@@ -608,6 +608,17 @@ def parse_adapters_string(adapters_string: str) -> tuple[list[str], bool]:
     return adapters, running_under_wine
 
 
+def _bcrypt_cache_key(trusted_hashword: bytes, untrusted_password: bytes) -> bytes:
+    """Compute a SHA-256 cache key from the bcrypt hash and password.
+
+    This avoids storing the plaintext (or MD5) password in memory.
+    A correct password + correct hash produces a unique, consistent key.
+    When the bcrypt hash changes (password reset), all old entries become
+    unreachable automatically.
+    """
+    return hashlib.sha256(trusted_hashword + b":" + untrusted_password).digest()
+
+
 async def authenticate(
     username: str,
     untrusted_password: bytes,
@@ -620,16 +631,17 @@ async def authenticate(
         return None
 
     trusted_hashword = user_info["pw_bcrypt"].encode()
+    cache_key = _bcrypt_cache_key(trusted_hashword, untrusted_password)
 
     # in-memory bcrypt lookup cache for performance
-    if trusted_hashword in app.state.cache.bcrypt:  # ~0.01 ms
-        if untrusted_password != app.state.cache.bcrypt[trusted_hashword]:
-            return None
+    # Key = SHA-256(hash:password) – never stores plaintext in memory
+    if cache_key in app.state.cache.bcrypt:  # ~0.01 ms – already verified pair
+        pass  # verified
     else:  # ~200ms
         if not bcrypt.checkpw(untrusted_password, trusted_hashword):
             return None
 
-        app.state.cache.bcrypt[trusted_hashword] = untrusted_password
+        app.state.cache.bcrypt[cache_key] = True  # mark pair as verified
 
     return user_info
 
@@ -1445,9 +1457,43 @@ class MatchCreate(BasePacket):
         app.state.sessions.channels.append(chat_channel)
         match.chat = chat_channel
 
+
+        # taksiegra: create stable web_id for this lobby (stored in DB)
+        try:
+            match.web_id = await services.database.execute(
+                "INSERT INTO mp_matches (bancho_slot, name, creator_id, created_at, ended_at) "
+                "VALUES (:bancho_slot, :name, :creator_id, NOW(), NULL)",
+                {
+                    "bancho_slot": match_id + 1,
+                    "name": match.name,
+                    "creator_id": player.id,
+                },
+            )
+        except Exception as exc:
+            # don't break lobby creation if DB/table isn't ready yet
+            log(f"Failed to insert mp_matches for match {match_id}: {exc}", Ansi.LYELLOW)
         player.update_latest_activity_soon()
         player.join_match(match, self.match_data.passwd)
 
+        # event: creator joined
+        if getattr(match, "web_id", None):
+            try:
+                await services.database.execute(
+                    "INSERT INTO mp_match_events (match_id, type, user_id) VALUES (:mid, 'join', :uid)",
+                    {"mid": match.web_id, "uid": player.id}
+                )
+            except Exception as exc:
+                log(f"Failed to insert creator join event: {exc}", Ansi.LYELLOW)
+
+
+        # taksiegra: send link message (channel + BanchoBot DM)
+        try:
+            if match.web_link is not None:
+                match.chat.send_bot(f"Match is being linked: {match.web_link}")
+                match.notify_link_once(player)
+        except Exception:
+            # don't break match creation if match link helpers aren't available yet
+            ...
         match.chat.send_bot(f"Match created by {player.name}.")
         log(f"{player} created a new multiplayer match.")
 
@@ -1484,13 +1530,34 @@ class MatchJoin(BasePacket):
             return
 
         player.update_latest_activity_soon()
-        player.join_match(match, self.match_passwd)
+        joined = player.join_match(match, self.match_passwd)
 
-
+        if joined:
+            try:
+                match.notify_link_once(player)
+            except Exception:
+                # match link helpers may not be available yet
+                ...
+            if getattr(match, 'web_id', None):
+                try:
+                    await services.database.execute(
+                        "INSERT INTO mp_match_events (match_id, type, user_id) VALUES (:mid, 'join', :uid)",
+                        {"mid": match.web_id, "uid": player.id}
+                    )
+                except Exception as exc:
+                    log(f"Failed to insert join event: {exc}", Ansi.LYELLOW)
 @register(ClientPackets.PART_MATCH)
 class MatchPart(BasePacket):
     async def handle(self, player: Player) -> None:
         player.update_latest_activity_soon()
+        if player.match and getattr(player.match, 'web_id', None):
+            try:
+                await services.database.execute(
+                    "INSERT INTO mp_match_events (match_id, type, user_id) VALUES (:mid, 'leave', :uid)",
+                    {"mid": player.match.web_id, "uid": player.id}
+                )
+            except Exception as exc:
+                log(f"Failed to insert leave event: {exc}", Ansi.LYELLOW)
         player.leave_match()
 
 
@@ -1704,12 +1771,33 @@ class MatchChangeSettings(BasePacket):
 @register(ClientPackets.MATCH_START)
 class MatchStart(BasePacket):
     async def handle(self, player: Player) -> None:
+        log(f"[DEBUG] MatchStart called by {player} match={player.match}", Ansi.LGREEN)
         if player.match is None:
             return
 
         if player is not player.match.host:
             log(f"{player} attempted to start match as non-host.", Ansi.LYELLOW)
             return
+
+        if getattr(player.match, 'web_id', None):
+            try:
+                game_id = await services.database.execute(
+                    "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, started_at) "
+                    "VALUES (:match_id, :map_id, :map_md5, :mode, :scoring_type, :team_type, NOW())",
+                    {
+                        "match_id": player.match.web_id,
+                        "map_id": player.match.map_id,
+                        "map_md5": player.match.map_md5,
+                        "mode": int(player.match.mode),
+                        "scoring_type": int(player.match.win_condition),
+                        "team_type": int(player.match.team_type),
+                    }
+                )
+                player.match.current_game_id = game_id
+            except Exception as exc:
+                log(f"Failed to insert mp_match_games: {exc}", Ansi.LYELLOW)
+            else:
+                log(f"[DEBUG] Inserted game_id={game_id} for match web_id={player.match.web_id} map_id={player.match.map_id}", Ansi.LGREEN)
 
         player.match.start()
 
@@ -1728,6 +1816,29 @@ class MatchScoreUpdate(BasePacket):
 
         slot_id = player.match.get_slot_id(player)
         assert slot_id is not None
+
+        # parse score frame and save in slot for later use
+        try:
+            import struct as _struct
+            SCOREFRAME_FMT = _struct.Struct("<iBHHHHHHiHH?BB?")
+            if len(self.play_data) >= 29:
+                sf_data = bytes(self.play_data[:29])
+                sf_fields = SCOREFRAME_FMT.unpack(sf_data)
+                slot = player.match.get_slot(player)
+                if slot is not None:
+                    slot.last_score_frame = {
+                        "total_score": sf_fields[8],
+                        "max_combo": sf_fields[9],
+                        "num300": sf_fields[2],
+                        "num100": sf_fields[3],
+                        "num50": sf_fields[4],
+                        "num_geki": sf_fields[5],
+                        "num_katu": sf_fields[6],
+                        "num_miss": sf_fields[7],
+                        "perfect": sf_fields[11],
+                    }
+        except Exception:
+            pass
 
         # if scorev2 is enabled, read an extra 8 bytes.
         buf = bytearray(b"0\x00\x00")
@@ -1778,6 +1889,89 @@ class MatchComplete(BasePacket):
         )
         player.match.enqueue_state()
 
+        if getattr(player.match, "web_id", None):
+            async def _save_scores(_match=player.match, _was_playing=was_playing):
+                try:
+                    await asyncio.sleep(3)  # czekaj na HTTP score submit
+                    from app.state import services as _svc
+                    # pobierz najnowszą grę tego meczu
+                    row = await _svc.database.fetch_one(
+                        "SELECT id FROM mp_match_games WHERE match_id = :mid ORDER BY id DESC LIMIT 1",
+                        {"mid": _match.web_id}
+                    )
+                    if not row:
+                        return
+                    game_id = row["id"]
+                    await _svc.database.execute(
+                        "UPDATE mp_match_games SET ended_at = NOW() WHERE id = :id",
+                        {"id": game_id}
+                    )
+                    for s in _was_playing:
+                        if s.player is None:
+                            continue
+                        rc = s.player.recent_score
+                        sf = s.last_score_frame  # ostatnia klatka z MATCH_SCORE_UPDATE
+
+                        # jesli recent_score nie ma lub nie pasuje do mapy (unranked/hidden),
+                        # uzyj danych z score frame
+                        use_frame = sf is not None and (
+                            rc is None or
+                            rc.bmap is None or
+                            rc.bmap.md5 != _match.map_md5
+                        )
+
+                        if use_frame:
+                            slot_mods = int(s.mods) if _match.freemods else int(_match.mods)
+                            await _svc.database.execute(
+                                "INSERT INTO mp_match_scores "
+                                "(game_id, user_id, score, acc, max_combo, mods, n300, n100, n50, nmiss, ngeki, nkatu, grade, passed, team) "
+                                "VALUES (:game_id, :user_id, :score, :acc, :max_combo, :mods, :n300, :n100, :n50, :nmiss, :ngeki, :nkatu, :grade, :passed, :team)",
+                                {
+                                    "game_id": game_id,
+                                    "user_id": s.player.id,
+                                    "score": sf["total_score"],
+                                    "acc": 0.0,
+                                    "max_combo": sf["max_combo"],
+                                    "mods": slot_mods,
+                                    "n300": sf["num300"],
+                                    "n100": sf["num100"],
+                                    "n50": sf["num50"],
+                                    "nmiss": sf["num_miss"],
+                                    "ngeki": sf["num_geki"],
+                                    "nkatu": sf["num_katu"],
+                                    "grade": "N",
+                                    "passed": 1 if sf["perfect"] or sf["num_miss"] == 0 else 0,
+                                    "team": int(s.team),
+                                }
+                            )
+                        elif rc is not None:
+                            await _svc.database.execute(
+                                "INSERT INTO mp_match_scores "
+                                "(game_id, user_id, score, acc, max_combo, mods, n300, n100, n50, nmiss, ngeki, nkatu, grade, passed, team) "
+                                "VALUES (:game_id, :user_id, :score, :acc, :max_combo, :mods, :n300, :n100, :n50, :nmiss, :ngeki, :nkatu, :grade, :passed, :team)",
+                                {
+                                    "game_id": game_id,
+                                    "user_id": s.player.id,
+                                    "score": rc.score,
+                                    "acc": rc.acc,
+                                    "max_combo": rc.max_combo,
+                                    "mods": int(rc.mods),
+                                    "n300": rc.n300,
+                                    "n100": rc.n100,
+                                    "n50": rc.n50,
+                                    "nmiss": rc.nmiss,
+                                    "ngeki": rc.ngeki,
+                                    "nkatu": rc.nkatu,
+                                    "grade": rc.grade.name if hasattr(rc.grade, "name") else str(rc.grade),
+                                    "passed": 1 if rc.passed else 0,
+                                    "team": int(s.team),
+                                }
+                            )
+                except Exception as exc:
+                    from app.logging import log, Ansi
+                    log(f"Failed to save match scores: {exc}", Ansi.LYELLOW)
+            app.state.loop.create_task(_save_scores())
+
         if player.match.is_scrimming:
             # determine winner, update match points & inform players.
             asyncio.create_task(  # type: ignore[unused-awaitable]
@@ -1822,6 +2016,7 @@ def is_playing(slot: Slot) -> bool:
 @register(ClientPackets.MATCH_LOAD_COMPLETE)
 class MatchLoadComplete(BasePacket):
     async def handle(self, player: Player) -> None:
+        log(f"[DEBUG] MatchLoadComplete by {player} in_progress={player.match.in_progress if player.match else None}", Ansi.LGREEN)
         if player.match is None:
             return
 
@@ -1949,6 +2144,14 @@ class MatchTransferHost(BasePacket):
             return
 
         player.match.host_id = target.id
+        if getattr(player.match, 'web_id', None):
+            try:
+                await services.database.execute(
+                    "INSERT INTO mp_match_events (match_id, type, user_id, data) VALUES (:mid, 'host_change', :uid, :data)",
+                    {"mid": player.match.web_id, "uid": target.id, "data": player.name}
+                )
+            except Exception as exc:
+                log(f"Failed to insert host_change event: {exc}", Ansi.LYELLOW)
         player.match.host.enqueue(app.packets.match_transfer_host())
         player.match.enqueue_state()
 
