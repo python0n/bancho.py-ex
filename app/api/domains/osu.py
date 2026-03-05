@@ -1,15 +1,17 @@
 """osu: handle connections from web, api, and beyond?"""
 
-from __future__ import annotations
+import re
 
 import orjson
 import asyncio
 import copy
 from datetime import datetime, timezone
+import base64
 import hashlib
 import os
 import random
 import secrets
+import math
 from collections import defaultdict
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -44,6 +46,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.responses import Response
 from fastapi.routing import APIRouter
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from fastapi import Form, Request
 
 import app.packets
 import app.settings
@@ -71,6 +74,9 @@ from app.repositories import comments as comments_repo
 from app.repositories import favourites as favourites_repo
 from app.repositories import mail as mail_repo
 from app.repositories import maps as maps_repo
+from app.repositories.maps import MapsTable
+from sqlalchemy import func as sa_func
+from sqlalchemy import select as sa_select
 from app.repositories import ratings as ratings_repo
 from app.repositories import scores as scores_repo
 from app.repositories import stats as stats_repo
@@ -84,6 +90,14 @@ from app.utils import pymysql_encode
 BEATMAPS_PATH = SystemPath.cwd() / ".data/osu"
 REPLAYS_PATH = SystemPath.cwd() / ".data/osr"
 SCREENSHOTS_PATH = SystemPath.cwd() / ".data/ss"
+SUBMISSIONS_PATH = SystemPath.cwd() / ".data/submissions"
+
+# Ensure submissions directory exists
+SUBMISSIONS_PATH.mkdir(parents=True, exist_ok=True)
+
+# Private server beatmap IDs start from 2^30 to avoid conflicts
+# with official osu! beatmap IDs. The client requires positive i32 IDs.
+BSS_ID_OFFSET = 1_073_741_824
 
 file_path = ".config/caps.json"
 
@@ -118,6 +132,139 @@ def load_json(file_path: str):
 
 capData = load_json(file_path)
 
+# ---------------------------------------------------------------------------
+# Score submission diagnostics & normalization
+# ---------------------------------------------------------------------------
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# Enable extra diagnostics for score submits (writes to .data/logs/strange_*.db).
+DIAG_SCORE_SUBMIT = _env_flag("DIAG_SCORE_SUBMIT", "0")
+
+# Normalize client hashes for comparison only (do NOT use for checksum calculation).
+SANITIZE_CLIENT_HASH = _env_flag("SANITIZE_CLIENT_HASH", "1")
+
+
+def _coerce_to_str(v: object) -> str:
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode(errors="ignore")
+    return str(v)
+
+
+def _normalize_client_hash_for_compare(v: object) -> str:
+    # Some clients (notably Wine builds) can send small formatting differences.
+    # We normalize for *comparison only*; checksum calculation must use the raw value.
+    s = _coerce_to_str(v).strip()
+    s = s.strip("'").strip('"').strip()
+
+    # Some builds append one or more trailing colons.
+    while s.endswith(":"):
+        s = s[:-1]
+
+    parts = s.split(":")
+    out_parts: list[str] = []
+    for p in parts:
+        p_stripped = p.strip()
+        pl = p_stripped.lower()
+        pl2 = pl.rstrip(".")  # e.g. "runningunderwin." -> "runningunderwin"
+        if pl2 in ("runningunderwin", "runningunderwine"):
+            out_parts.append("runningunderwine")
+        else:
+            out_parts.append(p_stripped)
+
+    return ":".join(out_parts)
+
+
+def _redact(s: object, keep: int = 8) -> str:
+    v = _coerce_to_str(s)
+    if len(v) <= keep * 2:
+        return "<redacted>"
+    return f"{v[:keep]}...{v[-keep:]}"
+
+
+
+
+
+def _is_ranked_for_first_places(status: Any) -> bool:
+    """Return True if a beatmap status should count towards 'first places'.
+
+    On this server, beatmaps.status uses:
+      0 = unranked (hide from first places)
+      2 = ranked, 3 = approved, 4 = qualified, 5 = loved (keep)
+    """
+    try:
+        v = int(status)  # int(Enum) works too
+    except Exception:
+        v = getattr(status, "value", None)
+        try:
+            v = int(v)
+        except Exception:
+            return False
+
+    return v in (2, 3, 4, 5)
+
+def _fmt_mods_for_announce(mods: Any) -> str:
+    """Format mod bitmask for chat/webhook announcements.
+
+    Key rule: if NC is present, do not show DT, and keep NC before RX.
+    """
+    raw = f"{mods!r}"
+
+    # Extract 2-char mod tokens (HD, HR, DT, NC, RX, etc.).
+    # This stays compatible with bancho.py's custom Mods.__repr__ output.
+    tokens = re.findall(r"[A-Z0-9]{2}", raw)
+    if not tokens:
+        return raw
+
+    # NC implies DT; PF implies SD.
+    if "NC" in tokens and "DT" in tokens:
+        tokens = [t for t in tokens if t != "DT"]
+    if "PF" in tokens and "SD" in tokens:
+        tokens = [t for t in tokens if t != "SD"]
+
+    # De-duplicate while preserving first occurrence.
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if t not in seen:
+            uniq.append(t)
+            seen.add(t)
+
+    # Preferred display order (add more if you care about other mods).
+    order: dict[str, int] = {
+        "NF": 10,
+        "EZ": 20,
+        "TD": 30,
+        "HD": 40,
+        "HR": 50,
+        "SD": 60,
+        "PF": 61,
+        "DT": 70,
+        "NC": 71,
+        "HT": 72,
+        "FL": 80,
+        "SO": 90,
+        # custom serverside mods / special
+        "RX": 100,
+        "AP": 110,
+        "FI": 120,
+        "V2": 130,
+        # mania keys (kept at the end unless you add ordering)
+        "1K": 200,
+        "2K": 201,
+        "3K": 202,
+        "4K": 203,
+        "5K": 204,
+        "6K": 205,
+        "7K": 206,
+        "8K": 207,
+        "9K": 208,
+        "CO": 209,
+    }
+
+    uniq.sort(key=lambda t: order.get(t, 1000))
+    return "".join(uniq)
 
 router = APIRouter(
     tags=["osu! web API"],
@@ -154,13 +301,721 @@ def authenticate_player_session(
 
 """ /web/ handlers """
 
-# Unhandled endpoints:
-# POST /web/osu-error.php
-# POST /web/osu-session.php
+# Previously unhandled BSS endpoints — now implemented:
 # POST /web/osu-osz2-bmsubmit-post.php
 # POST /web/osu-osz2-bmsubmit-upload.php
 # GET /web/osu-osz2-bmsubmit-getid.php
 # GET /web/osu-get-beatmap-topic.php
+
+# Remaining unhandled:
+# POST /web/osu-error.php
+# POST /web/osu-session.php
+
+
+# ===================== BSS Helper Functions =====================
+
+async def _bss_get_next_set_id() -> int:
+    """Get the next available beatmapset ID for BSS."""
+    stmt = sa_select(sa_func.max(MapsTable.set_id)).where(
+        MapsTable.set_id >= BSS_ID_OFFSET,
+    )
+    result = await app.state.services.database.fetch_val(stmt)
+    if result is None:
+        return BSS_ID_OFFSET
+    return result + 1
+
+
+async def _bss_get_next_beatmap_ids(count: int) -> list[int]:
+    """Get the next N available beatmap IDs for BSS."""
+    stmt = sa_select(sa_func.max(MapsTable.id)).where(
+        MapsTable.id >= BSS_ID_OFFSET,
+    )
+    result = await app.state.services.database.fetch_val(stmt)
+    start_id = BSS_ID_OFFSET if result is None else result + 1
+    return list(range(start_id, start_id + count))
+
+
+def _parse_osu_file_metadata(content: bytes) -> dict[str, Any]:
+    """Parse a .osu file and extract metadata."""
+    metadata: dict[str, Any] = {
+        "artist": "", "title": "", "version": "", "creator": "",
+        "mode": 0, "bpm": 0.0, "cs": 0.0, "ar": 0.0, "od": 0.0,
+        "hp": 0.0, "total_length": 0,
+    }
+
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("latin-1")
+        except Exception:
+            return metadata
+
+    section = ""
+    timing_points: list[float] = []
+    hit_objects_times: list[int] = []
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+
+        if section == "General":
+            if line.startswith("Mode:"):
+                try:
+                    metadata["mode"] = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+
+        elif section == "Metadata":
+            if ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if key == "Artist":
+                    metadata["artist"] = value[:128]
+                elif key == "ArtistUnicode" and not metadata["artist"]:
+                    metadata["artist"] = value[:128]
+                elif key == "Title":
+                    metadata["title"] = value[:128]
+                elif key == "TitleUnicode" and not metadata["title"]:
+                    metadata["title"] = value[:128]
+                elif key == "Version":
+                    metadata["version"] = value[:128]
+                elif key == "Creator":
+                    metadata["creator"] = value[:19]
+
+        elif section == "Difficulty":
+            if ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                try:
+                    val = float(value)
+                except ValueError:
+                    continue
+                if key == "CircleSize":
+                    metadata["cs"] = val
+                elif key == "OverallDifficulty":
+                    metadata["od"] = val
+                elif key == "ApproachRate":
+                    metadata["ar"] = val
+                elif key == "HPDrainRate":
+                    metadata["hp"] = val
+
+        elif section == "TimingPoints":
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    beat_length = float(parts[1])
+                    if beat_length > 0:  # uninherited timing point
+                        timing_points.append(beat_length)
+                except (ValueError, IndexError):
+                    pass
+
+        elif section == "HitObjects":
+            parts = line.split(",")
+            if len(parts) >= 3:
+                try:
+                    hit_objects_times.append(int(parts[2]))
+                except (ValueError, IndexError):
+                    pass
+
+    if timing_points:
+        if timing_points[0] > 0:
+            metadata["bpm"] = round(60000.0 / timing_points[0], 2)
+
+    if hit_objects_times:
+        first_time = min(hit_objects_times)
+        last_time = max(hit_objects_times)
+        metadata["total_length"] = max(0, (last_time - first_time) // 1000)
+
+    return metadata
+
+
+def _bss_try_extract_zip(data: bytes, output_dir: SystemPath) -> list[tuple[str, bytes]]:
+    """Try to extract .osu files from a zip/osz/osz2 file."""
+    import zipfile
+    import io
+
+    osu_files: list[tuple[str, bytes]] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                if name.endswith(".osu"):
+                    file_data = zf.read(name)
+                    safe = name.replace("/", "_").replace("\\", "_")
+                    (output_dir / safe).write_bytes(file_data)
+                    osu_files.append((name, file_data))
+                elif not name.endswith("/"):
+                    safe = name.replace("/", "_").replace("\\", "_")
+                    (output_dir / safe).write_bytes(zf.read(name))
+            if osu_files:
+                log(f"[BSS] extracted {len(osu_files)} .osu files from archive", Ansi.LCYAN)
+    except Exception:
+        pass  # not a valid zip — encrypted osz2 or other format
+    return osu_files
+
+
+def _read_uleb128(data: bytes, offset: int) -> tuple[int, int]:
+    """Read a ULEB128-encoded integer from data at offset."""
+    result = 0
+    shift = 0
+    while offset < len(data):
+        byte = data[offset]
+        offset += 1
+        result |= (byte & 0x7F) << shift
+        if (byte & 0x80) == 0:
+            break
+        shift += 7
+        if shift > 35:  # safety limit
+            break
+    return result, offset
+
+
+def _read_osu_string(data: bytes, offset: int) -> tuple[str, int]:
+    """Read an osu! binary protocol string (0x00=null, 0x0B=string)."""
+    if offset >= len(data):
+        return "", offset
+    marker = data[offset]
+    offset += 1
+    if marker == 0x00:
+        return "", offset
+    elif marker == 0x0B:
+        length, offset = _read_uleb128(data, offset)
+        if length > 0 and offset + length <= len(data):
+            try:
+                s = data[offset:offset + length].decode("utf-8", errors="replace")
+            except Exception:
+                s = ""
+            offset += length
+            return s, offset
+        else:
+            offset += min(length, len(data) - offset)
+            return "", offset
+    else:
+        # Unknown marker — not a valid string field
+        return "", offset - 1  # back up, might be a different field type
+
+
+def _parse_osz2_metadata(data: bytes) -> dict[str, Any]:
+    """Parse metadata from .osz2 file header.
+
+    The .osz2 format stores metadata strings in the header using osu!'s
+    binary protocol (0x0B + ULEB128 length + UTF-8 data).
+
+    We try multiple parsing strategies since the format varies by version.
+    """
+    metadata: dict[str, Any] = {
+        "artist": "", "title": "", "version": "", "creator": "",
+        "mode": 0, "bpm": 0.0, "cs": 0.0, "ar": 0.0, "od": 0.0,
+        "hp": 0.0, "total_length": 0, "filenames": [],
+    }
+
+    if len(data) < 20:
+        return metadata
+
+    # Strategy 1: Try to parse the osz2 header structure
+    # The format typically starts with a few header bytes, then
+    # contains osu! binary strings for metadata fields.
+    try:
+        offset = 0
+
+        # Skip magic/version bytes (usually 2-4 bytes)
+        # Look for the first 0x0B marker which starts a string
+        scan_limit = min(50, len(data))
+        first_string_offset = -1
+        for i in range(scan_limit):
+            if data[i] == 0x0B:
+                # Verify it looks like a valid string
+                test_len, test_off = _read_uleb128(data, i + 1)
+                if 0 < test_len < 500 and test_off + test_len <= len(data):
+                    first_string_offset = i
+                    break
+
+        if first_string_offset >= 0:
+            offset = first_string_offset
+
+            # Read strings in the typical osz2 order:
+            # hash, artist, artist_unicode, title, title_unicode,
+            # creator, version
+            strings_read: list[str] = []
+            for _ in range(10):  # read up to 10 strings
+                if offset >= len(data) or offset > 4096:
+                    break
+                s, new_offset = _read_osu_string(data, offset)
+                if new_offset == offset:
+                    # Didn't advance — try skipping a byte
+                    offset += 1
+                    continue
+                offset = new_offset
+                strings_read.append(s)
+
+            if len(strings_read) >= 6:
+                # Typical order: hash, artist, artist_unicode,
+                # title, title_unicode, creator, version
+                metadata["artist"] = strings_read[1] or strings_read[2] or ""
+                metadata["title"] = strings_read[3] or strings_read[4] or ""
+                metadata["creator"] = strings_read[5] if len(strings_read) > 5 else ""
+                metadata["version"] = strings_read[6] if len(strings_read) > 6 else ""
+                log(
+                    f"[BSS] osz2 header parsed: "
+                    f"'{metadata['artist']} - {metadata['title']} [{metadata['version']}]' "
+                    f"by {metadata['creator']}",
+                    Ansi.LCYAN,
+                )
+    except Exception as e:
+        log(f"[BSS] osz2 header parse error: {e}", Ansi.LYELLOW)
+
+    # Strategy 2: If header parsing didn't work, scan for readable metadata
+    if not metadata["artist"] and not metadata["title"]:
+        try:
+            # Scan for .osu filenames in the binary (they appear as strings)
+            # Pattern: "Artist - Title (Creator) [Version].osu"
+            import re
+            text_chunks = data[:min(len(data), 65536)]
+            # Look for .osu filename patterns in the binary
+            osu_pattern = rb'([^\x00\x0B]{3,80}\s*-\s*[^\x00\x0B]{3,80}\s*\([^\x00\x0B]{2,30}\)\s*\[[^\x00\x0B]{1,60}\]\.osu)'
+            matches = re.findall(osu_pattern, text_chunks)
+            for match in matches:
+                try:
+                    fn = match.decode("utf-8", errors="replace")
+                    metadata["filenames"].append(fn)
+                    # Parse: "Artist - Title (Creator) [Version].osu"
+                    fn_match = re.match(
+                        r'(.+?)\s*-\s*(.+?)\s*\((.+?)\)\s*\[(.+?)\]\.osu',
+                        fn,
+                    )
+                    if fn_match:
+                        metadata["artist"] = fn_match.group(1).strip()[:128]
+                        metadata["title"] = fn_match.group(2).strip()[:128]
+                        metadata["creator"] = fn_match.group(3).strip()[:19]
+                        metadata["version"] = fn_match.group(4).strip()[:128]
+                        log(f"[BSS] osz2 filename parsed: '{fn}'", Ansi.LCYAN)
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[BSS] osz2 binary scan error: {e}", Ansi.LYELLOW)
+
+    return metadata
+
+
+OSZ2_SERVICE_URL = os.environ.get("OSZ2_SERVICE_URL", "http://osz2-service:80")
+
+
+async def _bss_decrypt_osz2(osz2_data: bytes) -> dict | None:
+    """Send .osz2 to osz2-service for decryption, return extracted files.
+
+    Returns dict with keys: metadata, beatmaps, files
+    where files is {filename: base64_encoded_bytes}
+    Returns None on failure.
+    """
+    import aiohttp
+
+    url = f"{OSZ2_SERVICE_URL}/osz2/decrypt"
+
+    try:
+        form = aiohttp.FormData()
+        form.add_field(
+            "osz2", osz2_data,
+            filename="upload.osz2",
+            content_type="application/octet-stream",
+        )
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    log(f"[BSS] osz2-service returned {resp.status}: {error_text}", Ansi.LRED)
+                    return None
+
+                result = await resp.json()
+                file_count = len(result.get("files", {}))
+                osu_count = sum(1 for f in result.get("files", {}) if f.endswith(".osu"))
+                log(
+                    f"[BSS] osz2-service decrypted: {file_count} files ({osu_count} .osu)",
+                    Ansi.LGREEN,
+                )
+                return result
+    except Exception as e:
+        log(f"[BSS] osz2-service error: {e}", Ansi.LRED)
+        return None
+
+
+async def _bss_create_entry_from_osz2(
+    data: bytes,
+    set_id: int,
+    beatmap_id: int,
+    player: Player,
+) -> bool:
+    """Create a database entry from .osz2 metadata when we can't extract .osu files."""
+    meta = _parse_osz2_metadata(data)
+
+    # Generate a pseudo-md5 from the osz2 data for uniqueness
+    osz2_md5 = hashlib.md5(data).hexdigest()
+
+    artist = meta["artist"] or "Unknown Artist"
+    title = meta["title"] or "Unknown Title"
+    version = meta["version"] or "Normal"
+    creator = meta["creator"] or player.name
+
+    osu_filename = (
+        f"{artist} - {title} ({creator}) [{version}].osu"
+    ).replace("/", "_").replace("\\", "_")
+
+    log(
+        f"[BSS] creating entry from osz2: id={beatmap_id} set={set_id} "
+        f"'{artist} - {title} [{version}]' by {creator}",
+        Ansi.LCYAN,
+    )
+
+    try:
+        # Create mapsets entry (required for BeatmapSet.from_bsid to find the map)
+        # Set last_osuapi_check far in the future so bancho-py won't try to
+        # verify/update this map against the official osu!api.
+        await app.state.services.database.execute(
+            "REPLACE INTO mapsets (id, server, last_osuapi_check) "
+            "VALUES (:id, :server, :last_osuapi_check)",
+            {
+                "id": set_id,
+                "server": "osu!",
+                "last_osuapi_check": datetime(2099, 1, 1),
+            },
+        )
+
+        await maps_repo.create(
+            id=beatmap_id,
+            server="osu!",
+            set_id=set_id,
+            status=0,  # Pending
+            md5=osz2_md5,
+            artist=artist[:128],
+            title=title[:128],
+            version=version[:128],
+            creator=creator[:19],
+            filename=osu_filename[:256],
+            last_update=datetime.now(tz=timezone.utc),
+            total_length=meta["total_length"],
+            max_combo=0,
+            frozen=True,  # frozen so osu!api doesn't overwrite status
+            plays=0,
+            passes=0,
+            mode=meta["mode"],
+            bpm=meta["bpm"],
+            cs=meta["cs"],
+            ar=meta["ar"],
+            od=meta["od"],
+            hp=meta["hp"],
+            diff=0.0,
+        )
+        log(f"[BSS] DB entry created for map {beatmap_id}!", Ansi.LGREEN)
+        return True
+    except Exception as e:
+        log(f"[BSS] failed to create DB entry: {e}", Ansi.LRED)
+        return False
+
+
+async def _bss_process_osu_files(
+    osu_files: list[tuple[str, bytes]],
+    set_id: int,
+    player: Player,
+) -> None:
+    """Process .osu files: parse metadata and insert/update database records."""
+
+    # Ensure mapsets entry exists (required for BeatmapSet.from_bsid)
+    try:
+        await app.state.services.database.execute(
+            "REPLACE INTO mapsets (id, server, last_osuapi_check) "
+            "VALUES (:id, :server, :last_osuapi_check)",
+            {
+                "id": set_id,
+                "server": "osu!",
+                "last_osuapi_check": datetime(2099, 1, 1),
+            },
+        )
+    except Exception as e:
+        log(f"[BSS] failed to create mapsets entry: {e}", Ansi.LRED)
+
+    for filename, file_data in osu_files:
+        md5 = hashlib.md5(file_data).hexdigest()
+        meta = _parse_osu_file_metadata(file_data)
+
+        # Check if this map already exists (by md5)
+        existing = await maps_repo.fetch_one(md5=md5)
+        if existing:
+            log(f"[BSS] map {md5} already exists as id={existing['id']}, updating", Ansi.LCYAN)
+            await maps_repo.partial_update(
+                id=existing["id"],
+                set_id=set_id,
+                server="osu!",
+                artist=meta["artist"] or existing["artist"],
+                title=meta["title"] or existing["title"],
+                version=meta["version"] or existing["version"],
+                creator=player.name,
+                last_update=datetime.now(tz=timezone.utc),
+                frozen=True,
+                mode=meta["mode"],
+                bpm=meta["bpm"],
+                cs=meta["cs"],
+                ar=meta["ar"],
+                od=meta["od"],
+                hp=meta["hp"],
+                total_length=meta["total_length"],
+            )
+            osu_file_path = BEATMAPS_PATH / f"{existing['id']}.osu"
+            osu_file_path.write_bytes(file_data)
+            if md5 in app.state.cache.unsubmitted:
+                app.state.cache.unsubmitted.discard(md5)
+            continue
+
+        assigned_ids = await _bss_get_next_beatmap_ids(1)
+        beatmap_id = assigned_ids[0]
+
+        osu_filename = (
+            f"{meta['artist'] or 'Unknown'} - {meta['title'] or 'Unknown'} "
+            f"({meta['creator'] or player.name}) "
+            f"[{meta['version'] or 'Normal'}].osu"
+        ).replace("/", "_").replace("\\", "_")
+
+        log(
+            f"[BSS] creating map: id={beatmap_id} set={set_id} "
+            f"'{meta['artist']} - {meta['title']} [{meta['version']}]'",
+            Ansi.LCYAN,
+        )
+
+        try:
+            await maps_repo.create(
+                id=beatmap_id,
+                server="osu!",
+                set_id=set_id,
+                status=0,  # Pending
+                md5=md5,
+                artist=meta["artist"] or "Unknown Artist",
+                title=meta["title"] or "Unknown Title",
+                version=meta["version"] or "Normal",
+                creator=meta["creator"] or player.name,
+                filename=osu_filename,
+                last_update=datetime.now(tz=timezone.utc),
+                total_length=meta["total_length"],
+                max_combo=0,
+                frozen=True,
+                plays=0,
+                passes=0,
+                mode=meta["mode"],
+                bpm=meta["bpm"],
+                cs=meta["cs"],
+                ar=meta["ar"],
+                od=meta["od"],
+                hp=meta["hp"],
+                diff=0.0,
+            )
+        except Exception as e:
+            log(f"[BSS] failed to create map entry: {e}", Ansi.LRED)
+            # Still save .osu file even if DB insert failed
+            osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
+            osu_file_path.write_bytes(file_data)
+            continue
+
+        # Store .osu file for gameplay
+        osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
+        osu_file_path.write_bytes(file_data)
+
+        # Calculate star rating
+        try:
+            import akatsuki_pp_py as rosu
+            bm = rosu.Beatmap(path=str(osu_file_path))
+            calc = rosu.Calculator()
+            perf = calc.performance(bm)
+            sr = perf.difficulty.stars
+            await maps_repo.partial_update(id=beatmap_id, diff=round(sr, 2))
+            log(f"[BSS] SR for {beatmap_id}: {sr:.2f}", Ansi.LGREEN)
+        except Exception as e:
+            log(f"[BSS] SR calc failed for {beatmap_id}: {e}", Ansi.LYELLOW)
+
+        # Clear cached unsubmitted state
+        if md5 in app.state.cache.unsubmitted:
+            app.state.cache.unsubmitted.discard(md5)
+
+        log(f"[BSS] map {beatmap_id} saved!", Ansi.LGREEN)
+
+
+# ===================== BSS Endpoints =====================
+
+@router.get("/web/osu-osz2-bmsubmit-getid.php")
+async def bmsubmitGetID(
+    player: Player = Depends(authenticate_player_session(Query, "u", "h")),
+    set_id: int = Query(0, alias="s"),
+    beatmap_ids_str: str = Query("0", alias="b"),
+    osz2_hash: str = Query("", alias="z"),
+) -> Response:
+    """BSS Step 1: Assign beatmapset and beatmap IDs."""
+    log(f"[BSS] getid from {player}: set_id={set_id} b={beatmap_ids_str}", Ansi.LCYAN)
+
+    try:
+        bmap_ids = [int(x) for x in beatmap_ids_str.split(",") if x.strip()]
+    except ValueError:
+        bmap_ids = [0]
+
+    num_diffs = max(len(bmap_ids), 1)
+
+    if set_id <= 0:
+        # New submission
+        new_set_id = await _bss_get_next_set_id()
+        new_bmap_ids = await _bss_get_next_beatmap_ids(num_diffs)
+        full_submit = 1
+        log(f"[BSS] new submission: set={new_set_id} maps={new_bmap_ids}", Ansi.LCYAN)
+    else:
+        # Update existing
+        existing_maps = await maps_repo.fetch_many(set_id=set_id)
+        if existing_maps:
+            creator = existing_maps[0]["creator"]
+            if creator.lower() != player.name.lower():
+                log(f"[BSS] {player} tried to update set {set_id} owned by {creator}", Ansi.LYELLOW)
+                return Response(content="1")
+
+        new_set_id = set_id
+        new_bmap_ids = list(bmap_ids)
+
+        for i, bid in enumerate(new_bmap_ids):
+            if bid <= 0:
+                new_ids = await _bss_get_next_beatmap_ids(1)
+                new_bmap_ids[i] = new_ids[0]
+
+        full_submit = 1
+        log(f"[BSS] update: set={new_set_id} maps={new_bmap_ids}", Ansi.LCYAN)
+
+    response_lines = [
+        "0",
+        str(new_set_id),
+        ",".join(str(bid) for bid in new_bmap_ids),
+        str(full_submit),
+        str(new_set_id),
+        "0",
+    ]
+    return Response(content="\n".join(response_lines))
+
+
+@router.post("/web/osu-osz2-bmsubmit-upload.php")
+async def bmsubmitUpload(
+    request: Request,
+    player: Player = Depends(authenticate_player_session(Form, "u", "h")),
+    upload_type: int = Form(1, alias="t"),
+    set_id: int = Form(0, alias="s"),
+) -> Response:
+    """BSS Step 2: Receive uploaded beatmap files."""
+    log(f"[BSS] upload from {player}: set_id={set_id} type={upload_type}", Ansi.LCYAN)
+
+    if set_id <= 0:
+        log("[BSS] upload with invalid set_id", Ansi.LRED)
+        return Response(content="5")
+
+    form = await request.form()
+
+    BEATMAPS_PATH.mkdir(parents=True, exist_ok=True)
+    submission_dir = SUBMISSIONS_PATH / str(set_id)
+    submission_dir.mkdir(parents=True, exist_ok=True)
+
+    osu_files_found: list[tuple[str, bytes]] = []
+    osz2_data: bytes | None = None  # keep track of osz2 for fallback
+
+    for field_name, field_value in form.items():
+        if field_name in ("u", "h", "t", "s"):
+            continue
+
+        if isinstance(field_value, StarletteUploadFile):
+            file_data = await field_value.read()
+            filename = field_value.filename or field_name
+
+            log(f"[BSS] received file: {filename} ({len(file_data)} bytes)", Ansi.LCYAN)
+
+            safe_filename = filename.replace("/", "_").replace("\\", "_")
+            (submission_dir / safe_filename).write_bytes(file_data)
+
+            if filename.endswith(".osu") or field_name == "osu":
+                osu_files_found.append((filename, file_data))
+            elif filename.endswith((".osz2", ".osz")) or field_name in ("osz2", "osz"):
+                (submission_dir / "upload.osz2").write_bytes(file_data)
+                osz2_data = file_data
+                extracted = _bss_try_extract_zip(file_data, submission_dir)
+                osu_files_found.extend(extracted)
+
+    if osu_files_found:
+        await _bss_process_osu_files(osu_files_found, set_id, player)
+    elif osz2_data is not None:
+        # .osz2 is encrypted — try to decrypt via osz2-service
+        log(f"[BSS] .osz2 is encrypted, sending to osz2-service...", Ansi.LYELLOW)
+        decrypted = await _bss_decrypt_osz2(osz2_data)
+
+        if decrypted and decrypted.get("files"):
+            # Save all decrypted files (audio, images, .osu, etc.)
+            for fname, file_b64 in decrypted["files"].items():
+                try:
+                    file_bytes = base64.b64decode(file_b64)
+                except Exception:
+                    log(f"[BSS] failed to decode file: {fname}", Ansi.LYELLOW)
+                    continue
+
+                safe_name = fname.replace("/", "_").replace("\\", "_")
+                (submission_dir / safe_name).write_bytes(file_bytes)
+
+                if fname.endswith(".osu"):
+                    osu_files_found.append((fname, file_bytes))
+                    log(f"[BSS] extracted .osu: {fname} ({len(file_bytes)} bytes)", Ansi.LCYAN)
+
+            if osu_files_found:
+                await _bss_process_osu_files(osu_files_found, set_id, player)
+                log(f"[BSS] osz2 fully processed via osz2-service!", Ansi.LGREEN)
+            else:
+                log(f"[BSS] osz2-service returned files but no .osu — falling back", Ansi.LYELLOW)
+                existing_maps = await maps_repo.fetch_many(set_id=set_id)
+                if not existing_maps:
+                    assigned_ids = await _bss_get_next_beatmap_ids(1)
+                    beatmap_id = assigned_ids[0]
+                    await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
+        else:
+            # osz2-service unavailable or failed — fall back to header parsing
+            log(f"[BSS] osz2-service unavailable, falling back to header parsing", Ansi.LYELLOW)
+            existing_maps = await maps_repo.fetch_many(set_id=set_id)
+            if not existing_maps:
+                assigned_ids = await _bss_get_next_beatmap_ids(1)
+                beatmap_id = assigned_ids[0]
+                await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
+    else:
+        log(f"[BSS] no files found in upload for set {set_id}", Ansi.LYELLOW)
+
+    return Response(content="0")
+
+
+@router.post("/web/osu-osz2-bmsubmit-post.php")
+async def bmsubmitPost(
+    player: Player = Depends(authenticate_player_session(Form, "u", "h")),
+    set_id: int = Form(0, alias="b"),
+    storyboard: int = Form(0, alias="storyboard"),
+    notify: int = Form(0, alias="notify"),
+    subject: str = Form("", alias="subject"),
+    message: str = Form("", alias="message"),
+    language_id: int = Form(1, alias="language_id"),
+    genre_id: int = Form(1, alias="genre_id"),
+) -> Response:
+    """BSS Step 3: Finalize submission."""
+    log(
+        f"[BSS] post from {player}: set_id={set_id} subject='{subject[:50]}'",
+        Ansi.LCYAN,
+    )
+    return Response(content="0")
+
+
+@router.get("/web/osu-get-beatmap-topic.php")
+async def getBeatmapTopic(
+    player: Player = Depends(authenticate_player_session(Query, "u", "h")),
+    set_id: int = Query(0, alias="s"),
+) -> Response:
+    """Get beatmap forum topic (stub — we don't have a forum)."""
+    return Response(content="")
 
 
 @router.post("/web/osu-screenshot.php")
@@ -221,31 +1076,75 @@ def bancho_to_osuapi_status(bancho_status: int) -> int:
         5: 4,
     }[bancho_status]
 
-
 @router.post("/web/osu-getbeatmapinfo.php")
 async def osuGetBeatmapInfo(
-    form_data: models.OsuBeatmapRequestForm,
+    request: Request,
     player: Player = Depends(authenticate_player_session(Query, "u", "h")),
 ) -> Response:
-    num_requests = len(form_data.Filenames) + len(form_data.Ids)
-    log(f"{player} requested info for {num_requests} maps.", Ansi.LCYAN)
+    body = await request.body()
+    f = body.decode("utf-8", errors="replace")
 
+    if not f.strip():
+        try:
+            form = await request.form()
+            f_raw = form.get("f", "")
+            if isinstance(f_raw, bytes):
+                f_raw = f_raw.decode("utf-8", errors="replace")
+            f = str(f_raw)
+        except Exception:
+            pass
+
+    lines = [ln.strip() for ln in f.splitlines() if ln.strip()]
+    log(f"{player} requested info for {len(lines)} maps.", Ansi.LCYAN)
+
+    md5_re = re.compile(r"^[0-9a-f]{32}$", re.I)
     response_lines: list[str] = []
 
-    for idx, map_filename in enumerate(form_data.Filenames):
-        # try getting the map from sql
+    for idx, entry in enumerate(lines):
+        candidate_filename = None
+        candidate_md5 = None
 
-        beatmap = await maps_repo.fetch_one(filename=map_filename)
+        if "|" in entry:
+            parts = [p.strip() for p in entry.split("|") if p.strip()]
+            for p in parts:
+                if md5_re.match(p):
+                    candidate_md5 = p.lower()
+                    break
+            for p in parts:
+                if p.lower().endswith(".osu"):
+                    candidate_filename = p
+                    break
+        else:
+            if md5_re.match(entry):
+                candidate_md5 = entry.lower()
+            else:
+                candidate_filename = entry
+
+        beatmap = None
+        if candidate_filename:
+            beatmap = await maps_repo.fetch_one(filename=candidate_filename)
+        if not beatmap and candidate_md5:
+            beatmap = await maps_repo.fetch_one(md5=candidate_md5)
 
         if not beatmap:
-            continue
+            bmap_obj = None
+            if candidate_md5:
+                bmap_obj = await Beatmap.from_md5(candidate_md5)
+            if not bmap_obj and candidate_filename:
+                rec = await maps_repo.fetch_one(filename=candidate_filename)
+                if rec:
+                    beatmap = rec
+            if bmap_obj and not beatmap:
+                beatmap = {
+                    "id": bmap_obj.id,
+                    "set_id": bmap_obj.set_id,
+                    "md5": bmap_obj.md5,
+                    "status": int(bmap_obj.status),
+                }
+            if not beatmap:
+                continue
 
-        # try to get the user's grades on the map
-        # NOTE: osu! only allows us to send back one per gamemode,
-        #       so we've decided to send back *vanilla* grades.
-        #       (in theory we could make this user-customizable)
         grades = ["N", "N", "N", "N"]
-
         for score in await scores_repo.fetch_many(
             map_md5=beatmap["md5"],
             user_id=player.id,
@@ -265,12 +1164,8 @@ async def osuGetBeatmapInfo(
             ),
         )
 
-    if form_data.Ids:  # still have yet to see this used
-        await app.state.services.log_strange_occurrence(
-            f"{player} requested map(s) info by id ({form_data.Ids})",
-        )
+    return Response("\n".join(response_lines).encode(), media_type="text/plain")
 
-    return Response("\n".join(response_lines).encode())
 
 
 @router.get("/web/osu-getfavourites.php")
@@ -543,6 +1438,36 @@ def format_achievement_string(file: str, name: str, description: str) -> str:
     return f"{file}+{name}+{description}"
 
 
+# pp is stored as DECIMAL in the database on some deployments. That means
+# reading it back yields decimal.Decimal values (from PyMySQL), which do not
+# mix with float operations. Also, in rare cases pp calculation can produce
+# absurd values (e.g. 1e23) which will overflow DECIMAL columns.
+PP_DB_MAX = 9_999_999_999_999.0  # fits DECIMAL(16,3) (13 digits before decimal)
+
+def pp_to_float(value: Any) -> float:
+    """Convert a pp value from any backend type to a safe float."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not math.isfinite(f) or f < 0:
+        return 0.0
+
+    if f > PP_DB_MAX:
+        log(f"Suspicious pp value {f:.3e}; dropping to 0.000 for safety.", Ansi.LYELLOW)
+        return 0.0
+
+    return f
+
+
+def pp_to_db(value: Any) -> str:
+    """Convert pp to a string safe for DECIMAL(16,3) inserts."""
+    f = pp_to_float(value)
+    return f"{f:.3f}"
+
+
+
 def parse_form_data_score_params(
     score_data: FormData,
 ) -> tuple[bytes, StarletteUploadFile] | None:
@@ -601,6 +1526,9 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
             osu_version,
         )
 
+        raw_client_hash = _coerce_to_str(client_hash_decoded)
+        norm_client_hash = _normalize_client_hash_for_compare(raw_client_hash)
+
         # fetch map & player
 
         bmap_md5 = score_data[0]
@@ -640,7 +1568,16 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
             if osu_version != f"{player.client_details.osu_version.date:%Y%m%d}":
                 raise ValueError("osu! version mismatch")
 
-            if client_hash_decoded != player.client_details.client_hash:
+            stored_client_hash = _coerce_to_str(player.client_details.client_hash)
+
+            client_hash_for_compare = norm_client_hash if SANITIZE_CLIENT_HASH else raw_client_hash
+            stored_hash_for_compare = (
+                _normalize_client_hash_for_compare(stored_client_hash)
+                if SANITIZE_CLIENT_HASH
+                else stored_client_hash
+            )
+
+            if client_hash_for_compare != stored_hash_for_compare:
                 raise ValueError("client hash mismatch")
             # assert unique ids (c1) are correct and match login params
             if unique_id1_md5 != player.client_details.uninstall_md5:
@@ -656,7 +1593,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
             # assert online checksums match
             server_score_checksum = score.compute_online_checksum(
                 osu_version=osu_version,
-                osu_client_hash=client_hash_decoded,
+                osu_client_hash=raw_client_hash,
                 storyboard_checksum=storyboard_md5 or "",
             )
             if score.client_checksum != server_score_checksum:
@@ -664,11 +1601,24 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                     f"online score checksum mismatch ({server_score_checksum} != {score.client_checksum})",
                 )
 
-        except (ValueError, AssertionError):
+        except (ValueError, AssertionError) as exc:
             # NOTE: this is undergoing a temporary trial period,
             # after which, it will be enabled & perform restrictions.
-            stacktrace = app.utils.get_appropriate_stacktrace()
-            await app.state.services.log_strange_occurrence(stacktrace)
+            if DIAG_SCORE_SUBMIT:
+                await app.state.services.log_strange_occurrence(
+                    {
+                        "where": "osuSubmitModular",
+                        "error": repr(exc),
+                        "player": f"{player.name} ({player.id})",
+                        "bmap_md5": bmap_md5,
+                        "osu_version": osu_version,
+                        "sanitize_client_hash": SANITIZE_CLIENT_HASH,
+                        "client_hash_raw": _redact(raw_client_hash),
+                        "client_hash_stored": _redact(getattr(player.client_details, "client_hash", "")),
+                    },
+                )
+            else:
+                log(f"[score-submit] validation failed (trial): {exc}", Ansi.LYELLOW)
 
             # await player.restrict(
             #     admin=app.state.sessions.bot,
@@ -713,7 +1663,11 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                 expected_md5=bmap.md5,
             )
             if osu_file_available:
-                score.pp, score.sr = score.calculate_performance(bmap.id)
+                try:
+                    score.pp, score.sr = score.calculate_performance(bmap.id)
+                except Exception as e:
+                    log(f"[BSS] PP calc failed for map {bmap.id}: {e}", Ansi.LYELLOW)
+                    score.pp, score.sr = 0.0, 0.0
 
                 if score.passed:
                     await score.calculate_status()
@@ -774,7 +1728,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         ),
                     )
 
-                    if score.rank == 1 and not score.player.restricted and score.status == 2:
+                    if score.rank == 1 and not score.player.restricted and score.status == 2 and _is_ranked_for_first_places(score.bmap.status):
                         announce_chan = app.state.sessions.channels.get_by_name("#announce")
 
                         ann = [
@@ -783,7 +1737,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         ]
 
                         if score.mods:
-                            ann.insert(1, f"+{score.mods!r}")
+                            ann.insert(1, f"+{_fmt_mods_for_announce(score.mods)}")
 
                         scoring_metric = (
                             "pp"
@@ -802,7 +1756,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         if prev_n1:
                             if score.player.id != prev_n1["id"]:
                                 ann.append(
-                                    f"(Previous #1: [https://{app.settings.DOMAIN}/u/"
+                                    f"(Previous #1: [https://{app.settings.WEB_DOMAIN}/u/"
                                     "{id} {name}])".format(
                                         id=prev_n1["id"],
                                         name=prev_n1["name"],
@@ -815,7 +1769,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         if(app.settings.ENABLE_FIRST_PLACES_WEBHOOK):
                             embed = Embed(
                             title=f"#1 achieved by {score.player.name}",
-                            description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.DOMAIN}/b/{score.bmap.id}",
+                            description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.WEB_DOMAIN}/b/{score.bmap.id}",
                             color=0xFFD700,
                             timestamp=datetime.now(timezone.utc).isoformat(),
                             )
@@ -832,7 +1786,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                                 if score.player.id != prev_n1["id"]:
                                     embed.add_field(
                                     name="Previous #1",
-                                    value=f"[{prev_n1['name']}](https://{app.settings.DOMAIN}/u/{prev_n1['id']})",
+                                    value=f"[{prev_n1['name']}](https://{app.settings.WEB_DOMAIN}/u/{prev_n1['id']})",
                                     inline=False,
                                     )
 
@@ -859,6 +1813,14 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         "mode": score.mode,
                     },
                 )
+                if score.prev_best and score.prev_best.status == SubmissionStatus.SCORE_BEST:
+                    await app.state.services.database.execute(
+                        "UPDATE scores SET status = 3 WHERE id = :id",
+                        {"id": score.prev_best.id},
+                    )
+
+            pp_db = pp_to_db(score.pp)
+
 
             score.id = await app.state.services.database.execute(
                 "INSERT INTO scores "
@@ -872,7 +1834,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                 {
                     "map_md5": score.bmap.md5,
                     "score": score.score,
-                    "pp": score.pp,
+                    "pp": pp_db,
                     "acc": score.acc,
                     "max_combo": score.max_combo,
                     "mods": score.mods,
@@ -995,15 +1957,13 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                 )
 
                 # calculate new total weighted accuracy
-                weighted_acc = sum(
-                    row["acc"] * 0.95**i for i, row in enumerate(best_scores)
-                )
+                weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
                 bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
                 stats.acc = (weighted_acc * bonus_acc) / 100
                 stats_updates["acc"] = stats.acc
 
                 # calculate new total weighted pp
-                weighted_pp = sum(row["pp"] * 0.95**i for i, row in enumerate(best_scores))
+                weighted_pp = sum(pp_to_float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
                 bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
                 stats.pp = round(weighted_pp + bonus_pp)
                 stats_updates["pp"] = stats.pp
@@ -1184,8 +2144,12 @@ async def osuSubmitModularSelector(
     """Handle a score submission from an osu! client with an active session."""
 
     if fl_cheat_screenshot:
-        stacktrace = app.utils.get_appropriate_stacktrace()
-        await app.state.services.log_strange_occurrence(stacktrace)
+        if DIAG_SCORE_SUBMIT:
+            await app.state.services.log_strange_occurrence(
+                {"where": "osuSubmitModularSelector", "event": "fl_cheat_screenshot_present"},
+            )
+        else:
+            log("[score-submit] cheat screenshot provided (trial mode).", Ansi.LYELLOW)
 
     # NOTE: the bancho protocol uses the "score" parameter name for both
     # the base64'ed score data, and the replay file in the multipart
@@ -1204,6 +2168,9 @@ async def osuSubmitModularSelector(
         iv_b64,
         osu_version,
     )
+
+    raw_client_hash = _coerce_to_str(client_hash_decoded)
+    norm_client_hash = _normalize_client_hash_for_compare(raw_client_hash)
 
     # fetch map & player
 
@@ -1244,7 +2211,16 @@ async def osuSubmitModularSelector(
         if osu_version != f"{player.client_details.osu_version.date:%Y%m%d}":
             raise ValueError("osu! version mismatch")
 
-        if client_hash_decoded != player.client_details.client_hash:
+        stored_client_hash = _coerce_to_str(player.client_details.client_hash)
+
+        client_hash_for_compare = norm_client_hash if SANITIZE_CLIENT_HASH else raw_client_hash
+        stored_hash_for_compare = (
+            _normalize_client_hash_for_compare(stored_client_hash)
+            if SANITIZE_CLIENT_HASH
+            else stored_client_hash
+        )
+
+        if client_hash_for_compare != stored_hash_for_compare:
             raise ValueError("client hash mismatch")
         # assert unique ids (c1) are correct and match login params
         if unique_id1_md5 != player.client_details.uninstall_md5:
@@ -1260,7 +2236,7 @@ async def osuSubmitModularSelector(
         # assert online checksums match
         server_score_checksum = score.compute_online_checksum(
             osu_version=osu_version,
-            osu_client_hash=client_hash_decoded,
+            osu_client_hash=raw_client_hash,
             storyboard_checksum=storyboard_md5 or "",
         )
         if score.client_checksum != server_score_checksum:
@@ -1274,11 +2250,24 @@ async def osuSubmitModularSelector(
                 f"beatmap hash mismatch ({bmap_md5} != {updated_beatmap_hash})",
             )
 
-    except (ValueError, AssertionError):
+    except (ValueError, AssertionError) as exc:
         # NOTE: this is undergoing a temporary trial period,
         # after which, it will be enabled & perform restrictions.
-        stacktrace = app.utils.get_appropriate_stacktrace()
-        await app.state.services.log_strange_occurrence(stacktrace)
+        if DIAG_SCORE_SUBMIT:
+            await app.state.services.log_strange_occurrence(
+                {
+                    "where": "osuSubmitModularSelector",
+                    "error": repr(exc),
+                    "player": f"{player.name} ({player.id})" if player else None,
+                    "bmap_md5": bmap_md5,
+                    "osu_version": osu_version,
+                    "sanitize_client_hash": SANITIZE_CLIENT_HASH,
+                    "client_hash_raw": _redact(raw_client_hash),
+                    "client_hash_stored": _redact(getattr(getattr(player, "client_details", None), "client_hash", "")),
+                },
+            )
+        else:
+            log(f"[score-submit] validation failed (trial): {exc}", Ansi.LYELLOW)
 
         # await player.restrict(
         #     admin=app.state.sessions.bot,
@@ -1323,7 +2312,12 @@ async def osuSubmitModularSelector(
             expected_md5=bmap.md5,
         )
         if osu_file_available:
-            score.pp, score.sr = score.calculate_performance(bmap.id)
+            try:
+                score.pp, score.sr = score.calculate_performance(bmap.id)
+            except Exception as e:
+                log(f"[BSS] PP calc failed for map {bmap.id}: {e}", Ansi.LYELLOW)
+                score.pp, score.sr = 0.0, 0.0
+            score.pp = pp_to_float(score.pp)  # clamp/normalize for DECIMAL and safety
 
             if score.passed:
                 await score.calculate_status()
@@ -1382,7 +2376,7 @@ async def osuSubmitModularSelector(
                     ),
                 )
 
-                if score.rank == 1 and not score.player.restricted and score.status == 2:
+                if score.rank == 1 and not score.player.restricted and score.status == 2 and _is_ranked_for_first_places(score.bmap.status):
                     announce_chan = app.state.sessions.channels.get_by_name("#announce")
 
                     ann = [
@@ -1391,7 +2385,7 @@ async def osuSubmitModularSelector(
                     ]
 
                     if score.mods:
-                        ann.insert(1, f"+{score.mods!r}")
+                        ann.insert(1, f"+{_fmt_mods_for_announce(score.mods)}")
 
                     scoring_metric = (
                         "pp" if score.mode >= GameMode.RELAX_OSU else "score"
@@ -1410,7 +2404,7 @@ async def osuSubmitModularSelector(
                     if prev_n1:
                         if score.player.id != prev_n1["id"]:
                             ann.append(
-                                f"(Previous #1: [https://{app.settings.DOMAIN}/u/"
+                                f"(Previous #1: [https://{app.settings.WEB_DOMAIN}/u/"
                                 "{id} {name}])".format(
                                     id=prev_n1["id"],
                                     name=prev_n1["name"],
@@ -1423,7 +2417,7 @@ async def osuSubmitModularSelector(
                     if(app.settings.ENABLE_FIRST_PLACES_WEBHOOK):
                         embed = Embed(
                         title=f"#1 achieved by {score.player.name}",
-                        description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.DOMAIN}/b/{score.bmap.id}",
+                        description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.WEB_DOMAIN}/b/{score.bmap.id}",
                         color=0xFFD700,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         )
@@ -1440,7 +2434,7 @@ async def osuSubmitModularSelector(
                             if score.player.id != prev_n1["id"]:
                                 embed.add_field(
                                 name="Previous #1",
-                                value=f"[{prev_n1['name']}](https://{app.settings.DOMAIN}/u/{prev_n1['id']})",
+                                value=f"[{prev_n1['name']}](https://{app.settings.WEB_DOMAIN}/u/{prev_n1['id']})",
                                 inline=False,
                                 )
 
@@ -1460,7 +2454,7 @@ async def osuSubmitModularSelector(
             # records with SubmissionStatus.SUBMITTED.
             await app.state.services.database.execute(
                 "UPDATE scores SET status = 1 "
-                "WHERE status = 2 AND map_md5 = :map_md5 "
+                "WHERE status = 3 AND map_md5 = :map_md5 "
                 "AND userid = :user_id AND mode = :mode",
                 {
                     "map_md5": score.bmap.md5,
@@ -1468,6 +2462,9 @@ async def osuSubmitModularSelector(
                     "mode": score.mode,
                 },
             )
+
+        pp_db = pp_to_db(score.pp)
+
 
         score.id = await app.state.services.database.execute(
             "INSERT INTO scores "
@@ -1481,7 +2478,7 @@ async def osuSubmitModularSelector(
             {
                 "map_md5": score.bmap.md5,
                 "score": score.score,
-                "pp": score.pp,
+                "pp": pp_db,
                 "acc": score.acc,
                 "max_combo": score.max_combo,
                 "mods": score.mods,
@@ -1603,15 +2600,13 @@ async def osuSubmitModularSelector(
             )
 
             # calculate new total weighted accuracy
-            weighted_acc = sum(
-                row["acc"] * 0.95**i for i, row in enumerate(best_scores)
-            )
+            weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
             bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
             stats.acc = (weighted_acc * bonus_acc) / 100
             stats_updates["acc"] = stats.acc
 
             # calculate new total weighted pp
-            weighted_pp = sum(row["pp"] * 0.95**i for i, row in enumerate(best_scores))
+            weighted_pp = sum(pp_to_float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
             bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
             stats.pp = round(weighted_pp + bonus_pp)
             stats_updates["pp"] = stats.pp
@@ -1837,7 +2832,7 @@ async def get_leaderboard_scores(
         "FROM scores s "
         "INNER JOIN users u ON u.id = s.userid "
         "LEFT JOIN clans c ON c.id = u.clan_id "
-        "WHERE s.map_md5 = :map_md5 AND s.status = 2 "  # 2: =best score
+        "WHERE s.map_md5 = :map_md5 AND s.status IN (2, 3) "  # 2: best pp, 3: best score
         "AND (u.priv & 1 OR u.id = :user_id) AND mode = :mode",
     ]
 
@@ -1874,7 +2869,7 @@ async def get_leaderboard_scores(
             "UNIX_TIMESTAMP(play_time) time "
             "FROM scores "
             "WHERE map_md5 = :map_md5 AND mode = :mode "
-            "AND userid = :user_id AND status = 2 "
+            "AND userid = :user_id AND status IN (2, 3) "
             "ORDER BY _score DESC LIMIT 1",
             {"map_md5": map_md5, "mode": mode, "user_id": player.id},
         )
@@ -1928,13 +2923,21 @@ async def getScores(
     if aqn_files_found:
         stacktrace = app.utils.get_appropriate_stacktrace()
         await app.state.services.log_strange_occurrence(stacktrace)
-
     # check if this md5 has already been  cached as
     # unsubmitted/needs update to reduce osu!api spam
-    if map_md5 in app.state.cache.unsubmitted:
-        return Response(b"-1|false")
     if map_md5 in app.state.cache.needs_update:
         return Response(b"1|false")
+    if map_md5 in app.state.cache.unsubmitted:
+        # DEBUG: log when BSS maps hit unsubmitted cache
+        if map_set_id >= BSS_ID_OFFSET:
+            log(f"[BSS-DEBUG] md5={map_md5} set={map_set_id} hit unsubmitted cache!", Ansi.LRED)
+        return Response(b"-1|false")
+    # Nt: unsubmitted cache check removed — let from_md5 re-check
+    # every time so newly imported maps get picked up properly
+
+    # DEBUG: log BSS map lookups
+    if map_set_id >= BSS_ID_OFFSET:
+        log(f"[BSS-DEBUG] getscores lookup: md5={map_md5} set={map_set_id} file={map_filename}", Ansi.LCYAN)
 
     if mods_arg & Mods.RELAX:
         if mode_arg == 3:  # rx!mania doesn't exist
@@ -1966,12 +2969,48 @@ async def getScores(
     bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
     has_set_id = map_set_id > 0
 
+    # BSS maps: client updates BeatmapID/SetID in the .osu file after
+    # submission, which changes the md5. If lookup by md5 fails but
+    # we have a BSS set_id, look up by set_id and fix the md5.
+    if not bmap and map_set_id >= BSS_ID_OFFSET:
+        bss_maps = await maps_repo.fetch_many(set_id=map_set_id)
+        if bss_maps:
+            # Update the md5 in DB to match what the client has
+            target = bss_maps[0]
+            log(
+                f"[BSS] md5 mismatch fix: {target['md5']} -> {map_md5} "
+                f"for map {target['id']}",
+                Ansi.LCYAN,
+            )
+            await maps_repo.partial_update(id=target["id"], md5=map_md5)
+
+            # Clear old md5 from unsubmitted cache if present
+            if target["md5"] in app.state.cache.unsubmitted:
+                app.state.cache.unsubmitted.discard(target["md5"])
+
+            # Evict the old beatmapset from cache so it reloads
+            if map_set_id in app.state.cache.beatmapset:
+                del app.state.cache.beatmapset[map_set_id]
+
+            # Retry lookup with the now-corrected md5
+            bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
+
     if not bmap:
+        # DEBUG: log BSS map lookup failures
+        if map_set_id >= BSS_ID_OFFSET:
+            db_rec = await maps_repo.fetch_one(id=map_set_id)
+            log(
+                f"[BSS-DEBUG] from_md5 returned None! "
+                f"client_md5={map_md5} set={map_set_id} "
+                f"db_md5={db_rec['md5'] if db_rec else 'NOT IN DB'}",
+                Ansi.LRED,
+            )
         # map not found, figure out whether it needs an
         # update or isn't submitted using its filename.
 
         if has_set_id and map_set_id not in app.state.cache.beatmapset:
             # set not cached, it doesn't exist
+            log(f"[BSS-DEBUG] adding to unsubmitted (set not cached): md5={map_md5} set={map_set_id}", Ansi.LYELLOW)
             app.state.cache.unsubmitted.add(map_md5)
             return Response(b"-1|false")
 
@@ -2005,6 +3044,7 @@ async def getScores(
             # map is unsubmitted.
             # add this map to the unsubmitted cache, so
             # that we don't have to make this request again.
+            log(f"[BSS-DEBUG] adding to unsubmitted (not found): md5={map_md5} set={map_set_id} file={map_filename}", Ansi.LYELLOW)
             app.state.cache.unsubmitted.add(map_md5)
             return Response(b"-1|false")
 
@@ -2320,6 +3360,53 @@ async def get_osz(
     if no_video:
         map_set_id = map_set_id[:-1]
 
+    try:
+        set_id_int = int(map_set_id)
+    except ValueError:
+        set_id_int = 0
+
+    # For BSS maps, build and serve .osz from local files
+    if set_id_int >= BSS_ID_OFFSET:
+        import zipfile
+        import io
+
+        maps = await maps_repo.fetch_many(set_id=set_id_int)
+        if not maps:
+            return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+        buf = io.BytesIO()
+        has_files = False
+        first_map = maps[0]
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for m in maps:
+                osu_path = BEATMAPS_PATH / f"{m['id']}.osu"
+                if osu_path.exists():
+                    zf.writestr(m["filename"], osu_path.read_bytes())
+                    has_files = True
+
+            # Include audio/bg from submissions dir if available
+            sub_dir = SUBMISSIONS_PATH / str(set_id_int)
+            if sub_dir.exists():
+                for f in sub_dir.iterdir():
+                    if f.is_file() and "." in f.name and not f.name.endswith((".osz2", ".osz", ".osu")):
+                        zf.writestr(f.name, f.read_bytes())
+
+        if not has_files:
+            return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+        osz_filename = (
+            f"{first_map['artist']} - {first_map['title']} "
+            f"({first_map['creator']}).osz"
+        )
+
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/x-osu-beatmap-archive",
+            headers={
+                "Content-Disposition": f'attachment; filename="{osz_filename}"',
+            },
+        )
+
     query_str = f"{map_set_id}?n={int(not no_video)}"
 
     return RedirectResponse(
@@ -2327,6 +3414,21 @@ async def get_osz(
         status_code=status.HTTP_301_MOVED_PERMANENTLY,
     )
 
+
+@router.get("/api/v1/bss/bg/{set_id}")
+async def bss_background(set_id: int = Path(...)) -> Response:
+    """Serve background image for BSS maps."""
+    if set_id < BSS_ID_OFFSET:
+        return RedirectResponse(
+            url=f"https://assets.ppy.sh/beatmaps/{set_id}/covers/cover.jpg",
+        )
+    sub_dir = SUBMISSIONS_PATH / str(set_id)
+    if sub_dir.exists():
+        for f in sub_dir.iterdir():
+            if f.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                media = "image/jpeg" if f.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                return Response(content=f.read_bytes(), media_type=media)
+    return Response(status_code=404)
 
 @router.get("/web/maps/{map_filename}")
 async def get_updated_beatmap(
@@ -2337,6 +3439,17 @@ async def get_updated_beatmap(
     """Send the latest .osu file the server has for a given map."""
     if host == "osu.ppy.sh":
         return Response("bancho.py only supports the -devserver connection method")
+
+    # Check if we have this .osu file locally (BSS maps)
+    # Try to find by filename in DB
+    rec = await maps_repo.fetch_one(filename=map_filename)
+    if rec is not None:
+        osu_path = BEATMAPS_PATH / f"{rec['id']}.osu"
+        if osu_path.exists():
+            return Response(
+                content=osu_path.read_bytes(),
+                media_type="application/octet-stream",
+            )
 
     return RedirectResponse(
         url=f"https://osu.ppy.sh{request['raw_path'].decode()}",
@@ -2451,7 +3564,8 @@ async def register_account(
         # make the md5 & bcrypt the md5 for sql.
         pw_md5 = hashlib.md5(pw_plaintext.encode()).hexdigest().encode()
         pw_bcrypt = bcrypt.hashpw(pw_md5, bcrypt.gensalt())
-        app.state.cache.bcrypt[pw_bcrypt] = pw_md5  # cache result for login
+        _ck = hashlib.sha256(pw_bcrypt + b":" + pw_md5).digest()
+        app.state.cache.bcrypt[_ck] = True  # cache result for login
 
         ip = app.state.services.ip_resolver.get_ip(request.headers)
 
