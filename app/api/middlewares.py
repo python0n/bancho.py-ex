@@ -39,11 +39,56 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, *args, max_requests_per_second: int = 30, **kwargs):
+    """Per-IP token-bucket rate limiter.
+
+    - api.* subdomain : up to API_MAX_PER_SECOND requests/s per IP
+    - login/register  : up to AUTH_MAX_PER_MINUTE requests/min per IP
+      (brute-force protection)
+    """
+
+    API_MAX_PER_SECOND: int = 30
+    AUTH_MAX_PER_MINUTE: int = 10
+    AUTH_PATHS: frozenset[str] = frozenset(
+        {"/users/login", "/web/login.php", "/users/register"},
+    )
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
-        self.max_requests_per_second = max_requests_per_second
-        self.last_access_time = 0
-        self.tokens = 0
+        # {ip_str: [tokens, last_refill_time]}
+        self._api_buckets: dict[str, list[float]] = {}
+        # {ip_str: [attempt_count, window_start_time]}
+        self._auth_windows: dict[str, list[float]] = {}
+
+    def _api_allowed(self, ip: str) -> bool:
+        now = time.time()
+        if ip not in self._api_buckets:
+            self._api_buckets[ip] = [float(self.API_MAX_PER_SECOND - 1), now]
+            return True
+        tokens, last = self._api_buckets[ip]
+        tokens = min(
+            float(self.API_MAX_PER_SECOND),
+            tokens + (now - last) * self.API_MAX_PER_SECOND,
+        )
+        self._api_buckets[ip][1] = now
+        if tokens < 1.0:
+            return False
+        self._api_buckets[ip][0] = tokens - 1.0
+        return True
+
+    def _auth_allowed(self, ip: str) -> bool:
+        now = time.time()
+        if ip not in self._auth_windows:
+            self._auth_windows[ip] = [1.0, now]
+            return True
+        count, window_start = self._auth_windows[ip]
+        if now - window_start >= 60.0:
+            self._auth_windows[ip] = [1.0, now]
+            return True
+        count += 1.0
+        if count > self.AUTH_MAX_PER_MINUTE:
+            return False
+        self._auth_windows[ip][0] = count
+        return True
 
     async def dispatch(
         self,
@@ -51,29 +96,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         call_next: RequestResponseEndpoint,
     ) -> Response:
         host = request.headers.get("host", "")
-        if not host.startswith("api."):
-            # Skip rate limiting for non-"api" subdomain requests
-            return await call_next(request)
+        ip = str(app.state.services.ip_resolver.get_ip(request.headers))
 
-        current_time = time.time()
-
-        # Refill tokens
-        elapsed_time = current_time - self.last_access_time
-        tokens_to_add = int(elapsed_time * self.max_requests_per_second)
-        self.tokens = min(self.tokens + tokens_to_add, self.max_requests_per_second)
-        self.last_access_time = current_time
-
-        # Check if enough tokens are available
-        if self.tokens < 1:
-            ip = app.state.services.ip_resolver.get_ip(request.headers)
-            url = request.url.path
-            print(f"Rate Limit Exceeded - IP: {ip}, Endpoint: {url}")
+        # API subdomain – per-IP token bucket
+        if host.startswith("api.") and not self._api_allowed(ip):
+            log(f"Rate limit [API] IP={ip} path={request.url.path}", Ansi.LRED)
             return Response("Too Many Requests", status_code=429)
 
-        # Consume a token
-        self.tokens -= 1
+        # Login / register – per-IP sliding window (brute-force protection)
+        if request.url.path in self.AUTH_PATHS and not self._auth_allowed(ip):
+            log(f"Rate limit [AUTH] IP={ip} path={request.url.path}", Ansi.LRED)
+            return Response("Too Many Requests", status_code=429)
 
-        # Call the next middleware
-        response = await call_next(request)
-
-        return response
+        return await call_next(request)

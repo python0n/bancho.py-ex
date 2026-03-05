@@ -23,3 +23,13 @@ caps.json
 
 docker-compose.override.yml
 ..env.swp
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
