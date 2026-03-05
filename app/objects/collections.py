@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
@@ -267,7 +268,9 @@ class Players(list[Player]):
 
         assert player.pw_bcrypt is not None
 
-        if app.state.cache.bcrypt[player.pw_bcrypt] == pw_md5.encode():
+        trusted_hashword = player.pw_bcrypt.encode()
+        cache_key = hashlib.sha256(trusted_hashword + b":" + pw_md5.encode()).digest()
+        if cache_key in app.state.cache.bcrypt:
             return player
 
         return None
