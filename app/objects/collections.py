@@ -268,7 +268,7 @@ class Players(list[Player]):
 
         assert player.pw_bcrypt is not None
 
-        trusted_hashword = player.pw_bcrypt.encode()
+        trusted_hashword = player.pw_bcrypt if isinstance(player.pw_bcrypt, bytes) else player.pw_bcrypt.encode()
         cache_key = hashlib.sha256(trusted_hashword + b":" + pw_md5.encode()).digest()
         if cache_key in app.state.cache.bcrypt:
             return player
