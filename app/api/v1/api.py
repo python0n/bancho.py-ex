@@ -470,7 +470,7 @@ async def api_get_player_scores(
         {
             "id": row.get("id"),
             "score": row.get("score"),
-            "pp": row.get("pp"),
+            "pp": float(row.get("pp") or 0),
             "acc": row.get("acc"),
             "max_combo": row.get("max_combo"),
             "mods": row.get("mods"),
