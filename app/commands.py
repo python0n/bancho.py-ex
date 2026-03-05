@@ -1768,7 +1768,7 @@ async def mp_addref(ctx: Context, match: Match) -> str | None:
     return f"{target.name} added to match referees."
 
 
-@mp_commands.add(Privileges.UNRESTRICTED)
+@mp_commands.add(Privileges.UNRESTRICTED, aliases=["removeref"])
 @ensure_match
 async def mp_rmref(ctx: Context, match: Match) -> str | None:
     """Remove a referee from the current match by name."""
@@ -1789,7 +1789,7 @@ async def mp_rmref(ctx: Context, match: Match) -> str | None:
     return f"{target.name} removed from match referees."
 
 
-@mp_commands.add(Privileges.UNRESTRICTED)
+@mp_commands.add(Privileges.UNRESTRICTED, aliases=["listrefs"])
 @ensure_match
 async def mp_listref(ctx: Context, match: Match) -> str | None:
     """List all referees from the current match."""
@@ -2181,6 +2181,244 @@ async def mp_pick(ctx: Context, match: Match) -> str | None:
     match.enqueue_state()
 
     return f"Picked {bmap.embed}. ({mods_slot})"
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_kick(ctx: Context, match: Match) -> str | None:
+    """Kick a player from the current match by name."""
+    if len(ctx.args) != 1:
+        return "Invalid syntax: !mp kick <name>"
+
+    target = app.state.sessions.players.get(name=ctx.args[0])
+    if not target:
+        return "Could not find a user by that name."
+
+    if target not in {slot.player for slot in match.slots}:
+        return "Found no such player in the match."
+
+    if target is match.host:
+        return "You can't kick the host!"
+
+    slot = match.get_slot(target)
+    assert slot is not None
+    slot.reset()
+    match.enqueue_state()
+    return f"{target.name} was kicked from the match."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_timer(ctx: Context, match: Match) -> str | None:
+    """Start a countdown timer in the current match."""
+    if len(ctx.args) > 1:
+        return "Invalid syntax: !mp timer [seconds]"
+
+    if match.starting is not None:
+        time_remaining = int(match.starting["time"] - time.time())
+        return f"Timer already active ({time_remaining}s remaining)."
+
+    duration = 30  # default
+    if ctx.args:
+        if not ctx.args[0].isdecimal():
+            return "Invalid syntax: !mp timer [seconds]"
+        duration = int(ctx.args[0])
+        if not 0 < duration <= 600:
+            return "Timer range is 1-600 seconds."
+
+    def _end() -> None:
+        match.starting = None
+        match.chat.send_bot("Timer ended.")
+
+    def _alert(t: int) -> None:
+        match.chat.send_bot(f"Timer ends in {t} seconds.")
+
+    match.starting = {
+        "start": app.state.loop.call_later(duration, _end),
+        "alerts": [
+            app.state.loop.call_later(duration - t, lambda t=t: _alert(t))
+            for t in (60, 30, 10, 5, 4, 3, 2, 1)
+            if t < duration
+        ],
+        "time": time.time() + duration,
+    }
+    return f"Timer started for {duration} seconds."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED, aliases=["at"])
+@ensure_match
+async def mp_aborttimer(ctx: Context, match: Match) -> str | None:
+    """Abort the current countdown timer (or match start timer)."""
+    if match.starting is None:
+        return "No timer currently active."
+
+    match.starting["start"].cancel()
+    for alert in match.starting["alerts"]:
+        alert.cancel()
+    match.starting = None
+    return "Timer aborted."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_size(ctx: Context, match: Match) -> str | None:
+    """Set the current match size by locking or unlocking slots."""
+    if len(ctx.args) != 1 or not ctx.args[0].isdecimal():
+        return "Invalid syntax: !mp size <size>"
+
+    size = int(ctx.args[0])
+    if not 1 <= size <= 16:
+        return "Match size must be between 1 and 16."
+
+    for i, slot in enumerate(match.slots):
+        if i < size:
+            if slot.status == SlotStatus.locked:
+                slot.status = SlotStatus.open
+        else:
+            if slot.status == SlotStatus.open:
+                slot.status = SlotStatus.locked
+
+    match.enqueue_state()
+    return f"Match size set to {size}."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED, aliases=["passwd", "pw"])
+@ensure_match
+async def mp_password(ctx: Context, match: Match) -> str | None:
+    """Set or clear the current match's password."""
+    match.passwd = ctx.args[0] if ctx.args else ""
+    msg = f"Password set." if match.passwd else "Password removed."
+    match.enqueue_state(lobby=True)
+    return msg
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_name(ctx: Context, match: Match) -> str | None:
+    """Rename the current match."""
+    if not ctx.args:
+        return "Invalid syntax: !mp name <title>"
+
+    new_name = " ".join(ctx.args)[:50]
+    match.name = new_name
+    match.enqueue_state(lobby=True)
+    return f"Match renamed to: {match.name}"
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_clearhost(ctx: Context, match: Match) -> str | None:
+    """Clear the current match host."""
+    match.host_id = -1
+    match.enqueue_state(lobby=True)
+    return "Host cleared."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_team(ctx: Context, match: Match) -> str | None:
+    """Assign a player to a team (red or blue)."""
+    if len(ctx.args) != 2 or ctx.args[1] not in ("red", "blue"):
+        return "Invalid syntax: !mp team <name> <red/blue>"
+
+    target = app.state.sessions.players.get(name=ctx.args[0])
+    if not target:
+        return "Could not find a user by that name."
+
+    if target not in {slot.player for slot in match.slots}:
+        return "Found no such player in the match."
+
+    slot = match.get_slot(target)
+    assert slot is not None
+    slot.team = MatchTeams.red if ctx.args[1] == "red" else MatchTeams.blue
+    match.enqueue_state()
+    return f"{target.name} moved to {ctx.args[1]} team."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_move(ctx: Context, match: Match) -> str | None:
+    """Move a player to a different slot in the current match."""
+    if len(ctx.args) != 2 or not ctx.args[1].isdecimal():
+        return "Invalid syntax: !mp move <name> <slot>"
+
+    target = app.state.sessions.players.get(name=ctx.args[0])
+    if not target:
+        return "Could not find a user by that name."
+
+    if target not in {slot.player for slot in match.slots}:
+        return "Found no such player in the match."
+
+    slot_id = int(ctx.args[1]) - 1  # convert 1-indexed to 0-indexed
+    if not 0 <= slot_id <= 15:
+        return "Slot must be between 1 and 16."
+
+    new_slot = match.slots[slot_id]
+    if new_slot.player is not None:
+        return "That slot is already occupied."
+
+    if new_slot.status == SlotStatus.locked:
+        return "That slot is locked."
+
+    old_slot = match.get_slot(target)
+    assert old_slot is not None
+    new_slot.copy_from(old_slot)
+    old_slot.reset()
+    match.enqueue_state()
+    return f"{target.name} moved to slot {slot_id + 1}."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_set(ctx: Context, match: Match) -> str | None:
+    """Set team mode, score mode, and match size simultaneously."""
+    if not ctx.args or len(ctx.args) > 3:
+        return "Invalid syntax: !mp set <teammode> [scoremode] [size]"
+
+    # team mode (required, accepts int 0-3 or name)
+    team_type_str = ctx.args[0]
+    if team_type_str in ("0", "ffa", "head-to-head"):
+        match.team_type = MatchTeamTypes.head_to_head
+    elif team_type_str in ("1", "tag", "tag-coop"):
+        match.team_type = MatchTeamTypes.tag_coop
+    elif team_type_str in ("2", "teams", "team-vs"):
+        match.team_type = MatchTeamTypes.team_vs
+    elif team_type_str in ("3", "tag-teams", "tag-team-vs"):
+        match.team_type = MatchTeamTypes.tag_team_vs
+    else:
+        return "Unknown team type (0=ffa, 1=tag, 2=teams, 3=tag-teams)."
+
+    # score mode (optional)
+    if len(ctx.args) >= 2:
+        cond_str = ctx.args[1]
+        if cond_str in ("0", "score"):
+            match.win_condition = MatchWinConditions.score
+        elif cond_str in ("1", "accuracy", "acc"):
+            match.win_condition = MatchWinConditions.accuracy
+        elif cond_str in ("2", "combo"):
+            match.win_condition = MatchWinConditions.combo
+        elif cond_str in ("3", "scorev2", "v2"):
+            match.win_condition = MatchWinConditions.scorev2
+        else:
+            return "Unknown score mode (0=score, 1=acc, 2=combo, 3=scorev2)."
+
+    # size (optional)
+    if len(ctx.args) >= 3:
+        if not ctx.args[2].isdecimal():
+            return "Invalid size."
+        size = int(ctx.args[2])
+        if not 1 <= size <= 16:
+            return "Match size must be between 1 and 16."
+        for i, slot in enumerate(match.slots):
+            if i < size:
+                if slot.status == SlotStatus.locked:
+                    slot.status = SlotStatus.open
+            else:
+                if slot.status == SlotStatus.open:
+                    slot.status = SlotStatus.locked
+
+    match.enqueue_state()
+    return "Match settings updated."
 
 
 """ Mappool management commands
