@@ -33,6 +33,24 @@ For installation look up our [new documentation](https://osu-nolimits.github.io/
 - 🕹️ **Support for osu! 2016 client** (optional)
 - ⚙️ **Configure server name and Discord invite via `.env`—no code changes required**
 - 🛠️ **Fixes and performance optimizations**
+- 📦 **Beatmap Submission System (BSS)**:
+  - Submit maps directly from the osu! editor
+  - Automatic `.osu` metadata parsing and star rating calculation via `akatsuki_pp_py`
+  - Map download endpoint `/d/{set_id}` that builds `.osz` files on demand
+  - Integration with osz2-service for encrypted file decryption
+- 🪞 **osu!direct mirror fallback** — automatic failover on Cloudflare errors (520–527, 530), no-video variant via `/d/n`
+- 🛡️ **Per-IP rate limiting** — brute-force protection on login endpoints
+- 🧹 **PP sanitization** — blocks absurd PP scores from entering the database with configurable autoban
+- 🔢 **Floating-point PP** — stored as `DECIMAL(16,3)` throughout to prevent overflow and truncation
+- 🎮 **Match history tracking** — records multiplayer match data (`mp_match_games`, `mp_match_scores`, `mp_match_events`)
+- 🔐 **Client hash validation** — normalized hash comparison to prevent false login rejections
+- 📬 **Improved score webhooks** — floating-point PP display, try counter in embed footers
+
+---
+
+## 📋 Changelog
+
+Full changelog with all updates: **[taksiegra.ovh/changelog/](https://taksiegra.ovh/changelog/)**
 
 ---
 
