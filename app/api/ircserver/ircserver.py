@@ -513,24 +513,24 @@ class IRCClient:
             if cmd:
                 # a command was triggered.
                 if not cmd["hidden"]:
-                    await channel.send(message, sender=fro)
+                    channel.send(message, sender=fro)
                     if cmd["resp"] is not None:
-                        await channel.send_bot(cmd["resp"])
+                        channel.send_bot(cmd["resp"])
                 else:
                     staff = app.state.sessions.players.staff
-                    await channel.send_selective(
+                    channel.send_selective(
                         msg=message,
                         sender=fro,
                         recipients=staff - {fro},
                     )
                     if cmd["resp"] is not None:
-                        await channel.send_selective(
+                        channel.send_selective(
                             msg=cmd["resp"],
                             sender=app.state.sessions.bot,
                             recipients=staff | {fro},
                         )
             else:
-                await channel.send(message, fro)
+                channel.send(message, fro)
                 log(
                     f"{fro} @ {channel}: {message}",
                     Ansi.LCYAN,
@@ -551,17 +551,17 @@ class IRCClient:
                     cmd = None
  
                 if cmd:
-                    await recipient.send(message, sender=fro)
- 
+                    recipient.send(message, sender=fro)
+
                     if cmd["resp"] is not None:
-                        await fro.send_bot(cmd["resp"])
+                        fro.send_bot(cmd["resp"])
                         # Forward bot response to IRC client via IRC protocol
                         bot_name = app.state.sessions.bot.name
                         await self.add_queue(
                             f":{bot_name} PRIVMSG {fro.name} :{cmd['resp']}"
                         )
             else:
-                await recipient.send(message, fro)
+                recipient.send(message, fro)
                 log(
                     f"{fro} @ {recipient}: {message}",
                     Ansi.LCYAN,

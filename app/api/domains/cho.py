@@ -368,12 +368,18 @@ class SendMessage(BasePacket):
         else:
             cmd = None
 
+        irc = getattr(app.state.services, "irc", None)
+
         if cmd:
             # a command was triggered.
             if not cmd["hidden"]:
                 t_chan.send(msg, sender=player)
+                if irc:
+                    await irc.bancho_message(player.name, t_chan.real_name, msg)
                 if cmd["resp"] is not None:
                     t_chan.send_bot(cmd["resp"])
+                    if irc:
+                        await irc.bancho_message(app.state.sessions.bot.name, t_chan.real_name, cmd["resp"])
             else:
                 staff = app.state.sessions.players.staff
                 t_chan.send_selective(
@@ -427,6 +433,8 @@ class SendMessage(BasePacket):
                     player.last_np = None
 
             t_chan.send(msg, sender=player)
+            if irc:
+                await irc.bancho_message(player.name, t_chan.real_name, msg)
 
         player.update_latest_activity_soon()
 
