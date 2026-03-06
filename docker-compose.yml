@@ -12,7 +12,9 @@ services:
       MYSQL_RANDOM_ROOT_PASSWORD: "true"
     volumes:
       - ./migrations/base.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - db-data:/var/lib/mysql
+      # UWAGA: ./db-data to bind mount z danymi serwera!
+      # NIE zmieniać na "db-data" (named volume) — to zresetuje bazę!
+      - ./db-data:/var/lib/mysql
     healthcheck:
       test: '/usr/bin/mysql --user=$$MYSQL_USER --password=$$MYSQL_PASSWORD --execute "SHOW DATABASES;"'
       interval: 2s
