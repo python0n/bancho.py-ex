@@ -2505,13 +2505,18 @@ async def mp_close(ctx: Context, match: Match) -> str | None:
             alert.cancel()
         match.starting = None
 
-    # Remove all players from their slots (kick without auto-close side effects)
-    for slot in match.slots:
-        if slot.player is not None:
-            p = slot.player
-            slot.reset()
-            p.leave_channel(match.chat)
-            p.match = None
+    # Notify all slotted players before removing them so their clients close the lobby
+    slotted = [(slot, slot.player) for slot in match.slots if slot.player is not None]
+    for slot, p in slotted:
+        slot.reset()
+    # Send empty match state to all players still in the channel — this makes
+    # the osu! client automatically leave the match lobby UI
+    match.enqueue_state(lobby=False)
+
+    # Now clean up server-side references
+    for _, p in slotted:
+        p.leave_channel(match.chat)
+        p.match = None
 
     # Clean up IRC host's match reference if not in a slot
     if ctx.player.match is match:
