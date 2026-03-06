@@ -43,6 +43,7 @@ import app.usecases.performance
 import app.utils
 from app.constants import regexes
 from app.constants.gamemodes import GAMEMODE_REPR_LIST
+from app.constants.gamemodes import GameMode
 from app.constants.mods import SPEED_CHANGING_MODS
 from app.constants.mods import Mods
 from app.constants.privileges import ClanPrivileges
@@ -68,8 +69,10 @@ from app.repositories import tourney_pools as tourney_pools_repo
 from app.repositories import users as users_repo
 from app.usecases.performance import ScoreParams
 
+from app.objects.channel import Channel
+
 if TYPE_CHECKING:
-    from app.objects.channel import Channel
+    pass
 
 
 BEATMAPS_PATH = Path.cwd() / ".data/osu"
@@ -1485,6 +1488,76 @@ def ensure_match(
     return wrapper
 
 
+@mp_commands.add(Privileges.UNRESTRICTED)
+async def mp_make(ctx: Context) -> str | None:
+    """Create a new multiplayer match (usable from IRC)."""
+    if ctx.player.match:
+        return "You are already in a match. Use !mp close first."
+
+    if not ctx.args:
+        return "Invalid syntax: !mp make <title>"
+
+    title = " ".join(ctx.args)
+    if len(title) > 50:
+        return "Match title must be 50 characters or less."
+
+    match_id = app.state.sessions.matches.get_free()
+    if match_id is None:
+        return "No match slots available."
+
+    chat_channel = Channel(
+        name=f"#multi_{match_id}",
+        topic=f"MID {match_id}'s multiplayer channel.",
+        auto_join=False,
+        instance=True,
+    )
+
+    match = Match(
+        id=match_id,
+        name=title,
+        password="",
+        has_public_history=True,
+        map_name="",
+        map_id=0,
+        map_md5="",
+        host_id=ctx.player.id,
+        mode=GameMode.VANILLA_OSU,
+        mods=Mods.NOMOD,
+        win_condition=MatchWinConditions.score,
+        team_type=MatchTeamTypes.head_to_head,
+        freemods=False,
+        seed=0,
+        chat_channel=chat_channel,
+    )
+
+    app.state.sessions.matches[match_id] = match
+    app.state.sessions.channels.append(chat_channel)
+    match.chat = chat_channel
+
+    try:
+        match.web_id = await app.state.services.database.execute(
+            "INSERT INTO mp_matches (bancho_slot, name, creator_id, created_at, ended_at) "
+            "VALUES (:bancho_slot, :name, :creator_id, NOW(), NULL)",
+            {
+                "bancho_slot": match_id + 1,
+                "name": match.name,
+                "creator_id": ctx.player.id,
+            },
+        )
+    except Exception as exc:
+        log(f"Failed to insert mp_matches for match {match_id}: {exc}", Ansi.LYELLOW)
+
+    if getattr(ctx.player, "irc_client", False):
+        # IRC clients must not occupy a slot — they're just managing the match.
+        # Manually join the channel and set match reference without entering a slot.
+        ctx.player.join_channel(match.chat)
+        ctx.player.match = match
+        match.enqueue_state()  # broadcast to #lobby so game clients see it
+    else:
+        ctx.player.join_match(match, "")
+    return f"Match created: join #multi_{match_id}"
+
+
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["h"])
 @ensure_match
 async def mp_help(ctx: Context, match: Match) -> str | None:
@@ -1823,7 +1896,7 @@ async def mp_unlock(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_teams(ctx: Context, match: Match) -> str | None:
-    """Change the team type for the current match."""
+    # use !mp set instead
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp teams <type>"
 
@@ -1864,7 +1937,7 @@ async def mp_teams(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["cond"])
 @ensure_match
 async def mp_condition(ctx: Context, match: Match) -> str | None:
-    """Change the win condition for the match."""
+    # use !mp set instead
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp condition <type>"
 
@@ -2262,7 +2335,7 @@ async def mp_aborttimer(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_size(ctx: Context, match: Match) -> str | None:
-    """Set the current match size by locking or unlocking slots."""
+    # use !mp set instead
     if len(ctx.args) != 1 or not ctx.args[0].isdecimal():
         return "Invalid syntax: !mp size <size>"
 
@@ -2419,6 +2492,40 @@ async def mp_set(ctx: Context, match: Match) -> str | None:
 
     match.enqueue_state()
     return "Match settings updated."
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+@ensure_match
+async def mp_close(ctx: Context, match: Match) -> str | None:
+    """Close the current match, removing all players."""
+    # Cancel any running timers first
+    if match.starting is not None:
+        match.starting["start"].cancel()
+        for alert in match.starting["alerts"]:
+            alert.cancel()
+        match.starting = None
+
+    # Remove all players from their slots (kick without auto-close side effects)
+    for slot in match.slots:
+        if slot.player is not None:
+            p = slot.player
+            slot.reset()
+            p.leave_channel(match.chat)
+            p.match = None
+
+    # Clean up IRC host's match reference if not in a slot
+    if ctx.player.match is match:
+        ctx.player.leave_channel(match.chat)
+        ctx.player.match = None
+
+    # Force-remove match from sessions and notify lobby
+    app.state.sessions.matches.remove(match)
+
+    lobby = app.state.sessions.channels.get_by_name("#lobby")
+    if lobby:
+        lobby.enqueue(app.packets.dispose_match(match.id))
+
+    return None
 
 
 """ Mappool management commands
