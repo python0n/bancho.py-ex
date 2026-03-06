@@ -1608,6 +1608,13 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
             if not 0 < duration <= 300:
                 return "Timer range is 1-300 seconds."
 
+            def _irc_fwd_start(msg: str) -> None:
+                irc = getattr(app.state.services, "irc", None)
+                if irc:
+                    app.state.loop.create_task(
+                        irc.bancho_message(app.state.sessions.bot.name, match.chat.real_name, msg)
+                    )
+
             def _start() -> None:
                 """Remove any pending timers & start the match."""
                 # remove start & alert timers
@@ -1616,15 +1623,21 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
                 # make sure player didn't leave the
                 # match since queueing this start lol...
                 if ctx.player not in {slot.player for slot in match.slots}:
-                    match.chat.send_bot("Player left match? (cancelled)")
+                    msg = "Player left match? (cancelled)"
+                    match.chat.send_bot(msg)
+                    _irc_fwd_start(msg)
                     return
 
                 match.start()
-                match.chat.send_bot("Starting match.")
+                msg = "Starting match."
+                match.chat.send_bot(msg)
+                _irc_fwd_start(msg)
 
             def _alert_start(t: int) -> None:
                 """Alert the match of the impending start."""
-                match.chat.send_bot(f"Match starting in {t} seconds.")
+                msg = f"Match starting in {t} seconds."
+                match.chat.send_bot(msg)
+                _irc_fwd_start(msg)
 
             # add timers to our match object,
             # so we can cancel them if needed.
@@ -2299,12 +2312,23 @@ async def mp_timer(ctx: Context, match: Match) -> str | None:
         if not 0 < duration <= 600:
             return "Timer range is 1-600 seconds."
 
+    def _irc_fwd_timer(msg: str) -> None:
+        irc = getattr(app.state.services, "irc", None)
+        if irc:
+            app.state.loop.create_task(
+                irc.bancho_message(app.state.sessions.bot.name, match.chat.real_name, msg)
+            )
+
     def _end() -> None:
         match.starting = None
-        match.chat.send_bot("Timer ended.")
+        msg = "Timer ended."
+        match.chat.send_bot(msg)
+        _irc_fwd_timer(msg)
 
     def _alert(t: int) -> None:
-        match.chat.send_bot(f"Timer ends in {t} seconds.")
+        msg = f"Timer ends in {t} seconds."
+        match.chat.send_bot(msg)
+        _irc_fwd_timer(msg)
 
     match.starting = {
         "start": app.state.loop.call_later(duration, _end),
