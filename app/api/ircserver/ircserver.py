@@ -252,6 +252,7 @@ class IRCClient:
         if msg.startswith("!mp close"):
             log(f"Trying to part channel {recipient}", Ansi.LYELLOW)
             await self.handle_mp_close()
+            return
 
         if recipient.startswith("#") or recipient.startswith("$"):
             channel = app.state.sessions.channels.get_by_name(recipient)
@@ -356,24 +357,29 @@ class IRCClient:
                 raise
  
     async def handle_mp_close(self) -> None:
-        """Handle !mp close to leave and part the match."""
+        """Close the current match by routing through the !mp close command."""
         try:
             if not self.player.match:
                 return
- 
+
             match_id = self.player.match.id
             channel_name = f"#multi_{match_id}"
+            match_chat = self.player.match.chat
 
+            # Let the normal command handler do all cleanup (slots, DB, dispose)
+            cmd = await commands.process_commands(self.player, match_chat, "!mp close")
+            if cmd and cmd.get("resp"):
+                bot_name = app.state.sessions.bot.name
+                await self.add_queue(
+                    f":{bot_name} PRIVMSG {self.player.name} :{cmd['resp']}"
+                )
+
+            # Tell IRC client to part the channel
             await self.add_queue(f":{self.player.name} PART {channel_name} :Match closed")
+            log(f"[IRC] Match {match_id} closed by {self.player.name}", Ansi.LYELLOW)
 
-            log(f"[IRC] Sent PART for {channel_name}", Ansi.LYELLOW)
-            await self.handler_part(channel_name)
- 
-            await self.player.leave_match()
- 
         except Exception as e:
             log(f"[WARN] MP close failed: {e}", Ansi.LYELLOW)
-            await self.socket.drain()
  
     async def handler_join(self, channel: str) -> None:
         if self.player is None:
@@ -388,18 +394,20 @@ class IRCClient:
             )
         try:
             log(f"Joining channel {channel}", Ansi.LYELLOW)
-            if self.player.join_channel(chan):
+            already_member = self.player in chan.players
+            joined = self.player.join_channel(chan)
+            if joined or already_member:
                 for client in await self.server.authorized_clients:
                     assert client.player is not None
-    
+
                     if chan in client.player.channels:
                         await client.add_queue(f":{self.player.name} JOIN :{chan.real_name}")
-    
+
                 if chan.topic:
                     await self.add_queue(f"332 {chan.real_name} :{chan.topic}")
                 else:
                     await self.add_queue(f"331 {chan.real_name} :No topic is set")
-    
+
                 nicks = " ".join([x.name for x in chan.players])
                 await self.add_queue(f":{NAME} 353 {self.player.name} = {chan.real_name} :{nicks}")
                 await self.add_queue(
@@ -410,6 +418,8 @@ class IRCClient:
                     403,
                     f"{channel} :No channel named {channel} has been found",
                 )
+        except BanchoIRCException:
+            raise
         except Exception as e:
             log(f"Error {e}", Ansi.LRED)
         
@@ -545,6 +555,11 @@ class IRCClient:
  
                     if cmd["resp"] is not None:
                         await fro.send_bot(cmd["resp"])
+                        # Forward bot response to IRC client via IRC protocol
+                        bot_name = app.state.sessions.bot.name
+                        await self.add_queue(
+                            f":{bot_name} PRIVMSG {fro.name} :{cmd['resp']}"
+                        )
             else:
                 await recipient.send(message, fro)
                 log(
