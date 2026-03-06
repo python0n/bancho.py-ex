@@ -2518,6 +2518,16 @@ async def mp_close(ctx: Context, match: Match) -> str | None:
         ctx.player.leave_channel(match.chat)
         ctx.player.match = None
 
+    # Mark match as ended in the database
+    if match.web_id:
+        try:
+            await app.state.services.database.execute(
+                "UPDATE mp_matches SET ended_at = NOW() WHERE id = :id",
+                {"id": match.web_id},
+            )
+        except Exception as exc:
+            log(f"Failed to update mp_matches ended_at for match {match.id}: {exc}", Ansi.LYELLOW)
+
     # Force-remove match from sessions and notify lobby
     app.state.sessions.matches.remove(match)
 
