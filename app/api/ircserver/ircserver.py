@@ -510,12 +510,20 @@ class IRCClient:
             else:
                 cmd = None
  
+            bot_name = app.state.sessions.bot.name
+
             if cmd:
                 # a command was triggered.
                 if not cmd["hidden"]:
                     channel.send(message, sender=fro)
                     if cmd["resp"] is not None:
                         channel.send_bot(cmd["resp"])
+                        # Forward bot response to IRC client as a channel PRIVMSG
+                        for resp_line in cmd["resp"].split("\n"):
+                            if resp_line.strip():
+                                await self.add_queue(
+                                    f":{bot_name} PRIVMSG {to} :{resp_line}"
+                                )
                 else:
                     staff = app.state.sessions.players.staff
                     channel.send_selective(
