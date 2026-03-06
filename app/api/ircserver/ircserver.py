@@ -44,8 +44,9 @@ class IRCClient:
         self.socket = writer
         self.server = server
         self.player: Player
-        self._ip = None 
+        self._ip = None
         self.ip_obj = None
+        self.owns_player = False  # True only when IRC login created a new player session
  
     def __repr__(self) -> str:
         if self.player is not None:
@@ -91,34 +92,40 @@ class IRCClient:
         await self.add_queue(f":{NAME} 376 : End of MOTD command")
  
     async def login(self, irc_key: Optional[str] = "") -> Player | None:
-        
-        player = await Player.from_irc(irc_key)
-
-        log(f"IRC login: {player.name}", Ansi.LCYAN)
- 
         if not irc_key:
             raise BanchoIRCException(464, f"PASS :Incorrect password")
- 
+
+        player = await Player.from_irc(irc_key)
+
         if not player:
             raise BanchoIRCException(404, f"PLAYER :Incorrect username")
- 
+
         if player.restricted:
             raise BanchoIRCException(404, f"PLAYER :You can't login in restricted mode")
 
+        # If the player is already online (e.g. game client), reuse their session
+        # to avoid duplicate entries in channel NAMES replies.
+        existing = app.state.sessions.players.get(id=player.id)
+        if existing:
+            existing.irc_client = True
+            self.owns_player = False
+            log(f"IRC login: {existing.name}", Ansi.LCYAN)
+            log(f"{existing} logged in from IRC with {self.ip}", Ansi.LCYAN)
+            return existing
+
         player.irc_client = True
- 
-        
         await player.stats_from_sql_full()
- 
         player.geoloc = await app.state.services.fetch_geoloc(self.ip_obj)
 
-        user_data = app.packets.user_presence(player) 
-
+        user_data = app.packets.user_presence(player)
         app.state.sessions.players.append(player)
         app.state.sessions.players.enqueue(user_data)
- 
+
+        self.owns_player = True
+        log(f"IRC login: {player.name}", Ansi.LCYAN)
         log(f"{player} logged in from IRC with {self.ip}", Ansi.LCYAN)
- 
+
+
         return player
  
     async def data_received(self, data: bytes) -> None:
@@ -419,18 +426,28 @@ class IRCClient:
     async def handler_quit(self, args: str) -> None:
         if self.player is None:
             raise BanchoIRCException(451, "You have not registered")
- 
-        for chan in self.player.channels:
+
+        # Notify all shared-channel clients of the QUIT (deduplicate per client)
+        notified: set[int] = set()
+        for chan in list(self.player.channels):
             for client in await self.server.authorized_clients:
-                assert client.player is not None
- 
-                if chan in client.player.channels:
+                if (
+                    client.player is not None
+                    and client.player.id not in notified
+                    and chan in client.player.channels
+                ):
+                    notified.add(client.player.id)
                     await client.add_queue(f":{self.player.name} QUIT :{args.lstrip(':')}")
- 
-            if self.player.irc_client:
-                await self.player.logout()
-                log(f"{self.player} disconnected from IRC", Ansi.YELLOW)
- 
+
+        # Logout once, outside the channel loop
+        player_name = self.player.name
+        if self.owns_player:
+            self.player.logout()
+        else:
+            self.player.irc_client = False
+        self.player = None  # prevent the finally block from calling logout again
+        log(f"{player_name} disconnected from IRC", Ansi.YELLOW)
+
         self.socket.close()
         await self.socket.wait_closed()
  
@@ -673,8 +690,11 @@ class IRCServer:
                     await writer.wait_closed()
  
                 if client.player:
-                    await client.player.logout()
                     log_msg = f"{client.player.name} ({client_ip})"
+                    if client.owns_player:
+                        client.player.logout()
+                    else:
+                        client.player.irc_client = False
                 else:
                     log_msg = f"Anonymous ({client_ip})"
  

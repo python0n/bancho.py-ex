@@ -690,6 +690,25 @@ class Player:
 
             app.state.sessions.matches.remove(self.match)
 
+            # Clean up any IRC hosts or observers that are in the channel but
+            # not occupying a slot (they never go through leave_match themselves).
+            for p in list(self.match.chat.players):
+                p.leave_channel(self.match.chat)
+                p.match = None
+
+            # Mark the match as ended in the database (async, fire-and-forget).
+            if self.match.web_id:
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(
+                        app.state.services.database.execute(
+                            "UPDATE mp_matches SET ended_at = NOW() WHERE id = :id",
+                            {"id": self.match.web_id},
+                        )
+                    )
+                except RuntimeError:
+                    pass
+
             lobby = app.state.sessions.channels.get_by_name("#lobby")
             if lobby:
                 lobby.enqueue(app.packets.dispose_match(self.match.id))
