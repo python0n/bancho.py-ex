@@ -662,7 +662,12 @@ class Player:
             return
 
         slot = self.match.get_slot(self)
-        assert slot is not None
+        if slot is None:
+            # IRC host / observer: in channel but not occupying a slot.
+            # Just clean up the channel and match references.
+            self.leave_channel(self.match.chat)
+            self.match = None
+            return
 
         if slot.status == SlotStatus.locked:
             # player was kicked, keep the slot locked.
