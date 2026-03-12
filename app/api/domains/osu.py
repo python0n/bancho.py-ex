@@ -814,7 +814,7 @@ async def _bss_process_osu_files(
                 diff=0.0,
             )
         except Exception as e:
-            log(f"[BSS] failed to create map entry: {e}", Ansi.LRED)
+            log(f"[BSS] failed to create map entry: {e!r}", Ansi.LRED)
             # Still save .osu file even if DB insert failed
             osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
             osu_file_path.write_bytes(file_data)
@@ -1756,7 +1756,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         if prev_n1:
                             if score.player.id != prev_n1["id"]:
                                 ann.append(
-                                    f"(Previous #1: [https://{app.settings.WEB_DOMAIN}/u/"
+                                    f"(Previous #1: [https://{app.settings.DOMAIN}/u/"
                                     "{id} {name}])".format(
                                         id=prev_n1["id"],
                                         name=prev_n1["name"],
@@ -1769,7 +1769,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         if(app.settings.ENABLE_FIRST_PLACES_WEBHOOK):
                             embed = Embed(
                             title=f"#1 achieved by {score.player.name}",
-                            description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.WEB_DOMAIN}/b/{score.bmap.id}",
+                            description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.DOMAIN}/b/{score.bmap.id}",
                             color=0xFFD700,
                             timestamp=datetime.now(timezone.utc).isoformat(),
                             )
@@ -1786,7 +1786,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                                 if score.player.id != prev_n1["id"]:
                                     embed.add_field(
                                     name="Previous #1",
-                                    value=f"[{prev_n1['name']}](https://{app.settings.WEB_DOMAIN}/u/{prev_n1['id']})",
+                                    value=f"[{prev_n1['name']}](https://{app.settings.DOMAIN}/u/{prev_n1['id']})",
                                     inline=False,
                                     )
 
@@ -2404,7 +2404,7 @@ async def osuSubmitModularSelector(
                     if prev_n1:
                         if score.player.id != prev_n1["id"]:
                             ann.append(
-                                f"(Previous #1: [https://{app.settings.WEB_DOMAIN}/u/"
+                                f"(Previous #1: [https://{app.settings.DOMAIN}/u/"
                                 "{id} {name}])".format(
                                     id=prev_n1["id"],
                                     name=prev_n1["name"],
@@ -2417,7 +2417,7 @@ async def osuSubmitModularSelector(
                     if(app.settings.ENABLE_FIRST_PLACES_WEBHOOK):
                         embed = Embed(
                         title=f"#1 achieved by {score.player.name}",
-                        description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.WEB_DOMAIN}/b/{score.bmap.id}",
+                        description=f"{score.player.name} has achieved #1 on \nhttps://{app.settings.DOMAIN}/b/{score.bmap.id}",
                         color=0xFFD700,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         )
@@ -2434,7 +2434,7 @@ async def osuSubmitModularSelector(
                             if score.player.id != prev_n1["id"]:
                                 embed.add_field(
                                 name="Previous #1",
-                                value=f"[{prev_n1['name']}](https://{app.settings.WEB_DOMAIN}/u/{prev_n1['id']})",
+                                value=f"[{prev_n1['name']}](https://{app.settings.DOMAIN}/u/{prev_n1['id']})",
                                 inline=False,
                                 )
 
@@ -2975,22 +2975,25 @@ async def getScores(
     if not bmap and map_set_id >= BSS_ID_OFFSET:
         bss_maps = await maps_repo.fetch_many(set_id=map_set_id)
         if bss_maps:
-            # Update the md5 in DB to match what the client has
-            target = bss_maps[0]
-            log(
-                f"[BSS] md5 mismatch fix: {target['md5']} -> {map_md5} "
-                f"for map {target['id']}",
-                Ansi.LCYAN,
-            )
-            await maps_repo.partial_update(id=target["id"], md5=map_md5)
+            already_exists = next((m for m in bss_maps if m["md5"] == map_md5), None)
+            if already_exists:
+                bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
+            else:
+                target = bss_maps[0]
+                log(
+                    f"[BSS] md5 mismatch fix: {target['md5']} -> {map_md5} "
+                    f"for map {target['id']}",
+                    Ansi.LCYAN,
+                )
+                await maps_repo.partial_update(id=target["id"], md5=map_md5)
 
-            # Clear old md5 from unsubmitted cache if present
-            if target["md5"] in app.state.cache.unsubmitted:
-                app.state.cache.unsubmitted.discard(target["md5"])
+                # Clear old md5 from unsubmitted cache if present
+                if target["md5"] in app.state.cache.unsubmitted:
+                    app.state.cache.unsubmitted.discard(target["md5"])
 
-            # Evict the old beatmapset from cache so it reloads
-            if map_set_id in app.state.cache.beatmapset:
-                del app.state.cache.beatmapset[map_set_id]
+                # Evict the old beatmapset from cache so it reloads
+                if map_set_id in app.state.cache.beatmapset:
+                    del app.state.cache.beatmapset[map_set_id]
 
             # Retry lookup with the now-corrected md5
             bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
