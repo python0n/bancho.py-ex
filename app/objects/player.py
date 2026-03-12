@@ -645,9 +645,21 @@ class Player:
         if match.team_type in (MatchTeamTypes.team_vs, MatchTeamTypes.tag_team_vs):
             slot.team = MatchTeams.red
 
+        # send match link on first player joining (before slot assignment)
+        _is_first_player = not any(s.player is not None for s in match.slots)
+
         slot.status = SlotStatus.not_ready
         slot.player = self
         self.match = match
+
+        if _is_first_player:
+            match_id = getattr(match, "web_id", None) or match.id
+            match.chat.send_bot(
+                f"Room name: {match.name}, History: https://osu.ppy.sh/mp/{match_id}"
+            )
+
+        slot_idx = match.slots.index(slot) + 1
+        match.chat.send_bot(f"{self.name} joined in slot {slot_idx}.")
 
         self.enqueue(app.packets.match_join_success(match))
         match.enqueue_state()

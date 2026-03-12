@@ -105,6 +105,16 @@ class Channel:
             ),
         )
 
+        # Forward to any IRC clients in this channel
+        irc = getattr(app.state.services, "irc", None)
+        if irc:
+            try:
+                app.state.loop.create_task(
+                    irc.bancho_message(bot.name, self.real_name, msg)
+                )
+            except RuntimeError:
+                pass
+
     def send_selective(
         self,
         msg: str,

@@ -1886,6 +1886,32 @@ class MatchComplete(BasePacket):
             s for s in player.match.slots if s.player and s.player.id not in not_playing
         ]
 
+        # Announce match results to the match chat
+        if was_playing:
+            results = []
+            for s in was_playing:
+                if s.player is None:
+                    continue
+                sf = getattr(s, "last_score_frame", None)
+                if sf:
+                    score = sf.get("total_score", 0)
+                    n300 = sf.get("num300", 0)
+                    n100 = sf.get("num100", 0)
+                    n50 = sf.get("num50", 0)
+                    n_miss = sf.get("num_miss", 0)
+                    max_combo = sf.get("max_combo", 0)
+                    total = n300 + n100 + n50 + n_miss
+                    acc = (300 * n300 + 100 * n100 + 50 * n50) / (300 * total) * 100 if total else 0.0
+                    results.append((score, s.player.name, acc, max_combo))
+                else:
+                    results.append((0, s.player.name, 0.0, 0))
+            results.sort(key=lambda x: x[0], reverse=True)
+            player.match.chat.send_bot("Match ended!")
+            for rank, (score, pname, acc, max_combo) in enumerate(results, 1):
+                player.match.chat.send_bot(
+                    f"#{rank} {pname}: {score:,} ({acc:.2f}%) x{max_combo}"
+                )
+
         player.match.unready_players(expected=SlotStatus.complete)
         player.match.reset_players_loaded_status()
 

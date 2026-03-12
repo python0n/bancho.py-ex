@@ -251,7 +251,7 @@ class IRCClient:
 
         if msg.startswith("!mp close"):
             log(f"Trying to part channel {recipient}", Ansi.LYELLOW)
-            await self.handle_mp_close()
+            await self.handle_mp_close(recipient)
             return
 
         if recipient.startswith("#") or recipient.startswith("$"):
@@ -356,27 +356,49 @@ class IRCClient:
             else:
                 raise
  
-    async def handle_mp_close(self) -> None:
+    async def handle_mp_close(self, recipient: str = "") -> None:
         """Close the current match by routing through the !mp close command."""
         try:
-            if not self.player.match:
+            match = self.player.match
+
+            # If player.match is None (e.g. after reconnect or auto-close), try to
+            # recover the match from the channel name the command was sent to.
+            if match is None and recipient.startswith("#multi_"):
+                try:
+                    mid = int(recipient.split("_", 1)[1])
+                    candidate = app.state.sessions.matches[mid]
+                    if candidate is not None:
+                        match = candidate
+                        self.player.match = match
+                        self.player.join_channel(match.chat)
+                except (ValueError, IndexError):
+                    pass
+
+            if match is None:
+                await self.add_queue(
+                    f":{NAME} NOTICE {self.player.name} :No active match to close."
+                )
                 return
 
-            match_id = self.player.match.id
+            match_id = match.id
             channel_name = f"#multi_{match_id}"
-            match_chat = self.player.match.chat
+            match_chat = match.chat
 
             # Let the normal command handler do all cleanup (slots, DB, dispose)
             cmd = await commands.process_commands(self.player, match_chat, "!mp close")
-            if cmd and cmd.get("resp"):
-                bot_name = app.state.sessions.bot.name
-                await self.add_queue(
-                    f":{bot_name} PRIVMSG {self.player.name} :{cmd['resp']}"
-                )
 
-            # Tell IRC client to part the channel
-            await self.add_queue(f":{self.player.name} PART {channel_name} :Match closed")
-            log(f"[IRC] Match {match_id} closed by {self.player.name}", Ansi.LYELLOW)
+            # mp_close returns None on success — detect success by checking player.match
+            if self.player.match is None:
+                # Match was successfully closed; tell IRC client to part the channel
+                await self.add_queue(f":{self.player.name} PART {channel_name} :Match closed")
+                log(f"[IRC] Match {match_id} closed by {self.player.name}", Ansi.LYELLOW)
+            else:
+                # Command ran but match wasn't closed — surface the response if any
+                if cmd and cmd.get("resp"):
+                    bot_name = app.state.sessions.bot.name
+                    await self.add_queue(
+                        f":{bot_name} PRIVMSG {self.player.name} :{cmd['resp']}"
+                    )
 
         except Exception as e:
             log(f"[WARN] MP close failed: {e}", Ansi.LYELLOW)
@@ -397,6 +419,16 @@ class IRCClient:
             already_member = self.player in chan.players
             joined = self.player.join_channel(chan)
             if joined or already_member:
+                # If joining a match channel, restore player.match reference
+                if chan.name.startswith("#multi_") and self.player.match is None:
+                    try:
+                        mid = int(chan.name.split("_", 1)[1])
+                        m = app.state.sessions.matches[mid]
+                        if m is not None:
+                            self.player.match = m
+                    except (ValueError, IndexError):
+                        pass
+
                 for client in await self.server.authorized_clients:
                     assert client.player is not None
 
