@@ -1476,8 +1476,17 @@ def ensure_match(
             # message not in match channel
             return None
 
+        try:
+            in_refs = ctx.player in match.refs
+        except ValueError:
+            # host not found in sessions; fall back to id comparison
+            in_refs = (
+                ctx.player.id == match.host_id
+                or ctx.player in match.referees
+            )
+
         if not (
-            ctx.player in match.refs
+            in_refs
             or ctx.player.priv & Privileges.TOURNEY_MANAGER
             or f is mp_help.__wrapped__  # type: ignore[attr-defined]
         ):
@@ -1575,6 +1584,75 @@ async def mp_help(ctx: Context, match: Match) -> str | None:
     return "\n".join(cmds)
 
 
+@mp_commands.add(Privileges.UNRESTRICTED, aliases=["cfg", "info"])
+@ensure_match
+async def mp_settings(ctx: Context, match: Match) -> str | None:
+    """Show current match settings (room, beatmap, mods, slots)."""
+    _TEAM_TYPES = {
+        MatchTeamTypes.head_to_head: "HeadToHead",
+        MatchTeamTypes.tag_coop: "TagCoop",
+        MatchTeamTypes.team_vs: "TeamVs",
+        MatchTeamTypes.tag_team_vs: "TagTeamVs",
+    }
+    _WIN_CONDITIONS = {
+        MatchWinConditions.score: "Score",
+        MatchWinConditions.accuracy: "Accuracy",
+        MatchWinConditions.combo: "Combo",
+        MatchWinConditions.scorev2: "ScoreV2",
+    }
+    _SLOT_STATUS = {
+        SlotStatus.not_ready: "Not Ready",
+        SlotStatus.ready: "Ready",
+        SlotStatus.no_map: "No Map",
+        SlotStatus.playing: "Playing",
+        SlotStatus.complete: "Complete",
+    }
+    _MOD_FULL_NAMES = [
+        (Mods.NOFAIL, "NoFail"), (Mods.EASY, "Easy"), (Mods.HIDDEN, "Hidden"),
+        (Mods.HARDROCK, "HardRock"), (Mods.SUDDENDEATH, "SuddenDeath"),
+        (Mods.DOUBLETIME, "DoubleTime"), (Mods.RELAX, "Relax"),
+        (Mods.HALFTIME, "HalfTime"), (Mods.NIGHTCORE, "Nightcore"),
+        (Mods.FLASHLIGHT, "Flashlight"), (Mods.SPUNOUT, "SpunOut"),
+        (Mods.AUTOPILOT, "Autopilot"), (Mods.PERFECT, "Perfect"),
+        (Mods.SCOREV2, "ScoreV2"),
+    ]
+
+    # Build mods string
+    if not match.mods:
+        mods_str = "NoMod"
+    else:
+        mods_str = ", ".join(name for mod, name in _MOD_FULL_NAMES if match.mods & mod) or "NoMod"
+
+    player_count = sum(1 for s in match.slots if s.player is not None)
+    match_id = getattr(match, "web_id", None) or match.id
+
+    match.chat.send_bot(
+        f"Room name: {match.name}, History: https://osu.ppy.sh/mp/{match_id}"
+    )
+    match.chat.send_bot(
+        f"Beatmap: https://osu.ppy.sh/b/{match.map_id} {match.map_name}"
+    )
+    match.chat.send_bot(
+        f"Team mode: {_TEAM_TYPES.get(match.team_type, str(match.team_type))}, "
+        f"Win condition: {_WIN_CONDITIONS.get(match.win_condition, str(match.win_condition))}"
+    )
+    match.chat.send_bot(f"Active mods: {mods_str}")
+    match.chat.send_bot(f"Players: {player_count}")
+
+    for i, slot in enumerate(match.slots):
+        if slot.player is None:
+            continue
+        status = _SLOT_STATUS.get(slot.status, "Unknown")
+        host_tag = "  [Host]" if slot.player is match.host else ""
+        match.chat.send_bot(
+            f"Slot {i + 1}  {status}  "
+            f"https://osu.ppy.sh/u/{slot.player.id} {slot.player.name}"
+            f"{host_tag}"
+        )
+
+    return None
+
+
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["st"])
 @ensure_match
 async def mp_start(ctx: Context, match: Match) -> str | None:
@@ -1622,7 +1700,9 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
 
                 # make sure player didn't leave the
                 # match since queueing this start lol...
-                if ctx.player not in {slot.player for slot in match.slots}:
+                # IRC hosts never occupy a slot, so skip this check for them.
+                is_irc_host = getattr(ctx.player, "irc_client", False)
+                if not is_irc_host and ctx.player not in {slot.player for slot in match.slots}:
                     msg = "Player left match? (cancelled)"
                     match.chat.send_bot(msg)
                     _irc_fwd_start(msg)
