@@ -664,7 +664,12 @@ def write_match(m: Match, send_pw: bool = True) -> bytearray:
             assert s.player is not None
             ret += s.player.id.to_bytes(4, "little")
 
-    ret += m.host.id.to_bytes(4, "little")
+    # host_id can be -1 when host is cleared (!mp clearhost)
+    try:
+        host_id = m.host.id
+    except ValueError:
+        host_id = m.host_id  # fallback: use raw id (-1 or whatever)
+    ret += host_id.to_bytes(4, "little", signed=True)
     ret.extend((m.mode, m.win_condition, m.team_type, m.freemods))
 
     if m.freemods:

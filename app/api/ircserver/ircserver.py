@@ -132,6 +132,12 @@ class IRCClient:
         global cmd
         message = data.decode("utf-8")
         parts, command, args = None, None, None
+
+        # Keep IRC session alive: update last_recv_time on ANY activity
+        # so _disconnect_ghosts doesn't auto-dc the IRC user.
+        if self.player is not None:
+            self.player.last_recv_time = time.time()
+
         try:
             client_data = WHITE_SPACE.split(message.strip())
             for cmd in client_data:
@@ -263,11 +269,15 @@ class IRCClient:
                 )
  
             if channel not in self.player.channels:
-                raise BanchoIRCException(
-                    404,
-                    f"{recipient} :Cannot send message to the channel",
-                )
- 
+                # Try to auto-rejoin the channel if it still exists
+                if self.player.join_channel(channel):
+                    log(f"[IRC] Auto-rejoined {self.player.name} to {recipient}", Ansi.LYELLOW)
+                else:
+                    raise BanchoIRCException(
+                        404,
+                        f"{recipient} :Cannot send message to the channel",
+                    )
+
             await self.send_message(self.player, recipient, msg)
  
             for client in await self.server.authorized_clients:
@@ -342,9 +352,8 @@ class IRCClient:
         """Handle !mp make to create a new match."""
         if not hasattr(self.player, 'match') or not self.player.match:
             raise BanchoIRCException(404, "NOTICE :You're not in a match")
- 
-        match_id = self.player.match.id
-        channel_name = f"#multi_{match_id}"
+
+        channel_name = self.player.match.chat.real_name
  
         try:
             await self.handler_join(channel_name)
@@ -365,8 +374,8 @@ class IRCClient:
             # recover the match from the channel name the command was sent to.
             if match is None and recipient.startswith("#multi_"):
                 try:
-                    mid = int(recipient.split("_", 1)[1])
-                    candidate = app.state.sessions.matches[mid]
+                    seq = int(recipient.split("_", 1)[1])
+                    candidate = app.state.sessions.matches.get_by_seq(seq)
                     if candidate is not None:
                         match = candidate
                         self.player.match = match
@@ -381,7 +390,7 @@ class IRCClient:
                 return
 
             match_id = match.id
-            channel_name = f"#multi_{match_id}"
+            channel_name = match.chat.real_name
             match_chat = match.chat
 
             # Let the normal command handler do all cleanup (slots, DB, dispose)
@@ -420,12 +429,13 @@ class IRCClient:
             joined = self.player.join_channel(chan)
             if joined or already_member:
                 # If joining a match channel, restore player.match reference
-                if chan.name.startswith("#multi_") and self.player.match is None:
+                if chan.real_name.startswith("#multi_") and self.player.match is None:
                     try:
-                        mid = int(chan.name.split("_", 1)[1])
-                        m = app.state.sessions.matches[mid]
+                        seq = int(chan.real_name.split("_", 1)[1])
+                        m = app.state.sessions.matches.get_by_seq(seq)
                         if m is not None:
                             self.player.match = m
+                            m.referees.add(self.player)
                     except (ValueError, IndexError):
                         pass
 
@@ -550,12 +560,6 @@ class IRCClient:
                     channel.send(message, sender=fro)
                     if cmd["resp"] is not None:
                         channel.send_bot(cmd["resp"])
-                        # Forward bot response to IRC client as a channel PRIVMSG
-                        for resp_line in cmd["resp"].split("\n"):
-                            if resp_line.strip():
-                                await self.add_queue(
-                                    f":{bot_name} PRIVMSG {to} :{resp_line}"
-                                )
                 else:
                     staff = app.state.sessions.players.staff
                     channel.send_selective(
@@ -595,7 +599,8 @@ class IRCClient:
 
                     if cmd["resp"] is not None:
                         fro.send_bot(cmd["resp"])
-                        # Forward bot response to IRC client via IRC protocol
+                        # send_bot already forwards to IRC via bancho_message
+                        # but for private messages to BanchoBot, we need direct delivery
                         bot_name = app.state.sessions.bot.name
                         await self.add_queue(
                             f":{bot_name} PRIVMSG {fro.name} :{cmd['resp']}"

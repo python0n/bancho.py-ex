@@ -95,6 +95,8 @@ class Matches(list[Match | None]):
     def __init__(self) -> None:
         MAX_MATCHES = 64  # TODO: refactor this out of existence
         super().__init__([None] * MAX_MATCHES)
+        self._seq_counter = 0  # ever-incrementing match sequence ID
+        self._seq_to_slot: dict[int, int] = {}  # seq_id → array index
 
     def __iter__(self) -> Iterator[Match | None]:
         return super().__iter__()
@@ -102,20 +104,40 @@ class Matches(list[Match | None]):
     def __repr__(self) -> str:
         return f'[{", ".join(match.name for match in self if match)}]'
 
+    def next_seq_id(self) -> int:
+        """Return the next sequence ID (ever-incrementing)."""
+        seq = self._seq_counter
+        self._seq_counter += 1
+        return seq
+
     def get_free(self) -> int | None:
-        """Return the first free match id from `self`."""
+        """Return the first free slot index from `self`."""
         for idx, match in enumerate(self):
             if match is None:
                 return idx
-
         return None
 
-    def remove(self, match: Match | None) -> None:
+    def get_by_seq(self, seq_id: int) -> "Match | None":
+        """Look up a match by its sequence ID."""
+        slot = self._seq_to_slot.get(seq_id)
+        if slot is not None:
+            return self[slot]
+        return None
+
+    def register(self, slot: int, seq_id: int) -> None:
+        """Register the seq_id → slot mapping."""
+        self._seq_to_slot[seq_id] = slot
+
+    def remove(self, match: "Match | None") -> None:
         """Remove `match` from the list."""
         for i, _m in enumerate(self):
             if match is _m:
                 self[i] = None
                 break
+
+        # Clean up seq mapping
+        if match is not None and hasattr(match, "seq_id"):
+            self._seq_to_slot.pop(match.seq_id, None)
 
         if app.settings.DEBUG:
             log(f"{match} removed from matches list.")

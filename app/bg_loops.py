@@ -78,6 +78,21 @@ async def _disconnect_ghosts(interval: int) -> None:
 
         for player in app.state.sessions.players:
             if current_time - player.last_recv_time > OSU_CLIENT_MIN_PING_INTERVAL:
+                # Don't auto-dc players with an active IRC connection —
+                # their last_recv_time is updated by IRC data_received(),
+                # but as a safety net, also check the IRC client list.
+                if getattr(player, "irc_client", False):
+                    irc = getattr(app.state.services, "irc", None)
+                    if irc:
+                        has_active_irc = any(
+                            c.player is player
+                            for c in irc.clients
+                            if hasattr(c, "player") and c.player is not None
+                        )
+                        if has_active_irc:
+                            # IRC connection is alive, refresh the timer
+                            player.last_recv_time = current_time
+                            continue
                 log(f"Auto-dced {player}.", Ansi.LMAGENTA)
                 player.logout()
 

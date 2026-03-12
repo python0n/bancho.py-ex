@@ -159,8 +159,10 @@ class Match:
         freemods: bool,
         seed: int,
         chat_channel: Channel,
+        seq_id: int = 0,
     ) -> None:
         self.id = id
+        self.seq_id = seq_id  # ever-incrementing ID for IRC channel names
         self.name = name
         self.passwd = password
         self.has_public_history = has_public_history

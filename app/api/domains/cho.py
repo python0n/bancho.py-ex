@@ -1433,12 +1433,14 @@ class MatchCreate(BasePacket):
             player.enqueue(app.packets.match_join_fail())
             return
 
+        seq_id = app.state.sessions.matches.next_seq_id()
+
         # create the channel and add it
         # to the global channel list as
         # an instanced channel.
         chat_channel = Channel(
-            name=f"#multi_{match_id}",
-            topic=f"MID {match_id}'s multiplayer channel.",
+            name=f"#multi_{seq_id}",
+            topic=f"MID {seq_id}'s multiplayer channel.",
             auto_join=False,
             instance=True,
         )
@@ -1459,9 +1461,11 @@ class MatchCreate(BasePacket):
             freemods=bool(self.match_data.freemods),
             seed=self.match_data.seed,
             chat_channel=chat_channel,
+            seq_id=seq_id,
         )
 
         app.state.sessions.matches[match_id] = match
+        app.state.sessions.matches.register(seq_id, match_id)
         app.state.sessions.channels.append(chat_channel)
         match.chat = chat_channel
 
