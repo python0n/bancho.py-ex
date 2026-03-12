@@ -90,3 +90,4 @@ DEVELOPER_MODE = read_bool(os.environ["DEVELOPER_MODE"])
 
 with open("pyproject.toml", "rb") as f:
     VERSION = tomllib.load(f)["tool"]["poetry"]["version"]
+WEB_DOMAIN = DOMAIN

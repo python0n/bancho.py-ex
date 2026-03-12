@@ -106,12 +106,12 @@ class IPResolver:
         """Resolve the IP address from the headers."""
         ip_str = headers.get("CF-Connecting-IP")
         if ip_str is None:
-            forwards = headers["X-Forwarded-For"].split(",")
+            forwards = headers.get("X-Forwarded-For", "127.0.0.1").split(",")
 
             if len(forwards) != 1:
                 ip_str = forwards[0]
             else:
-                ip_str = headers["X-Real-IP"]
+                ip_str = headers.get("X-Real-IP", "127.0.0.1")
 
         ip = self.cache.get(ip_str)
         if ip is None:
