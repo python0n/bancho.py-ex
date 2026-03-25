@@ -79,7 +79,7 @@ async def recalculate_score(
         attrs = calculator.performance(beatmap)
 
         new_pp: float = attrs.pp
-        if math.isnan(new_pp) or math.isinf(new_pp):
+        if math.isnan(new_pp) or math.isinf(new_pp) or new_pp > 9999.0:
             new_pp = 0.0
 
         await ctx.database.execute(
@@ -138,12 +138,12 @@ async def recalculate_user(
         return
 
     # calculate new total weighted accuracy
-    weighted_acc = sum(row["acc"] * 0.95**i for i, row in enumerate(best_scores))
+    weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
     bonus_acc = 100.0 / (20 * (1 - 0.95**total_scores))
     acc = (weighted_acc * bonus_acc) / 100
 
     # calculate new total weighted pp
-    weighted_pp = sum(row["pp"] * 0.95**i for i, row in enumerate(best_scores))
+    weighted_pp = sum(float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
     bonus_pp = 416.6667 * (1 - 0.9994**total_scores)
     pp = round(weighted_pp + bonus_pp)
 
@@ -205,7 +205,7 @@ async def recalculate_mode_scores(mode: GameMode, ctx: Context) -> None:
               maps.id as `map_id`
             FROM scores
             INNER JOIN maps ON scores.map_md5 = maps.md5
-            WHERE scores.status = 2
+            WHERE scores.status IN (2, 3)
               AND scores.mode = :mode
             ORDER BY scores.pp DESC
             """,

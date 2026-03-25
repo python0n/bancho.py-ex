@@ -1801,11 +1801,36 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                                 app.metrics.increment("ex_first_place_webhook")
 
                 # this score is our best score.
-                # update any preexisting personal best
-                # records with SubmissionStatus.SUBMITTED.
+                # Zdegraduj stary BEST do SCORE_BEST lub SUBMITTED,
+                # potem wyczysc wszystkie pozostale duplikaty status=2/3.
+                if score.prev_best:
+                    await app.state.services.database.execute(
+                        "UPDATE scores SET status = :new_status WHERE id = :id",
+                        {
+                            "new_status": int(score.prev_best.status),
+                            "id": score.prev_best.id,
+                        },
+                    )
+                # Cleanup: wszystkie inne status=2 lub 3 na tej mapie -> 1
                 await app.state.services.database.execute(
                     "UPDATE scores SET status = 1 "
-                    "WHERE status = 2 AND map_md5 = :map_md5 "
+                    "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                    "AND userid = :user_id AND mode = :mode "
+                    "AND id != :exclude_id",
+                    {
+                        "map_md5": score.bmap.md5,
+                        "user_id": score.player.id,
+                        "mode": score.mode,
+                        "exclude_id": score.prev_best.id if score.prev_best else -1,
+                    },
+                )
+
+            if score.status == SubmissionStatus.SCORE_BEST:
+                # Nowy score ma wyzszy score value ale nizsze PP.
+                # Zdegraduj stary SCORE_BEST do SUBMITTED.
+                await app.state.services.database.execute(
+                    "UPDATE scores SET status = 1 "
+                    "WHERE status = 3 AND map_md5 = :map_md5 "
                     "AND userid = :user_id AND mode = :mode",
                     {
                         "map_md5": score.bmap.md5,
@@ -1813,11 +1838,6 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         "mode": score.mode,
                     },
                 )
-                if score.prev_best and score.prev_best.status == SubmissionStatus.SCORE_BEST:
-                    await app.state.services.database.execute(
-                        "UPDATE scores SET status = 3 WHERE id = :id",
-                        {"id": score.prev_best.id},
-                    )
 
             pp_db = pp_to_db(score.pp)
 
@@ -1856,8 +1876,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                 },
             )
 
-            pubsub = app.state.services.redis.pubsub()
-            await pubsub.execute_command("PUBLISH", "ex:submit", score.toJSON())
+            await app.state.services.redis.publish("ex:submit", score.toJSON())
             
 
         if score.passed:
@@ -2500,8 +2519,7 @@ async def osuSubmitModularSelector(
             },
         )
 
-        pubsub = app.state.services.redis.pubsub()
-        await pubsub.execute_command("PUBLISH", "ex:submit", score.toJSON())
+        await app.state.services.redis.publish("ex:submit", score.toJSON())
         
     if score.passed:
         replay_data = await replay_file.read()
