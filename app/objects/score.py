@@ -72,12 +72,14 @@ class SubmissionStatus(IntEnum):
     FAILED = 0
     SUBMITTED = 1
     BEST = 2
+    SCORE_BEST = 3
 
     def __repr__(self) -> str:
         return {
             self.FAILED: "Failed",
             self.SUBMITTED: "Submitted",
             self.BEST: "Best",
+            self.SCORE_BEST: "ScoreBest",
         }[self]
 
 
@@ -384,31 +386,47 @@ class Score:
         assert self.player is not None
         assert self.bmap is not None
 
-        recs = await scores_repo.fetch_many(
+        # Pobierz aktualny best PP (status=2)
+        pp_recs = await scores_repo.fetch_many(
             user_id=self.player.id,
             map_md5=self.bmap.md5,
             mode=self.mode,
             status=SubmissionStatus.BEST,
         )
+        # Pobierz aktualny best Score (status=3)
+        score_recs = await scores_repo.fetch_many(
+            user_id=self.player.id,
+            map_md5=self.bmap.md5,
+            mode=self.mode,
+            status=SubmissionStatus.SCORE_BEST,
+        )
 
-        if recs:
-            rec = recs[0]
-
-            # we have a score on the map.
-            # save it as our previous best score.
-            self.prev_best = await Score.from_sql(rec["id"])
+        if pp_recs:
+            pp_rec = pp_recs[0]
+            self.prev_best = await Score.from_sql(pp_rec["id"])
             assert self.prev_best is not None
 
-            # if our new score is better, update
-            # both of our score's submission statuses.
-            # NOTE: this will be updated in sql later on in submission
-            if self.pp > rec["pp"]:
+            if self.pp > pp_rec["pp"]:
+                # Nowy score ma wyzsze PP - jest nowym BEST
                 self.status = SubmissionStatus.BEST
-                self.prev_best.status = SubmissionStatus.SUBMITTED
+                # Stary BEST ma wyzszy score niz nowy? Zostaje jako SCORE_BEST
+                if pp_rec["score"] > self.score:
+                    self.prev_best.status = SubmissionStatus.SCORE_BEST
+                else:
+                    self.prev_best.status = SubmissionStatus.SUBMITTED
             else:
-                self.status = SubmissionStatus.SUBMITTED
+                # Nowy score ma nizsze PP
+                if self.score > pp_rec["score"]:
+                    # Ale ma wyzszy score - sprawdz czy bije obecny SCORE_BEST
+                    current_score_best = score_recs[0]["score"] if score_recs else 0
+                    if self.score > current_score_best:
+                        self.status = SubmissionStatus.SCORE_BEST
+                    else:
+                        self.status = SubmissionStatus.SUBMITTED
+                else:
+                    self.status = SubmissionStatus.SUBMITTED
         else:
-            # this is our first score on the map.
+            # Pierwszy score na tej mapie
             self.status = SubmissionStatus.BEST
 
     def calculate_accuracy(self) -> float:
