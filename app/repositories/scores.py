@@ -220,6 +220,7 @@ async def fetch_many(
     if page is not None and page_size is not None:
         select_stmt = select_stmt.limit(page_size).offset((page - 1) * page_size)
 
+    select_stmt = select_stmt.order_by(ScoresTable.pp.desc())
     scores = await app.state.services.database.fetch_all(select_stmt)
     return cast(list[Score], scores)
 
