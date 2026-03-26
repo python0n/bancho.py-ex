@@ -1801,29 +1801,61 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                                 app.metrics.increment("ex_first_place_webhook")
 
                 # this score is our best score.
-                # Zdegraduj stary BEST do SCORE_BEST lub SUBMITTED,
-                # potem wyczysc wszystkie pozostale duplikaty status=2/3.
-                if score.prev_best:
+                # Lock + reset + INSERT atomowo w jednej transakcji.
+                pp_db = pp_to_db(score.pp)
+                async with app.state.services.database.transaction():
+                    await app.state.services.database.fetch_one(
+                        "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
+                        {"user_id": score.player.id},
+                    )
                     await app.state.services.database.execute(
-                        "UPDATE scores SET status = :new_status WHERE id = :id",
+                        "UPDATE scores SET status = 1 "
+                        "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                        "AND userid = :user_id AND mode = :mode",
                         {
-                            "new_status": int(score.prev_best.status),
-                            "id": score.prev_best.id,
+                            "map_md5": score.bmap.md5,
+                            "user_id": score.player.id,
+                            "mode": score.mode,
                         },
                     )
-                # Cleanup: wszystkie inne status=2 lub 3 na tej mapie -> 1
-                await app.state.services.database.execute(
-                    "UPDATE scores SET status = 1 "
-                    "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
-                    "AND userid = :user_id AND mode = :mode "
-                    "AND id != :exclude_id",
-                    {
-                        "map_md5": score.bmap.md5,
-                        "user_id": score.player.id,
-                        "mode": score.mode,
-                        "exclude_id": score.prev_best.id if score.prev_best else -1,
-                    },
-                )
+                    if score.prev_best and score.prev_best.status == SubmissionStatus.SCORE_BEST:
+                        await app.state.services.database.execute(
+                            "UPDATE scores SET status = 3 WHERE id = :id",
+                            {"id": score.prev_best.id},
+                        )
+                    score.id = await app.state.services.database.execute(
+                        "INSERT INTO scores "
+                        "VALUES (NULL, "
+                        ":map_md5, :score, :pp, :acc, "
+                        ":max_combo, :mods, :n300, :n100, "
+                        ":n50, :nmiss, :ngeki, :nkatu, "
+                        ":grade, :status, :mode, :play_time, "
+                        ":time_elapsed, :client_flags, :user_id, :perfect, "
+                        ":checksum)",
+                        {
+                            "map_md5": score.bmap.md5,
+                            "score": score.score,
+                            "pp": pp_db,
+                            "acc": score.acc,
+                            "max_combo": score.max_combo,
+                            "mods": score.mods,
+                            "n300": score.n300,
+                            "n100": score.n100,
+                            "n50": score.n50,
+                            "nmiss": score.nmiss,
+                            "ngeki": score.ngeki,
+                            "nkatu": score.nkatu,
+                            "grade": score.grade.name,
+                            "status": score.status,
+                            "mode": score.mode,
+                            "play_time": score.server_time,
+                            "time_elapsed": score.time_elapsed,
+                            "client_flags": score.client_flags,
+                            "user_id": score.player.id,
+                            "perfect": score.perfect,
+                            "checksum": score.client_checksum,
+                        },
+                    )
 
             if score.status == SubmissionStatus.SCORE_BEST:
                 # Nowy score ma wyzszy score value ale nizsze PP.
@@ -1839,42 +1871,41 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                     },
                 )
 
-            pp_db = pp_to_db(score.pp)
-
-
-            score.id = await app.state.services.database.execute(
-                "INSERT INTO scores "
-                "VALUES (NULL, "
-                ":map_md5, :score, :pp, :acc, "
-                ":max_combo, :mods, :n300, :n100, "
-                ":n50, :nmiss, :ngeki, :nkatu, "
-                ":grade, :status, :mode, :play_time, "
-                ":time_elapsed, :client_flags, :user_id, :perfect, "
-                ":checksum)",
-                {
-                    "map_md5": score.bmap.md5,
-                    "score": score.score,
-                    "pp": pp_db,
-                    "acc": score.acc,
-                    "max_combo": score.max_combo,
-                    "mods": score.mods,
-                    "n300": score.n300,
-                    "n100": score.n100,
-                    "n50": score.n50,
-                    "nmiss": score.nmiss,
-                    "ngeki": score.ngeki,
-                    "nkatu": score.nkatu,
-                    "grade": score.grade.name,
-                    "status": score.status,
-                    "mode": score.mode,
-                    "play_time": score.server_time,
-                    "time_elapsed": score.time_elapsed,
-                    "client_flags": score.client_flags,
-                    "user_id": score.player.id,
-                    "perfect": score.perfect,
-                    "checksum": score.client_checksum,
-                },
-            )
+            if not score.id:
+                pp_db = pp_to_db(score.pp)
+                score.id = await app.state.services.database.execute(
+                    "INSERT INTO scores "
+                    "VALUES (NULL, "
+                    ":map_md5, :score, :pp, :acc, "
+                    ":max_combo, :mods, :n300, :n100, "
+                    ":n50, :nmiss, :ngeki, :nkatu, "
+                    ":grade, :status, :mode, :play_time, "
+                    ":time_elapsed, :client_flags, :user_id, :perfect, "
+                    ":checksum)",
+                    {
+                        "map_md5": score.bmap.md5,
+                        "score": score.score,
+                        "pp": pp_db,
+                        "acc": score.acc,
+                        "max_combo": score.max_combo,
+                        "mods": score.mods,
+                        "n300": score.n300,
+                        "n100": score.n100,
+                        "n50": score.n50,
+                        "nmiss": score.nmiss,
+                        "ngeki": score.ngeki,
+                        "nkatu": score.nkatu,
+                        "grade": score.grade.name,
+                        "status": score.status,
+                        "mode": score.mode,
+                        "play_time": score.server_time,
+                        "time_elapsed": score.time_elapsed,
+                        "client_flags": score.client_flags,
+                        "user_id": score.player.id,
+                        "perfect": score.perfect,
+                        "checksum": score.client_checksum,
+                    },
+                )
 
             await app.state.services.redis.publish("ex:submit", score.toJSON())
             
@@ -2469,32 +2500,38 @@ async def osuSubmitModularSelector(
 
 
             # this score is our best score.
-            # update any preexisting personal best
-            # records with SubmissionStatus.SUBMITTED.
-            await app.state.services.database.execute(
-                "UPDATE scores SET status = 1 "
-                "WHERE status = 3 AND map_md5 = :map_md5 "
-                "AND userid = :user_id AND mode = :mode",
-                {
-                    "map_md5": score.bmap.md5,
-                    "user_id": score.player.id,
-                    "mode": score.mode,
-                },
-            )
-
-        pp_db = pp_to_db(score.pp)
-
-
-        score.id = await app.state.services.database.execute(
-            "INSERT INTO scores "
-            "VALUES (NULL, "
-            ":map_md5, :score, :pp, :acc, "
-            ":max_combo, :mods, :n300, :n100, "
-            ":n50, :nmiss, :ngeki, :nkatu, "
-            ":grade, :status, :mode, :play_time, "
-            ":time_elapsed, :client_flags, :user_id, :perfect, "
-            ":checksum)",
-            {
+            # Lock + reset WSZYSTKICH BEST/SCORE_BEST + INSERT atomowo.
+            pp_db = pp_to_db(score.pp)
+            async with app.state.services.database.transaction():
+                await app.state.services.database.fetch_one(
+                    "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
+                    {"user_id": score.player.id},
+                )
+                await app.state.services.database.execute(
+                    "UPDATE scores SET status = 1 "
+                    "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                    "AND userid = :user_id AND mode = :mode",
+                    {
+                        "map_md5": score.bmap.md5,
+                        "user_id": score.player.id,
+                        "mode": score.mode,
+                    },
+                )
+                if score.prev_best and score.prev_best.status == SubmissionStatus.SCORE_BEST:
+                    await app.state.services.database.execute(
+                        "UPDATE scores SET status = 3 WHERE id = :id",
+                        {"id": score.prev_best.id},
+                    )
+                score.id = await app.state.services.database.execute(
+                    "INSERT INTO scores "
+                    "VALUES (NULL, "
+                    ":map_md5, :score, :pp, :acc, "
+                    ":max_combo, :mods, :n300, :n100, "
+                    ":n50, :nmiss, :ngeki, :nkatu, "
+                    ":grade, :status, :mode, :play_time, "
+                    ":time_elapsed, :client_flags, :user_id, :perfect, "
+                    ":checksum)",
+                    {
                 "map_md5": score.bmap.md5,
                 "score": score.score,
                 "pp": pp_db,

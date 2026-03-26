@@ -10,6 +10,7 @@ services:
       MYSQL_HOST: ${DB_HOST}
       MYSQL_TCP_PORT: ${DB_PORT}
       MYSQL_RANDOM_ROOT_PASSWORD: "true"
+    command: --log-bin-trust-function-creators=1
     volumes:
       - ./migrations/base.sql:/docker-entrypoint-initdb.d/init.sql:ro
       # UWAGA: ./db-data to bind mount z danymi serwera!
@@ -33,9 +34,9 @@ services:
       - -c
       - |
         if [ -n "$${REDIS_PASS}" ]; then
-          redis-server --requirepass "$${REDIS_PASS}"
+          redis-server --requirepass "$${REDIS_PASS}" --appendonly yes
         else
-          redis-server
+          redis-server --appendonly yes
         fi
 
   bancho:
