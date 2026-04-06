@@ -254,7 +254,8 @@ async def fetch_many(
     frozen: bool | None = None,
     page: int | None = None,
     page_size: int | None = None,
-    order_by: str | None = None,  # Optional parameter for ordering
+    order_by: str | None = None,
+    group_by_set: bool = False,
 ) -> list[Map]:
     """Fetch a list of maps from the database."""
     select_stmt = select(*READ_PARAMS)
@@ -274,15 +275,29 @@ async def fetch_many(
         select_stmt = select_stmt.where(MapsTable.mode == mode)
     if frozen is not None:
         select_stmt = select_stmt.where(MapsTable.frozen == frozen)
+    if group_by_set:
+        subq = select(func.max(MapsTable.id).label("max_id")).group_by(MapsTable.set_id)
+        if server is not None:
+            subq = subq.where(MapsTable.server == server)
+        if status is not None:
+            subq = subq.where(MapsTable.status == status)
+        if artist is not None:
+            subq = subq.where(MapsTable.artist == artist)
+        if creator is not None:
+            subq = subq.where(MapsTable.creator == creator)
+        if mode is not None:
+            subq = subq.where(MapsTable.mode == mode)
+        if frozen is not None:
+            subq = subq.where(MapsTable.frozen == frozen)
+        subq = subq.subquery()
+        select_stmt = select(*READ_PARAMS).where(MapsTable.id.in_(select(subq.c.max_id)))
     if order_by is not None:
-        valid_columns = {"plays"}  
+        valid_columns = {"plays", "last_update"}
         if order_by not in valid_columns:
             raise ValueError(f"Invalid order_by column: {order_by}")
-
         select_stmt = select_stmt.order_by(text(f"{order_by} DESC"))
     if page is not None and page_size is not None:
         select_stmt = select_stmt.limit(page_size).offset((page - 1) * page_size)
-
     maps = await app.state.services.database.fetch_all(select_stmt)
     return cast(list[Map], maps)
 
