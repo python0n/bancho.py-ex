@@ -117,6 +117,19 @@ async def channel_rank_receiver():
                 log(f"EX | Rank | Beatmap ID: {beatmap_id}, Status: {status}, Frozen: {frozen}", Ansi.LBLUE)
                 response = await change_bm_status(beatmap_id, status, frozen)
                 log(f"EX | " + response, Ansi.LBLUE)
+                # Notify Discord bot
+                status_map = {2: "rank", 5: "love", 0: "unrank", 1: "unrank"}
+                rank_type = status_map.get(status, "unrank")
+                await app.state.services.redis.publish(
+                    "ex:map_status_change",
+                    orjson.dumps({
+                        "map_ids": [beatmap_id],
+                        "type": rank_type,
+                        "ranktype": "map",
+                        "user_id": data.get("user_id"),
+                        "user_name": data.get("user_name"),
+                    }).decode()
+                )
     except asyncio.CancelledError:
         log("Channel rank receiver task cancelled.", Ansi.LYELLOW)
     finally:
