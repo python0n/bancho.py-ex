@@ -2937,6 +2937,7 @@ async def get_leaderboard_scores(
         "INNER JOIN users u ON u.id = s.userid "
         "LEFT JOIN clans c ON c.id = u.clan_id "
         "WHERE s.map_md5 = :map_md5 AND s.status IN (2, 3) "  # 2: best pp, 3: best score
+"AND NOT (s.status = 2 AND EXISTS (SELECT 1 FROM scores s2 WHERE s2.userid = s.userid AND s2.map_md5 = s.map_md5 AND s2.mode = s.mode AND s2.status = 3)) "
         "AND (u.priv & 1 OR u.id = :user_id) AND mode = :mode",
     ]
 

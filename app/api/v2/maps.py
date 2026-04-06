@@ -25,6 +25,7 @@ async def get_maps(
     filename: str | None = None,
     mode: int | None = None,
     frozen: bool | None = None,
+    group_by_set: bool = False,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
 ) -> Success[list[Map]] | Failure:
@@ -37,9 +38,10 @@ async def get_maps(
         filename=filename,
         mode=mode,
         frozen=frozen,
+        group_by_set=group_by_set,
         page=page,
         page_size=page_size,
-        order_by="plays",
+        order_by="last_update",
     )
     total_maps = await maps_repo.fetch_count(
         server=server,
