@@ -744,14 +744,28 @@ async def _bss_process_osu_files(
         md5 = hashlib.md5(file_data).hexdigest()
         meta = _parse_osu_file_metadata(file_data)
 
-        # Check if this map already exists (by md5)
+        # Check if this map already exists (by md5 OR by set_id+version)
         existing = await maps_repo.fetch_one(md5=md5)
+        if not existing:
+            # md5 changed (map updated) — find by set_id + version
+            existing_by_version = await app.state.services.database.fetch_one(
+                "SELECT * FROM maps WHERE set_id = :set_id AND version = :version LIMIT 1",
+                {"set_id": set_id, "version": meta["version"]},
+            )
+            if existing_by_version:
+                log(
+                    f"[BSS] map version '{meta['version']}' exists as id={existing_by_version['id']}, "
+                    f"md5 changed — updating in place",
+                    Ansi.LCYAN,
+                )
+                existing = existing_by_version
         if existing:
             log(f"[BSS] map {md5} already exists as id={existing['id']}, updating", Ansi.LCYAN)
             await maps_repo.partial_update(
                 id=existing["id"],
                 set_id=set_id,
                 server="osu!",
+                md5=md5,
                 artist=meta["artist"] or existing["artist"],
                 title=meta["title"] or existing["title"],
                 version=meta["version"] or existing["version"],
@@ -770,6 +784,17 @@ async def _bss_process_osu_files(
             osu_file_path.write_bytes(file_data)
             if md5 in app.state.cache.unsubmitted:
                 app.state.cache.unsubmitted.discard(md5)
+            # Przelicz SR po update
+            try:
+                import akatsuki_pp_py as rosu
+                bm = rosu.Beatmap(path=str(osu_file_path))
+                calc = rosu.Calculator()
+                perf = calc.performance(bm)
+                sr = perf.difficulty.stars
+                await maps_repo.partial_update(id=existing["id"], diff=round(sr, 2))
+                log(f"[BSS] SR updated for {existing['id']}: {sr:.2f}", Ansi.LGREEN)
+            except Exception as e:
+                log(f"[BSS] SR calc failed for {existing['id']}: {e}", Ansi.LYELLOW)
             continue
 
         assigned_ids = await _bss_get_next_beatmap_ids(1)
@@ -909,6 +934,8 @@ async def bmsubmitUpload(
     """BSS Step 2: Receive uploaded beatmap files."""
     log(f"[BSS] upload from {player}: set_id={set_id} type={upload_type}", Ansi.LCYAN)
 
+    beatmap_id: int | None = None
+
     if set_id <= 0:
         log("[BSS] upload with invalid set_id", Ansi.LRED)
         return Response(content="5")
@@ -987,6 +1014,15 @@ async def bmsubmitUpload(
     else:
         log(f"[BSS] no files found in upload for set {set_id}", Ansi.LYELLOW)
 
+    import json as _json
+    _bss_map_rows = await app.state.services.database.fetch_all(
+        "SELECT id FROM maps WHERE set_id = :set_id", {"set_id": set_id}
+    )
+    _bss_map_ids = [r["id"] for r in _bss_map_rows]
+    await app.state.services.redis.publish(
+        "ex:bss_upload",
+        _json.dumps({"player_name": player.name, "set_id": set_id, "map_ids": _bss_map_ids}),
+    )
     return Response(content="0")
 
 
@@ -2021,6 +2057,39 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                 # update global & country ranking
                 stats.rank = await score.player.update_rank(score.mode)
 
+                # --- global rank announce ---
+                if (
+                    not score.player.restricted
+                    and stats.rank > 0
+                    and stats.rank <= 50
+                    and (prev_stats.rank == 0 or stats.rank < prev_stats.rank)
+                ):
+                    _ann_chan = app.state.sessions.channels.get_by_name("#announce")
+                    if _ann_chan:
+                        import json as _json
+                        _displaced_ids = await app.state.services.redis.zrevrange(
+                            f"bancho:leaderboard:{score.mode.value}",
+                            stats.rank,  # 0-indexed = rank+1 po naszym wejściu
+                            stats.rank,
+                        )
+                        _prev_name: str | None = None
+                        if _displaced_ids:
+                            _prev_id = int(_displaced_ids[0])
+                            _prev_player = app.state.sessions.players.get(id=_prev_id)
+                            if _prev_player:
+                                _prev_name = _prev_player.name
+                            else:
+                                _row = await app.state.services.database.fetch_one(
+                                    "SELECT name FROM users WHERE id = :id", {"id": _prev_id}
+                                )
+                                if _row:
+                                    _prev_name = _row["name"]
+                        _ann_msg = f"\x01ACTION achieved global rank #{stats.rank}"
+                        if _prev_name:
+                            _ann_msg += f" (Previous: {_prev_name})"
+                        _ann_chan.send(_ann_msg, sender=score.player, to_self=True)
+                # --- end global rank announce ---
+
         await stats_repo.partial_update(
             score.player.id,
             score.mode.value,
@@ -2717,6 +2786,39 @@ async def osuSubmitModularSelector(
 
             # update global & country ranking
             stats.rank = await score.player.update_rank(score.mode)
+
+            # --- global rank announce ---
+            if (
+                not score.player.restricted
+                and stats.rank > 0
+                and stats.rank <= 50
+                and (prev_stats.rank == 0 or stats.rank < prev_stats.rank)
+            ):
+                _ann_chan = app.state.sessions.channels.get_by_name("#announce")
+                if _ann_chan:
+                    import json as _json
+                    _displaced_ids = await app.state.services.redis.zrevrange(
+                        f"bancho:leaderboard:{score.mode.value}",
+                        stats.rank,  # 0-indexed = rank+1 po naszym wejściu
+                        stats.rank,
+                    )
+                    _prev_name: str | None = None
+                    if _displaced_ids:
+                        _prev_id = int(_displaced_ids[0])
+                        _prev_player = app.state.sessions.players.get(id=_prev_id)
+                        if _prev_player:
+                            _prev_name = _prev_player.name
+                        else:
+                            _row = await app.state.services.database.fetch_one(
+                                "SELECT name FROM users WHERE id = :id", {"id": _prev_id}
+                            )
+                            if _row:
+                                _prev_name = _row["name"]
+                    _ann_msg = f"\x01ACTION achieved global rank #{stats.rank}"
+                    if _prev_name:
+                        _ann_msg += f" (Previous: {_prev_name})"
+                    _ann_chan.send(_ann_msg, sender=score.player, to_self=True)
+            # --- end global rank announce ---
 
     await stats_repo.partial_update(
         score.player.id,
