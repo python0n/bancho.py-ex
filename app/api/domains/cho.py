@@ -1794,8 +1794,8 @@ class MatchStart(BasePacket):
         if getattr(player.match, 'web_id', None):
             try:
                 game_id = await services.database.execute(
-                    "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, started_at) "
-                    "VALUES (:match_id, :map_id, :map_md5, :mode, :scoring_type, :team_type, NOW())",
+                    "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, mods, started_at) "
+                    "VALUES (:match_id, :map_id, :map_md5, :mode, :scoring_type, :team_type, :mods, NOW())",
                     {
                         "match_id": player.match.web_id,
                         "map_id": player.match.map_id,
@@ -1803,6 +1803,7 @@ class MatchStart(BasePacket):
                         "mode": int(player.match.mode),
                         "scoring_type": int(player.match.win_condition),
                         "team_type": int(player.match.team_type),
+                        "mods": int(player.match.mods),
                     }
                 )
                 player.match.current_game_id = game_id
@@ -1959,7 +1960,7 @@ class MatchComplete(BasePacket):
                         )
 
                         if use_frame:
-                            slot_mods = int(s.mods) if _match.freemods else int(_match.mods)
+                            slot_mods = (int(s.mods) | int(_match.mods)) if _match.freemods else int(_match.mods)
                             await _svc.database.execute(
                                 "INSERT INTO mp_match_scores "
                                 "(game_id, user_id, score, acc, max_combo, mods, n300, n100, n50, nmiss, ngeki, nkatu, grade, passed, team) "
