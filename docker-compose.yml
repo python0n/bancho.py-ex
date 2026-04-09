@@ -54,7 +54,7 @@ services:
     init: true
     volumes:
       - .:/srv/root
-      - data:/srv/root/.data
+      - ./.data:/srv/root/.data
     environment:
       - APP_HOST=${APP_HOST}
       - APP_PORT=${APP_PORT}
@@ -104,6 +104,5 @@ services:
       - DB_USE_SSL=${DB_USE_SSL}
 
 volumes:
-  data:
   db-data:
   redis-data:

@@ -87,6 +87,16 @@ class Channel:
             if sender.id not in player.blocks and (to_self or player.id != sender.id):
                 player.enqueue(data)
 
+        _chat_pub = {"#announce": "ex:announce", "#osu": "ex:chat:osu"}
+        if self.real_name in _chat_pub:
+            import asyncio, json as _json
+            asyncio.create_task(
+                app.state.services.redis.publish(
+                    _chat_pub[self.real_name],
+                    _json.dumps({"player_name": sender.name, "msg": msg}),
+                )
+            )
+
     def send_bot(self, msg: str) -> None:
         """Enqueue `msg` to all connected clients from bot."""
         bot = app.state.sessions.bot
