@@ -854,12 +854,16 @@ class Player:
             for spectator in self.spectators:
                 player.enqueue(app.packets.fellow_spectator_joined(spectator.id))
 
-        self.spectators.append(player)
+        if player not in self.spectators:
+            self.spectators.append(player)
         player.spectating = self
 
         log(f"{player} is now spectating {self}.")
 
     def remove_spectator(self, player: Player) -> None:
+        import traceback
+        print(f"[RS] {player.name} stopped spectating {self.name}", flush=True)
+        traceback.print_stack(limit=5)
         """Attempt to remove `player` from `self`'s spectators."""
         self.spectators.remove(player)
         player.spectating = None

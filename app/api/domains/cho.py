@@ -646,8 +646,11 @@ async def authenticate(
     if cache_key in app.state.cache.bcrypt:  # ~0.01 ms – already verified pair
         pass  # verified
     else:  # ~200ms
+        import hashlib as _hl
+        pw_double = _hl.md5(untrusted_password).hexdigest().encode()
         if not bcrypt.checkpw(untrusted_password, trusted_hashword):
-            return None
+            if not bcrypt.checkpw(pw_double, trusted_hashword):
+                return None
 
         app.state.cache.bcrypt[cache_key] = True  # mark pair as verified
 
@@ -906,7 +909,7 @@ async def handle_osu_login_request(
     # show up with the yellow name in-game, but everyone
     # gets osu!direct & other in-game perks).
     data += app.packets.bancho_privileges(
-        player.bancho_priv | ClientPrivileges.SUPPORTER,
+        player.bancho_priv | ClientPrivileges.SUPPORTER | ClientPrivileges.TOURNAMENT,
     )
 
     data += WELCOME_NOTIFICATION
@@ -1370,6 +1373,7 @@ class LobbyPart(BasePacket):
 class LobbyJoin(BasePacket):
     async def handle(self, player: Player) -> None:
         player.in_lobby = True
+        print(f"[DEBUG] JOIN_LOBBY from {player.name} tourney={player.is_tourney_client} matches={len([m for m in app.state.sessions.matches if m])}", flush=True)
 
         for match in app.state.sessions.matches:
             if match is not None:
@@ -1507,6 +1511,11 @@ class MatchCreate(BasePacket):
             # don't break match creation if match link helpers aren't available yet
             ...
         match.chat.send_bot(f"Match created by {player.name}.")
+        # notify all players in lobby about new match
+        lobby_packet = app.packets.new_match(match)
+        for o in app.state.sessions.players:
+            if o.in_lobby:
+                o.enqueue(lobby_packet)
         log(f"{player} created a new multiplayer match.")
 
 
@@ -1860,6 +1869,10 @@ class MatchScoreUpdate(BasePacket):
         buf[11] = slot_id
 
         player.match.enqueue(bytes(buf), lobby=False)
+        # also send to tourney spectators watching this player
+        print(f"[SCORE] {player.name} spectators={[s.name for s in player.spectators]}", flush=True)
+        for spectator in player.spectators:
+            spectator.enqueue(bytes(buf))
 
 
 @register(ClientPackets.MATCH_COMPLETE)
