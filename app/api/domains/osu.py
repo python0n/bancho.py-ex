@@ -1347,7 +1347,7 @@ async def osuSearchHandler(
     # eventually we could try supporting these,
     # but it mostly depends on the mirror.
     if query not in ("Newest", "Top+Rated", "Most+Played"):
-        params["query"] = query
+        params["q"] = query
 
     if mode != -1:  # -1 for all
         params["mode"] = mode
@@ -1364,6 +1364,7 @@ async def osuSearchHandler(
         return Response(b"-1\nFailed to retrieve data from the beatmap mirror.")
 
     result = response.json()
+
 
     lresult = len(result)  # send over 100 if we receive
     # 100 matches, so the client
@@ -1854,10 +1855,17 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                             "mode": score.mode,
                         },
                     )
-                    if score.prev_best and score.prev_best.status == SubmissionStatus.SCORE_BEST:
+                    old_score_best = await app.state.services.database.fetch_one(
+                        "SELECT id, score FROM scores "
+                        "WHERE map_md5 = :map_md5 AND userid = :user_id "
+                        "AND mode = :mode AND status = 1 "
+                        "ORDER BY score DESC LIMIT 1",
+                        {"map_md5": score.bmap.md5, "user_id": score.player.id, "mode": score.mode},
+                    )
+                    if old_score_best and old_score_best["score"] > score.score:
                         await app.state.services.database.execute(
                             "UPDATE scores SET status = 3 WHERE id = :id",
-                            {"id": score.prev_best.id},
+                            {"id": old_score_best["id"]},
                         )
                     score.id = await app.state.services.database.execute(
                         "INSERT INTO scores "
@@ -2586,10 +2594,17 @@ async def osuSubmitModularSelector(
                         "mode": score.mode,
                     },
                 )
-                if score.prev_best and score.prev_best.status == SubmissionStatus.SCORE_BEST:
+                old_score_best = await app.state.services.database.fetch_one(
+                    "SELECT id, score FROM scores "
+                    "WHERE map_md5 = :map_md5 AND userid = :user_id "
+                    "AND mode = :mode AND status = 1 "
+                    "ORDER BY score DESC LIMIT 1",
+                    {"map_md5": score.bmap.md5, "user_id": score.player.id, "mode": score.mode},
+                )
+                if old_score_best and old_score_best["score"] > score.score:
                     await app.state.services.database.execute(
                         "UPDATE scores SET status = 3 WHERE id = :id",
-                        {"id": score.prev_best.id},
+                        {"id": old_score_best["id"]},
                     )
                 score.id = await app.state.services.database.execute(
                     "INSERT INTO scores "
@@ -2980,7 +2995,7 @@ async def getReplay(
 @router.get("/web/osu-rate.php")
 async def osuRate(
     player: Player = Depends(
-        authenticate_player_session(Query, "u", "p", err=b"auth fail"),
+        authenticate_player_session(Query, "u", "p", err="auth fail"),
     ),
     map_md5: str = Query(..., alias="c", min_length=32, max_length=32),
     rating: int | None = Query(None, alias="v", ge=1, le=10),

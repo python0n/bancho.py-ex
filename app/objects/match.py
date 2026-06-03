@@ -296,6 +296,7 @@ class Match:
         if lobby and lchan and lchan.players:
             lchan.enqueue(data)
 
+
     def enqueue_state(self, lobby: bool = True) -> None:
         """Enqueue `self`'s state to players in the match & lobby."""
         # TODO: hmm this is pretty bad, writes twice
@@ -332,7 +333,11 @@ class Match:
                     no_map.append(s.player.id)
 
         self.in_progress = True
-        self.enqueue(app.packets.match_start(self), immune=no_map, lobby=False)
+        # send match_start only to slot players, not tourney clients in chat
+        data = app.packets.match_start(self)
+        for s in self.slots:
+            if s.player is not None and s.player.id not in no_map:
+                s.player.enqueue(data)
         self.enqueue_state()
 
     def reset_scrim(self) -> None:
