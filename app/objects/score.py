@@ -347,11 +347,13 @@ class Score:
             "INNER JOIN users u ON u.id = s.userid "
             "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
             "AND s.status = 2 AND u.priv & 1 "
+            "AND u.id != :self_id "  # nie licz wlasnego starego #1 (self-snipe)
             f"AND s.{scoring_metric} > :score",
             {
                 "map_md5": self.bmap.md5,
                 "mode": self.mode,
                 "score": score,
+                "self_id": self.player.id,
             },
             column=0,  # COUNT(*)
         )
