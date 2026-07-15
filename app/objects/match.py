@@ -333,11 +333,28 @@ class Match:
                     no_map.append(s.player.id)
 
         self.in_progress = True
-        # send match_start only to slot players, not tourney clients in chat
-        data = app.packets.match_start(self)
-        for s in self.slots:
-            if s.player is not None and s.player.id not in no_map:
-                s.player.enqueue(data)
+        # zapis gry do bazy (start z klienta ORAZ !mp start)
+        if getattr(self, "web_id", None):
+            async def _record_game(m=self):
+                try:
+                    game_id = await app.state.services.database.execute(
+                        "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, mods, started_at) "
+                        "VALUES (:match_id, :map_id, :map_md5, :mode, :scoring_type, :team_type, :mods, NOW())",
+                        {
+                            "match_id": m.web_id,
+                            "map_id": m.map_id,
+                            "map_md5": m.map_md5,
+                            "mode": int(m.mode),
+                            "scoring_type": int(m.win_condition),
+                            "team_type": int(m.team_type),
+                            "mods": int(m.mods),
+                        },
+                    )
+                    m.current_game_id = game_id
+                except Exception as exc:
+                    print(f"[mp] Failed to insert mp_match_games: {exc}", flush=True)
+            asyncio.create_task(_record_game())
+        self.enqueue(app.packets.match_start(self), immune=no_map, lobby=False)
         self.enqueue_state()
 
     def reset_scrim(self) -> None:
