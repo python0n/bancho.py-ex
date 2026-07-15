@@ -1118,6 +1118,9 @@ class StartSpectating(BasePacket):
             current_host.remove_spectator(player)
 
         new_host.add_spectator(player)
+        # presence self-heal: host musi znac spectatora (inaczej klient dropuje pakiet 13)
+        new_host.enqueue(app.packets.user_presence(player) + app.packets.user_stats(player))
+        player.enqueue(app.packets.user_presence(new_host) + app.packets.user_stats(new_host))
 
 
 @register(ClientPackets.STOP_SPECTATING)
@@ -1373,7 +1376,6 @@ class LobbyPart(BasePacket):
 class LobbyJoin(BasePacket):
     async def handle(self, player: Player) -> None:
         player.in_lobby = True
-        print(f"[DEBUG] JOIN_LOBBY from {player.name} tourney={player.is_tourney_client} matches={len([m for m in app.state.sessions.matches if m])}", flush=True)
 
         for match in app.state.sessions.matches:
             if match is not None:
@@ -1554,6 +1556,11 @@ class MatchJoin(BasePacket):
         joined = player.join_match(match, self.match_passwd)
 
         if joined:
+            # presence self-heal: wymiana presence z graczami w pokoju
+            for _s in match.slots:
+                if _s.player is not None and _s.player is not player:
+                    player.enqueue(app.packets.user_presence(_s.player) + app.packets.user_stats(_s.player))
+                    _s.player.enqueue(app.packets.user_presence(player) + app.packets.user_stats(player))
             try:
                 match.notify_link_once(player)
             except Exception:
@@ -1800,7 +1807,7 @@ class MatchStart(BasePacket):
             log(f"{player} attempted to start match as non-host.", Ansi.LYELLOW)
             return
 
-        if getattr(player.match, 'web_id', None):
+        if False:  # przeniesione do Match.start()
             try:
                 game_id = await services.database.execute(
                     "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, mods, started_at) "
@@ -1870,7 +1877,6 @@ class MatchScoreUpdate(BasePacket):
 
         player.match.enqueue(bytes(buf), lobby=False)
         # also send to tourney spectators watching this player
-        print(f"[SCORE] {player.name} spectators={[s.name for s in player.spectators]}", flush=True)
         for spectator in player.spectators:
             spectator.enqueue(bytes(buf))
 
@@ -1942,18 +1948,20 @@ class MatchComplete(BasePacket):
         player.match.enqueue_state()
 
         if getattr(player.match, "web_id", None):
-            async def _save_scores(_match=player.match, _was_playing=was_playing):
+            async def _save_scores(_match=player.match, _was_playing=was_playing, _gid=getattr(player.match, "current_game_id", None)):
                 try:
-                    await asyncio.sleep(3)  # czekaj na HTTP score submit
+                    await asyncio.sleep(12)  # czekaj na HTTP score submit
                     from app.state import services as _svc
                     # pobierz najnowszą grę tego meczu
-                    row = await _svc.database.fetch_one(
-                        "SELECT id FROM mp_match_games WHERE match_id = :mid ORDER BY id DESC LIMIT 1",
-                        {"mid": _match.web_id}
-                    )
-                    if not row:
-                        return
-                    game_id = row["id"]
+                    game_id = _gid
+                    if not game_id:
+                        row = await _svc.database.fetch_one(
+                            "SELECT id FROM mp_match_games WHERE match_id = :mid ORDER BY id DESC LIMIT 1",
+                            {"mid": _match.web_id}
+                        )
+                        if not row:
+                            return
+                        game_id = row["id"]
                     await _svc.database.execute(
                         "UPDATE mp_match_games SET ended_at = NOW() WHERE id = :id",
                         {"id": game_id}
@@ -2068,7 +2076,6 @@ def is_playing(slot: Slot) -> bool:
 @register(ClientPackets.MATCH_LOAD_COMPLETE)
 class MatchLoadComplete(BasePacket):
     async def handle(self, player: Player) -> None:
-        log(f"[DEBUG] MatchLoadComplete by {player} in_progress={player.match.in_progress if player.match else None}", Ansi.LGREEN)
         if player.match is None:
             return
 
@@ -2217,7 +2224,7 @@ class TourneyMatchInfoRequest(BasePacket):
         if not 0 <= self.match_id < 64:
             return  # invalid match id
 
-        if not player.priv & Privileges.DONATOR:
+        if not player.priv & (Privileges.DONATOR | Privileges.TOURNEY_MANAGER):
             return  # insufficient privs
 
         match = app.state.sessions.matches[self.match_id]
@@ -2236,7 +2243,7 @@ class TourneyMatchJoinChannel(BasePacket):
         if not 0 <= self.match_id < 64:
             return  # invalid match id
 
-        if not player.priv & Privileges.DONATOR:
+        if not player.priv & (Privileges.DONATOR | Privileges.TOURNEY_MANAGER):
             return  # insufficient privs
 
         match = app.state.sessions.matches[self.match_id]
@@ -2251,6 +2258,10 @@ class TourneyMatchJoinChannel(BasePacket):
         # attempt to join match chan
         if player.join_channel(match.chat):
             match.tourney_clients.add(player.id)
+            # presence self-heal: tourney client dostaje presence graczy
+            for _s in match.slots:
+                if _s.player is not None:
+                    player.enqueue(app.packets.user_presence(_s.player) + app.packets.user_stats(_s.player))
 
 
 @register(ClientPackets.TOURNAMENT_LEAVE_MATCH_CHANNEL)
@@ -2262,7 +2273,7 @@ class TourneyMatchLeaveChannel(BasePacket):
         if not 0 <= self.match_id < 64:
             return  # invalid match id
 
-        if not player.priv & Privileges.DONATOR:
+        if not player.priv & (Privileges.DONATOR | Privileges.TOURNEY_MANAGER):
             return  # insufficient privs
 
         match = app.state.sessions.matches[self.match_id]

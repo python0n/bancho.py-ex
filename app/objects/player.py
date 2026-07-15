@@ -429,7 +429,10 @@ class Player:
             if app.metrics.enabled:
                 app.metrics.decrement("ex_online_players")
 
-            app.state.sessions.players.enqueue(app.packets.logout(self.id))
+            # multi-sesje (tourney): broadcast logout tylko gdy umiera OSTATNIA sesja konta,
+            # inaczej klienci zapominaja presence konta, ktorego zywe sesje wciaz spectuja
+            if app.state.sessions.players.get(id=self.id) is None:
+                app.state.sessions.players.enqueue(app.packets.logout(self.id))
 
         log(f"{self} logged out.")
 
@@ -861,9 +864,6 @@ class Player:
         log(f"{player} is now spectating {self}.")
 
     def remove_spectator(self, player: Player) -> None:
-        import traceback
-        print(f"[RS] {player.name} stopped spectating {self.name}", flush=True)
-        traceback.print_stack(limit=5)
         """Attempt to remove `player` from `self`'s spectators."""
         self.spectators.remove(player)
         player.spectating = None

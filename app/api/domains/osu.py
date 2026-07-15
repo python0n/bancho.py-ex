@@ -3527,9 +3527,18 @@ if app.settings.REDIRECT_OSU_URLS:
         )
 
     async def profile_redirect(file_path: str) -> Response:
+        target = file_path
+        name = file_path.lstrip("@")
+        if not name.isdigit():
+            row = await app.state.services.database.fetch_one(
+                "SELECT id FROM users WHERE safe_name = :sn",
+                {"sn": name.lower().replace(" ", "_")},
+            )
+            if row:
+                target = str(row["id"])
         return RedirectResponse(
-            url=f"https://{app.settings.DOMAIN}/u/{file_path}",
-            status_code=status.HTTP_301_MOVED_PERMANENTLY,
+            url=f"https://{app.settings.DOMAIN}/u/{target}",
+            status_code=status.HTTP_302_FOUND,
         )
 
     async def avatar_edit_redirect() -> Response:
