@@ -1875,7 +1875,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         ":n50, :nmiss, :ngeki, :nkatu, "
                         ":grade, :status, :mode, :play_time, "
                         ":time_elapsed, :client_flags, :user_id, :perfect, "
-                        ":checksum)",
+                        ":checksum, 0, 0)",
                         {
                             "map_md5": score.bmap.md5,
                             "score": score.score,
@@ -1925,7 +1925,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                     ":n50, :nmiss, :ngeki, :nkatu, "
                     ":grade, :status, :mode, :play_time, "
                     ":time_elapsed, :client_flags, :user_id, :perfect, "
-                    ":checksum)",
+                    ":checksum, 0, 0)",
                     {
                         "map_md5": score.bmap.md5,
                         "score": score.score,
@@ -2614,7 +2614,7 @@ async def osuSubmitModularSelector(
                     ":n50, :nmiss, :ngeki, :nkatu, "
                     ":grade, :status, :mode, :play_time, "
                     ":time_elapsed, :client_flags, :user_id, :perfect, "
-                    ":checksum)",
+                    ":checksum, 0, 0)",
                     {
                 "map_md5": score.bmap.md5,
                 "score": score.score,
@@ -2663,7 +2663,7 @@ async def osuSubmitModularSelector(
                 ":n50, :nmiss, :ngeki, :nkatu, "
                 ":grade, :status, :mode, :play_time, "
                 ":time_elapsed, :client_flags, :user_id, :perfect, "
-                ":checksum)",
+                ":checksum, 0, 0)",
                 {
                     "map_md5": score.bmap.md5,
                     "score": score.score,
