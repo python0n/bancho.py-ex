@@ -13,8 +13,8 @@ tools/migrate_v420/scoreMigrator
 .pytest_cache/
 ext/nginx.conf
 tools/cf_records.txt
-/.db-data/
-/.redis-data/
+/db-data/
+/redis-data/
 poetry.toml
 .coverage
 logging.yaml
