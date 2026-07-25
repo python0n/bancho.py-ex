@@ -32,4 +32,5 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 *.swp
-*.swo
+*.swo*.bak
+*.bak.*
