@@ -26,6 +26,7 @@ from urllib.parse import unquote
 from urllib.parse import unquote_plus
 
 import bcrypt
+import httpx
 from app.api.v2.common import json
 from app.discord import Embed, Webhook
 import app.metrics
@@ -1346,7 +1347,14 @@ async def osuSearchHandler(
 
     # eventually we could try supporting these,
     # but it mostly depends on the mirror.
-    if query not in ("Newest", "Top+Rated", "Most+Played"):
+    _q = query.replace("+", " ")
+    if _q == "Newest":
+        params["sort"] = "ranked_date:desc" if ranked_status in (0, 3, 7, 8) else "submitted_date:desc"
+    elif _q == "Top Rated":
+        params["sort"] = "favourite_count:desc"
+    elif _q == "Most Played":
+        params["sort"] = "play_count:desc"
+    else:
         params["q"] = query
 
     if mode != -1:  # -1 for all
@@ -1356,14 +1364,31 @@ async def osuSearchHandler(
         # convert to osu!api status
         params["status"] = RankedStatus.from_osudirect(ranked_status).osu_api
 
-    response = await app.state.services.http_client.get(
-        app.settings.MIRROR_SEARCH_ENDPOINT,
-        params=params,
-    )
-    if response.status_code != status.HTTP_200_OK:
-        return Response(b"-1\nFailed to retrieve data from the beatmap mirror.")
+    MIRROR_FAILURE = Response(b"-1\nFailed to retrieve data from the beatmap mirror.")
 
-    result = response.json()
+    try:
+        response = await app.state.services.http_client.get(
+            app.settings.MIRROR_SEARCH_ENDPOINT,
+            params=params,
+            timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0),
+        )
+    except httpx.HTTPError as exc:
+        log(f"osu!direct: mirror search failed ({exc!r})", Ansi.LRED)
+        return MIRROR_FAILURE
+
+    if response.status_code != status.HTTP_200_OK:
+        log(f"osu!direct: mirror returned {response.status_code}", Ansi.LRED)
+        return MIRROR_FAILURE
+
+    try:
+        result = response.json()
+    except ValueError:
+        log("osu!direct: mirror returned non-JSON body", Ansi.LRED)
+        return MIRROR_FAILURE
+
+    if not isinstance(result, list):
+        log(f"osu!direct: unexpected payload {str(result)[:200]}", Ansi.LRED)
+        return MIRROR_FAILURE
 
 
     lresult = len(result)  # send over 100 if we receive
@@ -1376,6 +1401,9 @@ async def osuSearchHandler(
 
         # some mirrors use a true/false instead of 0 or 1
         bmapset["HasVideo"] = int(bmapset["HasVideo"])
+        _appr = bmapset.get("ApprovedDate")
+        if _appr and not _appr.startswith("0001"):
+            bmapset["LastUpdate"] = _appr
 
         diff_sorted_maps = sorted(
             bmapset["ChildrenBeatmaps"],
