@@ -1,6 +1,7 @@
 services:
   mysql:
     image: mysql:9.4.0
+    restart: unless-stopped
     ports:
       - ${DB_PORT}:${DB_PORT}
     environment:
@@ -24,6 +25,7 @@ services:
 
   redis:
     image: redis:8.2.2
+    restart: unless-stopped
     ports:
       - ${REDIS_PORT}:${REDIS_PORT}
     user: root
@@ -41,6 +43,7 @@ services:
 
   bancho:
     image: bancho:latest
+    restart: unless-stopped
     ports:
       - ${APP_PORT}:${APP_PORT}
       - ${IRC_PORT}:${IRC_PORT}
