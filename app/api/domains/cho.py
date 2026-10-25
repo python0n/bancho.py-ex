@@ -102,7 +102,7 @@ async def bancho_http_handler() -> Response:
     return HTMLResponse(
         f"""
 <!DOCTYPE html>
-<body style="font-family: monospace; white-space: pre-wrap;">Running bancho.py-ex v{app.settings.VERSION}ex
+<body style="font-family: monospace; white-space: pre-wrap;">Running bancho.py-ex v{app.settings.VERSION}
 
 <a href="online">{len(players)} online players</a>
 <a href="matches">{len(matches)} matches</a>
@@ -490,7 +490,7 @@ RESTRICTED_MSG = (
 )
 
 WELCOME_NOTIFICATION = app.packets.notification(
-    f"Welcome back to {app.settings.SERVER_NAME}!\nRunning bancho.py v{app.settings.VERSION}ex.",
+    f"Welcome back to {app.settings.SERVER_NAME}!\nRunning bancho.py v{app.settings.VERSION}.",
 )
 
 
