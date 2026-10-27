@@ -3080,9 +3080,16 @@ async def get_leaderboard_scores(
         "FROM scores s "
         "INNER JOIN users u ON u.id = s.userid "
         "LEFT JOIN clans c ON c.id = u.clan_id "
-        "WHERE s.map_md5 = :map_md5 AND s.status IN (2, 3) "  # 2: best pp, 3: best score
-"AND NOT (s.status = 2 AND EXISTS (SELECT 1 FROM scores s2 WHERE s2.userid = s.userid AND s2.map_md5 = s.map_md5 AND s2.mode = s.mode AND s2.status = 3)) "
-        "AND (u.priv & 1 OR u.id = :user_id) AND mode = :mode",
+        "WHERE s.map_md5 = :map_md5 "
+        + (
+            # pp leaderboards (rx/ap): one entry per player = best pp (status 2)
+            "AND s.status = 2 "
+            if scoring_metric == "pp"
+            # score leaderboards: best score = status 3 if the player has one, else status 2
+            else "AND s.status IN (2, 3) "
+            "AND NOT (s.status = 2 AND EXISTS (SELECT 1 FROM scores s2 WHERE s2.userid = s.userid AND s2.map_md5 = s.map_md5 AND s2.mode = s.mode AND s2.status = 3)) "
+        )
+        + "AND (u.priv & 1 OR u.id = :user_id) AND mode = :mode",
     ]
 
     params: dict[str, Any] = {
