@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import asyncio
 import hashlib
 import re
@@ -87,32 +88,46 @@ NOW_PLAYING_RGX = re.compile(
 
 FIRST_USER_ID = 3
 
+LANDING_LOGO = ['   __        __        _', '  / /_____ _/ /_______(_)__  ____ __________ _', ' / __/ __ `/ //_/ ___/ / _ \\/ __ `/ ___/ __ `/', '/ /_/ /_/ / ,< (__  ) /  __/ /_/ / /  / /_/ /', '\\__/\\__,_/_/|_/____/_/\\___/\\__, /_/   \\__,_/', '                          /____/']
+LANDING_ART = ['                 /\\_/\\  ', '                ( o.o )  ~ klik klik', '                 > ^ <   ', '            ____/     \\____', '           |  o    o    o  |', '           |_______________|']
+
 router = APIRouter(tags=["Bancho API"])
 
 
 @router.get("/")
 async def bancho_http_handler() -> Response:
     """Handle a request from a web browser."""
-    new_line = "\n"
     matches = [m for m in app.state.sessions.matches if m is not None]
     players = [p for p in app.state.sessions.players if not p.is_bot_client]
-
     packets = app.state.packets["all"]
-
+    domain = app.settings.DOMAIN
+    lines = [
+        *(html.escape(line) for line in LANDING_LOGO),
+        f"Running bancho.py-ex v{app.settings.VERSION} - {html.escape(app.settings.SERVER_NAME)}",
+        "",
+        *(html.escape(line) for line in LANDING_ART),
+        "",
+        f'web:       <a href="https://osu.{domain}">https://osu.{domain}</a>',
+        f'status:    <a href="https://{domain}/status/">https://{domain}/status/</a>',
+        f'changelog: <a href="https://{domain}/changelog/">https://{domain}/changelog/</a>',
+        "",
+        f'<a href="online">{len(players)} online players</a>',
+        f'<a href="matches">{len(matches)} matches</a>',
+        "",
+        f"<b>packets handled ({len(packets)})</b>",
+        *(f"{packet.name} ({packet.value})" for packet in packets),
+        "",
+        '<a href="https://github.com/python0n/bancho.py-ex">Source code</a> fork of '
+        '<a href="https://github.com/osuAkatsuki/bancho.py">bancho.py</a>',
+    ]
+    body = "\n".join(lines)
     return HTMLResponse(
-        f"""
-<!DOCTYPE html>
-<body style="font-family: monospace; white-space: pre-wrap;">Running bancho.py-ex v{app.settings.VERSION}
-
-<a href="online">{len(players)} online players</a>
-<a href="matches">{len(matches)} matches</a>
-
-<b>packets handled ({len(packets)})</b>
-{new_line.join([f"{packet.name} ({packet.value})" for packet in packets])}
-
-<a href="https://github.com/osu-NoLimits/bancho.py-ex">Source code</a> fork of <a href="https://github.com/osuAkatsuki/bancho.py">bancho.py</a>
-</body>
-</html>""",
+        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>"
+        + html.escape(app.settings.SERVER_NAME)
+        + "</title></head>\n"
+        '<body style="font-family: monospace; white-space: pre-wrap;">'
+        + body
+        + "</body>\n</html>",
     )
 
 
