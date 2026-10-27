@@ -2668,19 +2668,18 @@ async def osuSubmitModularSelector(
             },
         )
 
-            if score.status == SubmissionStatus.SCORE_BEST:
-                # Zdegraduj stary SCORE_BEST do SUBMITTED.
-                await app.state.services.database.execute(
-                    "UPDATE scores SET status = 1 "
-                    "WHERE status = 3 AND map_md5 = :map_md5 "
-                    "AND userid = :user_id AND mode = :mode",
-                    {
-                        "map_md5": score.bmap.md5,
-                        "user_id": score.player.id,
-                        "mode": score.mode,
-                    },
-                )
-
+        if score.status == SubmissionStatus.SCORE_BEST:
+            # Zdegraduj stary SCORE_BEST do SUBMITTED (przed INSERT nowego).
+            await app.state.services.database.execute(
+                "UPDATE scores SET status = 1 "
+                "WHERE status = 3 AND map_md5 = :map_md5 "
+                "AND userid = :user_id AND mode = :mode",
+                {
+                    "map_md5": score.bmap.md5,
+                    "user_id": score.player.id,
+                    "mode": score.mode,
+                },
+            )
         if not score.id:
             pp_db = pp_to_db(score.pp)
             score.id = await app.state.services.database.execute(
