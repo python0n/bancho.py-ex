@@ -52,6 +52,7 @@ async def get_maps(
         filename=filename,
         mode=mode,
         frozen=frozen,
+        group_by_set=group_by_set,
     )
 
     response = [Map.from_mapping(rec) for rec in maps]
