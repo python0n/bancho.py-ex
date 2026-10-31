@@ -949,7 +949,7 @@ async def api_get_match(
                 "mode": match.mode,
                 "mods": int(match.mods),
                 "seed": match.seed,
-                "host": {"id": match.host.id, "name": match.host.name},
+                "host": {"id": match.host.id, "name": match.host.name} if match.host else None,
                 "refs": [
                     {"id": player.id, "name": player.name} for player in match.refs
                 ],

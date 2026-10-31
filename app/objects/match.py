@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 
 MAX_MATCH_NAME_LENGTH = 50
 
+# osu! wiki: rooms made with !mp make close 30 minutes after becoming empty
+EMPTY_MATCH_TIMEOUT = 30 * 60
+
 
 @unique
 @pymysql_encode(escape_enum)
@@ -93,6 +96,8 @@ class Slot:
         self.mods = Mods.NOMOD
         self.loaded = False
         self.skipped = False
+        self.failed = False  # MATCH_FAILED without NF; cleared again on revive
+        self.last_score_frame: dict | None = None
 
     def empty(self) -> bool:
         return self.player is None
@@ -110,6 +115,8 @@ class Slot:
         self.mods = Mods.NOMOD
         self.loaded = False
         self.skipped = False
+        self.failed = False
+        self.last_score_frame = None
 
 
 class StartingTimers(TypedDict):
@@ -202,14 +209,28 @@ class Match:
 
         self.tourney_clients: set[int] = set()  # player ids
 
+        self.web_id: int | None = None  # id in mp_matches (match history page)
+        self.current_game_id: int | None = None  # id in mp_match_games
+        self._game_insert: asyncio.Task | None = None
+        self._all_loaded_sent = False
+        self._skip_sent = False
+
+        # made with !mp make: stays open while empty and closes after
+        # EMPTY_MATCH_TIMEOUT, like official bancho
+        self.ref_made = False
+        self._empty_timer: TimerHandle | None = None
+
     @property
-    def host(self) -> Player:
-        player = app.state.sessions.players.get(id=self.host_id)
-        if player is None:
-            raise ValueError(
-                f"Host with id {self.host_id} not found for match {self!r}",
-            )
-        return player
+    def host(self) -> Player | None:
+        """The match host, or None (after !mp clearhost or if they went offline)."""
+        if self.host_id < 0:
+            return None
+        return app.state.sessions.players.get(id=self.host_id)
+
+    @property
+    def history_url(self) -> str:
+        """Match history page on our website (osu-web has /mp/<id>)."""
+        return f"https://osu.{app.settings.DOMAIN}/matches/{self.web_id or self.id}"
 
     @property
     def url(self) -> str:
@@ -234,7 +255,8 @@ class Match:
     @property
     def refs(self) -> set[Player]:
         """Return all players with referee permissions."""
-        return self.referees | {self.host}
+        host = self.host
+        return self.referees | ({host} if host is not None else set())
 
     def __repr__(self) -> str:
         return f"<{self.name} ({self.id})>"
@@ -265,8 +287,11 @@ class Match:
 
     def get_host_slot(self) -> Slot | None:
         """Return the slot containing the host."""
+        host = self.host
+        if host is None:
+            return None
         for s in self.slots:
-            if s.player is not None and s.player is self.host:
+            if s.player is host:
                 return s
 
         return None
@@ -320,11 +345,24 @@ class Match:
             s.loaded = False
             s.skipped = False
 
+    @property
+    def game_mods(self) -> Mods:
+        """Mods of the game itself; the client adds ScoreV2 on its own when
+        that's the win condition, so it is stored too."""
+        mods = self.mods
+        if self.win_condition == MatchWinConditions.scorev2:
+            mods |= Mods.SCOREV2
+        return mods
+
     def start(self) -> None:
         """Start the match for all ready players with the map."""
         no_map: list[int] = []
 
         for s in self.slots:
+            s.loaded = False
+            s.skipped = False
+            s.failed = False
+            s.last_score_frame = None
             # start each player who has the map.
             if s.player is not None:
                 if s.status != SlotStatus.no_map:
@@ -333,11 +371,14 @@ class Match:
                     no_map.append(s.player.id)
 
         self.in_progress = True
+        self._all_loaded_sent = False
+        self._skip_sent = False
+        self.current_game_id = None
         # zapis gry do bazy (start z klienta ORAZ !mp start)
-        if getattr(self, "web_id", None):
-            async def _record_game(m=self):
+        if self.web_id:
+            async def _record_game(m=self) -> None:
                 try:
-                    game_id = await app.state.services.database.execute(
+                    m.current_game_id = await app.state.services.database.execute(
                         "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, mods, started_at) "
                         "VALUES (:match_id, :map_id, :map_md5, :mode, :scoring_type, :team_type, :mods, NOW())",
                         {
@@ -347,15 +388,223 @@ class Match:
                             "mode": int(m.mode),
                             "scoring_type": int(m.win_condition),
                             "team_type": int(m.team_type),
-                            "mods": int(m.mods),
+                            "mods": int(m.game_mods),
                         },
                     )
-                    m.current_game_id = game_id
                 except Exception as exc:
                     print(f"[mp] Failed to insert mp_match_games: {exc}", flush=True)
-            asyncio.create_task(_record_game())
+            self._game_insert = asyncio.create_task(_record_game())
         self.enqueue(app.packets.match_start(self), immune=no_map, lobby=False)
         self.enqueue_state()
+
+    # ------------------------------------------------------------ game flow
+    # Called after every change that can end a phase (load, skip, complete),
+    # including a player leaving or disconnecting, so the match never hangs.
+
+    def check_all_loaded(self) -> None:
+        if not self.in_progress or self._all_loaded_sent:
+            return
+        if any(s.status == SlotStatus.playing and not s.loaded for s in self.slots):
+            return
+        self._all_loaded_sent = True
+        self.enqueue(app.packets.match_all_players_loaded(), lobby=False)
+
+    def check_all_skipped(self) -> None:
+        if not self.in_progress or self._skip_sent:
+            return
+        playing = [s for s in self.slots if s.status == SlotStatus.playing]
+        if not playing or any(not s.skipped for s in playing):
+            return
+        self._skip_sent = True
+        self.enqueue(app.packets.match_skip(), lobby=False)
+
+    def check_complete(self) -> None:
+        """Finish the game once nobody is still playing."""
+        if not self.in_progress:
+            return
+        if any(s.status == SlotStatus.playing for s in self.slots):
+            return
+
+        was_playing = [
+            s for s in self.slots
+            if s.player is not None and s.status == SlotStatus.complete
+        ]
+        not_playing = [
+            s.player.id for s in self.slots
+            if s.player is not None and s.status != SlotStatus.complete
+        ]
+
+        results = [self._result_of(s) for s in was_playing]
+        if results:
+            self._announce_results(results)
+
+        self.unready_players(expected=SlotStatus.complete)
+        self.reset_players_loaded_status()
+        self.in_progress = False
+
+        self.enqueue(app.packets.match_complete(), lobby=False, immune=not_playing)
+        self.enqueue_state()
+
+        if self.web_id:
+            asyncio.create_task(self._save_game(results))
+
+        if self.is_scrimming and was_playing:
+            asyncio.create_task(self.update_matchpoints(was_playing))
+
+    def abort(self) -> None:
+        self.unready_players(expected=SlotStatus.playing)
+        self.reset_players_loaded_status()
+        self.in_progress = False
+        self.enqueue(app.packets.match_abort(), lobby=False)
+        self.enqueue_state()
+        if self.web_id:
+            asyncio.create_task(self._end_game())
+
+    def _result_of(self, slot: Slot) -> dict:
+        assert slot.player is not None
+        sf = slot.last_score_frame or {}
+        mods = slot.mods | self.game_mods if self.freemods else self.game_mods
+        if sf.get("sv2"):
+            mods |= Mods.SCOREV2
+        n300, n100, n50 = sf.get("n300", 0), sf.get("n100", 0), sf.get("n50", 0)
+        ngeki, nkatu, nmiss = sf.get("ngeki", 0), sf.get("nkatu", 0), sf.get("nmiss", 0)
+        acc = calculate_accuracy(self.mode.as_vanilla, n300, n100, n50, ngeki, nkatu, nmiss)
+        passed = not slot.failed
+        return {
+            "player": slot.player,
+            "team": slot.team,
+            "has_frame": bool(sf),
+            "score": sf.get("score", 0),
+            "max_combo": sf.get("max_combo", 0),
+            "n300": n300, "n100": n100, "n50": n50,
+            "ngeki": ngeki, "nkatu": nkatu, "nmiss": nmiss,
+            "acc": acc,
+            "mods": int(mods),
+            "passed": passed,
+            "grade": calculate_grade(self.mode.as_vanilla, mods, n300, n100, n50, ngeki, nkatu, nmiss, passed),
+        }
+
+    def _announce_results(self, results: list[dict]) -> None:
+        key = {
+            MatchWinConditions.accuracy: lambda r: (r["acc"], r["score"]),
+            MatchWinConditions.combo: lambda r: (r["max_combo"], r["score"]),
+        }.get(self.win_condition, lambda r: (r["score"],))
+        self.chat.send_bot("Match ended!")
+        for rank, r in enumerate(sorted(results, key=key, reverse=True), 1):
+            self.chat.send_bot(
+                f"#{rank} {r['player'].name}: {r['score']:,} ({r['acc']:.2f}%) x{r['max_combo']}",
+            )
+
+    async def _game_id(self) -> int | None:
+        if self._game_insert is not None:
+            try:
+                await self._game_insert
+            except Exception:
+                pass
+        return self.current_game_id
+
+    async def _end_game(self) -> int | None:
+        game_id = await self._game_id()
+        if game_id:
+            try:
+                await app.state.services.database.execute(
+                    "UPDATE mp_match_games SET ended_at = NOW() WHERE id = :id",
+                    {"id": game_id},
+                )
+            except Exception as exc:
+                print(f"[mp] Failed to end game {game_id}: {exc}", flush=True)
+        return game_id
+
+    async def _save_game(self, results: list[dict]) -> None:
+        """Store the game the way official bancho does: straight from the
+        players' last score frames, right when the game ends."""
+        game_id = await self._end_game()
+        if not game_id:
+            return
+        for r in results:
+            if not r["has_frame"]:
+                continue
+            try:
+                await app.state.services.database.execute(
+                    "INSERT INTO mp_match_scores "
+                    "(game_id, user_id, score, acc, max_combo, mods, n300, n100, n50, nmiss, ngeki, nkatu, grade, passed, team) "
+                    "VALUES (:game_id, :user_id, :score, :acc, :max_combo, :mods, :n300, :n100, :n50, :nmiss, :ngeki, :nkatu, :grade, :passed, :team)",
+                    {
+                        "game_id": game_id,
+                        "user_id": r["player"].id,
+                        "score": r["score"],
+                        "acc": round(r["acc"], 3),
+                        "max_combo": r["max_combo"],
+                        "mods": r["mods"],
+                        "n300": r["n300"],
+                        "n100": r["n100"],
+                        "n50": r["n50"],
+                        "nmiss": r["nmiss"],
+                        "ngeki": r["ngeki"],
+                        "nkatu": r["nkatu"],
+                        "grade": r["grade"],
+                        "passed": 1 if r["passed"] else 0,
+                        "team": int(r["team"]),
+                    },
+                )
+            except Exception as exc:
+                print(f"[mp] Failed to save score of {r['player']}: {exc}", flush=True)
+
+    # ------------------------------------------------------------ empty / close
+
+    def schedule_empty_close(self) -> None:
+        self.cancel_empty_close()
+        self._empty_timer = app.state.loop.call_later(
+            EMPTY_MATCH_TIMEOUT, self._close_if_empty,
+        )
+
+    def cancel_empty_close(self) -> None:
+        if self._empty_timer is not None:
+            self._empty_timer.cancel()
+            self._empty_timer = None
+
+    def _close_if_empty(self) -> None:
+        self._empty_timer = None
+        if all(s.empty() for s in self.slots):
+            self.chat.send_bot("Closing the empty room.")
+            self.close()
+
+    def close(self) -> None:
+        """Close the match: remove everybody and dispose it."""
+        self.cancel_empty_close()
+        if self.starting is not None:
+            self.starting["start"].cancel()
+            for alert in self.starting["alerts"]:
+                alert.cancel()
+            self.starting = None
+
+        slotted = [s.player for s in self.slots if s.player is not None]
+        for s in self.slots:
+            if s.player is not None:
+                s.reset()
+        # empty match state makes the osu! client leave the room ui
+        self.enqueue_state(lobby=False)
+
+        for p in list(self.chat.players):
+            p.leave_channel(self.chat)
+            if p.match is self:
+                p.match = None
+        for p in slotted:
+            if p.match is self:
+                p.match = None
+
+        if self.web_id:
+            asyncio.create_task(
+                app.state.services.database.execute(
+                    "UPDATE mp_matches SET ended_at = NOW() WHERE id = :id",
+                    {"id": self.web_id},
+                ),
+            )
+
+        app.state.sessions.matches.remove(self)
+        lobby = app.state.sessions.channels.get_by_name("#lobby")
+        if lobby:
+            lobby.enqueue(app.packets.dispose_match(self.id))
 
     def reset_scrim(self) -> None:
         """Reset the current scrim's winning points & bans."""
@@ -569,3 +818,77 @@ class Match:
 
         for line in msg:
             self.chat.send_bot(line)
+
+
+def calculate_accuracy(mode: int, n300: int, n100: int, n50: int,
+                       ngeki: int, nkatu: int, nmiss: int) -> float:
+    """Accuracy like osu-web (Scoreable::accuracy) for vanilla modes 0-3."""
+    if mode == 1:  # taiko
+        total = n300 + n100 + nmiss
+        return 100.0 * (n300 + n100 * 0.5) / total if total else 0.0
+    if mode == 2:  # catch
+        total = n300 + n100 + n50 + nkatu + nmiss
+        return 100.0 * (n300 + n100 + n50) / total if total else 0.0
+    if mode == 3:  # mania
+        total = n300 + n100 + n50 + ngeki + nkatu + nmiss
+        if not total:
+            return 0.0
+        return 100.0 * (300 * (n300 + ngeki) + 200 * nkatu + 100 * n100 + 50 * n50) / (300 * total)
+    total = n300 + n100 + n50 + nmiss
+    return 100.0 * (300 * n300 + 100 * n100 + 50 * n50) / (300 * total) if total else 0.0
+
+
+def calculate_grade(mode: int, mods: Mods, n300: int, n100: int, n50: int,
+                    ngeki: int, nkatu: int, nmiss: int, passed: bool) -> str:
+    """Grade like osu-web (game_scores has no grade column, it's computed)."""
+    if not passed:
+        return "F"
+    hidden = bool(mods & (Mods.HIDDEN | Mods.FLASHLIGHT | Mods.FADEIN))
+    acc = calculate_accuracy(mode, n300, n100, n50, ngeki, nkatu, nmiss)
+
+    if mode == 2:  # catch
+        if acc >= 100:
+            grade = "X"
+        elif acc > 98:
+            grade = "S"
+        elif acc > 94:
+            grade = "A"
+        elif acc > 90:
+            grade = "B"
+        elif acc > 85:
+            grade = "C"
+        else:
+            grade = "D"
+    elif mode == 3:  # mania
+        if acc >= 100:
+            grade = "X"
+        elif acc > 95:
+            grade = "S"
+        elif acc > 90:
+            grade = "A"
+        elif acc > 80:
+            grade = "B"
+        elif acc > 70:
+            grade = "C"
+        else:
+            grade = "D"
+    else:  # osu!, taiko
+        total = n300 + n100 + n50 + nmiss if mode == 0 else n300 + n100 + nmiss
+        r300 = n300 / total if total else 0.0
+        r50 = n50 / total if total and mode == 0 else 0.0
+        if total and n300 == total:
+            grade = "X"
+        elif r300 > 0.9 and r50 <= 0.01 and nmiss == 0:
+            grade = "S"
+        elif (r300 > 0.8 and nmiss == 0) or r300 > 0.9:
+            grade = "A"
+        elif (r300 > 0.7 and nmiss == 0) or r300 > 0.8:
+            grade = "B"
+        elif r300 > 0.6:
+            grade = "C"
+        else:
+            grade = "D"
+
+    if hidden and grade in ("X", "S"):
+        grade += "H"
+    return grade

@@ -13,6 +13,15 @@ import app.settings
 import app.state
 import app.settings
 from app import commands
+
+
+async def _process_irc_command(player, target, message):
+    """Run a chat command marked as typed in IRC (not in the game client)."""
+    token = commands.via_irc.set(True)
+    try:
+        return await commands.process_commands(player, target, message)
+    finally:
+        commands.via_irc.reset(token)
 from app.logging import Ansi
 from app.logging import log
 from app.objects.channel import Channel
@@ -394,7 +403,7 @@ class IRCClient:
             match_chat = match.chat
 
             # Let the normal command handler do all cleanup (slots, DB, dispose)
-            cmd = await commands.process_commands(self.player, match_chat, "!mp close")
+            cmd = await _process_irc_command(self.player, match_chat, "!mp close")
 
             # mp_close returns None on success — detect success by checking player.match
             if self.player.match is None:
@@ -548,7 +557,7 @@ class IRCClient:
                 return 403
  
             if message.startswith(app.settings.COMMAND_PREFIX):
-                cmd = await commands.process_commands(fro, channel, message)
+                cmd = await _process_irc_command(fro, channel, message)
             else:
                 cmd = None
  
@@ -590,7 +599,7 @@ class IRCClient:
  
             if recipient.is_bot_client:
                 if message.startswith(app.settings.COMMAND_PREFIX):
-                    cmd = await commands.process_commands(fro, recipient, message)
+                    cmd = await _process_irc_command(fro, recipient, message)
                 else:
                     cmd = None
  

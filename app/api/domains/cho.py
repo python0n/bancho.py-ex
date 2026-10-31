@@ -188,7 +188,7 @@ matches:
 -- '''
     + f"{new_line}-- ".join([
         f'{BEATMAP:<{max_properties_length}}: {m.map_name}',
-        f'{HOST:<{max_properties_length}}: <{m.host.id}> {m.host.safe_name}'
+        f'{HOST:<{max_properties_length}}: ' + (f'<{m.host.id}> {m.host.safe_name}' if m.host else '-')
     ]) for m in matches
 )}
 </body>
@@ -1448,6 +1448,22 @@ class MatchCreate(BasePacket):
             )
             return
 
+        if player.match:
+            # stale match from a previous session (upstream bancho.py-ex 12dfc7b)
+            player.enqueue(app.packets.match_join_fail())
+            player.send_bot("You're already in a match. We will try removing you from it.")
+
+            async def next_tick() -> None:
+                player.leave_match()
+                player.enqueue(
+                    app.packets.notification(
+                        "You can try again. Please report to staff if you keep getting this error.",
+                    ),
+                )
+
+            asyncio.create_task(next_tick(), name="remove-duplicated-user")
+            return
+
         match_id = app.state.sessions.matches.get_free()
 
         if match_id is None:
@@ -1488,7 +1504,7 @@ class MatchCreate(BasePacket):
         )
 
         app.state.sessions.matches[match_id] = match
-        app.state.sessions.matches.register(seq_id, match_id)
+        app.state.sessions.matches.register(match_id, seq_id)
         app.state.sessions.channels.append(chat_channel)
         match.chat = chat_channel
 
@@ -1615,6 +1631,9 @@ class MatchChangeSlot(BasePacket):
         if player.match is None:
             return
 
+        if player.match.in_progress:
+            return
+
         # read new slot ID
         if not 0 <= self.slot_id < 16:
             return
@@ -1640,7 +1659,8 @@ class MatchReady(BasePacket):
             return
 
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None or slot.status in (SlotStatus.playing, SlotStatus.complete):
+            return  # no status changes during a game
 
         slot.status = SlotStatus.ready
         player.match.enqueue_state(lobby=False)
@@ -1663,25 +1683,25 @@ class MatchLock(BasePacket):
         if not 0 <= self.slot_id < 16:
             return
 
-        slot = player.match.slots[self.slot_id]
+        match = player.match
+        slot = match.slots[self.slot_id]
 
         if slot.status == SlotStatus.locked:
             slot.status = SlotStatus.open
         else:
-            if slot.player is player.match.host:
+            if slot.player is player:
                 # don't allow the match host to kick
                 # themselves by clicking their crown
                 return
 
-            if slot.player:
-                # uggggggh i hate trusting the osu! client
-                # man why is it designed like this
-                # TODO: probably going to end up changing
-                ...  # slot.reset()
-
+            target = slot.player
             slot.status = SlotStatus.locked
+            if target is not None:
+                # locking an occupied slot kicks the player, like on bancho
+                target.leave_match()
+                target.enqueue(app.packets.dispose_match(match.id))
 
-        player.match.enqueue_state()
+        match.enqueue_state()
 
 
 @register(ClientPackets.MATCH_CHANGE_SETTINGS)
@@ -1720,13 +1740,13 @@ class MatchChangeSettings(BasePacket):
                 player.match.mods &= SPEED_CHANGING_MODS
             else:
                 # host mods -> match mods.
-                host = player.match.get_host_slot()  # should always exist
-                assert host is not None
+                host = player.match.get_host_slot()
 
                 # the match keeps any speed-changing mods,
                 # and also takes any mods the host has enabled.
                 player.match.mods &= SPEED_CHANGING_MODS
-                player.match.mods |= host.mods
+                if host is not None:
+                    player.match.mods |= host.mods
 
                 for slot in player.match.slots:
                     if slot.player is not None:
@@ -1757,7 +1777,7 @@ class MatchChangeSettings(BasePacket):
                 player.match.map_id = bmap.id
                 player.match.map_md5 = bmap.md5
                 player.match.map_name = bmap.full_name
-                player.match.mode = GameMode(player.match.host.status.mode.as_vanilla)
+                player.match.mode = GameMode(player.status.mode.as_vanilla)
             else:
                 player.match.map_id = self.match_data.map_id
                 player.match.map_md5 = self.match_data.map_md5
@@ -1816,7 +1836,6 @@ class MatchChangeSettings(BasePacket):
 @register(ClientPackets.MATCH_START)
 class MatchStart(BasePacket):
     async def handle(self, player: Player) -> None:
-        log(f"[DEBUG] MatchStart called by {player} match={player.match}", Ansi.LGREEN)
         if player.match is None:
             return
 
@@ -1824,28 +1843,12 @@ class MatchStart(BasePacket):
             log(f"{player} attempted to start match as non-host.", Ansi.LYELLOW)
             return
 
-        if False:  # przeniesione do Match.start()
-            try:
-                game_id = await services.database.execute(
-                    "INSERT INTO mp_match_games (match_id, map_id, map_md5, mode, scoring_type, team_type, mods, started_at) "
-                    "VALUES (:match_id, :map_id, :map_md5, :mode, :scoring_type, :team_type, :mods, NOW())",
-                    {
-                        "match_id": player.match.web_id,
-                        "map_id": player.match.map_id,
-                        "map_md5": player.match.map_md5,
-                        "mode": int(player.match.mode),
-                        "scoring_type": int(player.match.win_condition),
-                        "team_type": int(player.match.team_type),
-                        "mods": int(player.match.mods),
-                    }
-                )
-                player.match.current_game_id = game_id
-            except Exception as exc:
-                log(f"Failed to insert mp_match_games: {exc}", Ansi.LYELLOW)
-            else:
-                log(f"[DEBUG] Inserted game_id={game_id} for match web_id={player.match.web_id} map_id={player.match.map_id}", Ansi.LGREEN)
-
         player.match.start()
+
+
+# osu! score frame: time, id, n300, n100, n50, geki, katu, miss, score,
+# max combo, combo, perfect, hp, tag byte, scorev2 (+ 2 doubles with scorev2)
+SCOREFRAME_FMT = struct.Struct("<iBHHHHHHiHH?BB?")
 
 
 @register(ClientPackets.MATCH_SCORE_UPDATE)
@@ -1861,30 +1864,23 @@ class MatchScoreUpdate(BasePacket):
             return
 
         slot_id = player.match.get_slot_id(player)
-        assert slot_id is not None
+        if slot_id is None:
+            return
+        slot = player.match.slots[slot_id]
 
-        # parse score frame and save in slot for later use
-        try:
-            import struct as _struct
-            SCOREFRAME_FMT = _struct.Struct("<iBHHHHHHiHH?BB?")
-            if len(self.play_data) >= 29:
-                sf_data = bytes(self.play_data[:29])
-                sf_fields = SCOREFRAME_FMT.unpack(sf_data)
-                slot = player.match.get_slot(player)
-                if slot is not None:
-                    slot.last_score_frame = {
-                        "total_score": sf_fields[8],
-                        "max_combo": sf_fields[9],
-                        "num300": sf_fields[2],
-                        "num100": sf_fields[3],
-                        "num50": sf_fields[4],
-                        "num_geki": sf_fields[5],
-                        "num_katu": sf_fields[6],
-                        "num_miss": sf_fields[7],
-                        "perfect": sf_fields[11],
-                    }
-        except Exception:
-            pass
+        # the last score frame is what official bancho stores as the
+        # player's result (osu-web game_scores keeps the frame)
+        if len(self.play_data) >= SCOREFRAME_FMT.size:
+            (_time, _id, n300, n100, n50, ngeki, nkatu, nmiss, score, max_combo,
+             _combo, perfect, hp, _tag, sv2) = SCOREFRAME_FMT.unpack_from(bytes(self.play_data))
+            slot.last_score_frame = {
+                "score": score, "max_combo": max_combo,
+                "n300": n300, "n100": n100, "n50": n50,
+                "ngeki": ngeki, "nkatu": nkatu, "nmiss": nmiss,
+                "perfect": perfect, "hp": hp, "sv2": sv2,
+            }
+            if slot.failed and hp > 0:
+                slot.failed = False  # revived
 
         # if scorev2 is enabled, read an extra 8 bytes.
         buf = bytearray(b"0\x00\x00")
@@ -1905,155 +1901,12 @@ class MatchComplete(BasePacket):
             return
 
         slot = player.match.get_slot(player)
-        assert slot is not None
-
-        slot.status = SlotStatus.complete
-
-        # check if there are any players that haven't finished.
-        if any([s.status == SlotStatus.playing for s in player.match.slots]):
+        if slot is None or slot.status != SlotStatus.playing:
             return
 
-        # find any players just sitting in the multi room
-        # that have not been playing the map; they don't
-        # need to know all the players have completed, only
-        # the ones who are playing (just new match info).
-        not_playing = [
-            s.player.id
-            for s in player.match.slots
-            if s.player is not None and s.status != SlotStatus.complete
-        ]
-
-        was_playing = [
-            s for s in player.match.slots if s.player and s.player.id not in not_playing
-        ]
-
-        # Announce match results to the match chat
-        if was_playing:
-            results = []
-            for s in was_playing:
-                if s.player is None:
-                    continue
-                sf = getattr(s, "last_score_frame", None)
-                if sf:
-                    score = sf.get("total_score", 0)
-                    n300 = sf.get("num300", 0)
-                    n100 = sf.get("num100", 0)
-                    n50 = sf.get("num50", 0)
-                    n_miss = sf.get("num_miss", 0)
-                    max_combo = sf.get("max_combo", 0)
-                    total = n300 + n100 + n50 + n_miss
-                    acc = (300 * n300 + 100 * n100 + 50 * n50) / (300 * total) * 100 if total else 0.0
-                    results.append((score, s.player.name, acc, max_combo))
-                else:
-                    results.append((0, s.player.name, 0.0, 0))
-            results.sort(key=lambda x: x[0], reverse=True)
-            player.match.chat.send_bot("Match ended!")
-            for rank, (score, pname, acc, max_combo) in enumerate(results, 1):
-                player.match.chat.send_bot(
-                    f"#{rank} {pname}: {score:,} ({acc:.2f}%) x{max_combo}"
-                )
-
-        player.match.unready_players(expected=SlotStatus.complete)
-        player.match.reset_players_loaded_status()
-
-        player.match.in_progress = False
-        player.match.enqueue(
-            app.packets.match_complete(),
-            lobby=False,
-            immune=not_playing,
-        )
-        player.match.enqueue_state()
-
-        if getattr(player.match, "web_id", None):
-            async def _save_scores(_match=player.match, _was_playing=was_playing, _gid=getattr(player.match, "current_game_id", None)):
-                try:
-                    await asyncio.sleep(12)  # czekaj na HTTP score submit
-                    from app.state import services as _svc
-                    # pobierz najnowszą grę tego meczu
-                    game_id = _gid
-                    if not game_id:
-                        row = await _svc.database.fetch_one(
-                            "SELECT id FROM mp_match_games WHERE match_id = :mid ORDER BY id DESC LIMIT 1",
-                            {"mid": _match.web_id}
-                        )
-                        if not row:
-                            return
-                        game_id = row["id"]
-                    await _svc.database.execute(
-                        "UPDATE mp_match_games SET ended_at = NOW() WHERE id = :id",
-                        {"id": game_id}
-                    )
-                    for s in _was_playing:
-                        if s.player is None:
-                            continue
-                        rc = s.player.recent_score
-                        sf = s.last_score_frame  # ostatnia klatka z MATCH_SCORE_UPDATE
-
-                        # jesli recent_score nie ma lub nie pasuje do mapy (unranked/hidden),
-                        # uzyj danych z score frame
-                        use_frame = sf is not None and (
-                            rc is None or
-                            rc.bmap is None or
-                            rc.bmap.md5 != _match.map_md5
-                        )
-
-                        if use_frame:
-                            slot_mods = (int(s.mods) | int(_match.mods)) if _match.freemods else int(_match.mods)
-                            await _svc.database.execute(
-                                "INSERT INTO mp_match_scores "
-                                "(game_id, user_id, score, acc, max_combo, mods, n300, n100, n50, nmiss, ngeki, nkatu, grade, passed, team) "
-                                "VALUES (:game_id, :user_id, :score, :acc, :max_combo, :mods, :n300, :n100, :n50, :nmiss, :ngeki, :nkatu, :grade, :passed, :team)",
-                                {
-                                    "game_id": game_id,
-                                    "user_id": s.player.id,
-                                    "score": sf["total_score"],
-                                    "acc": 0.0,
-                                    "max_combo": sf["max_combo"],
-                                    "mods": slot_mods,
-                                    "n300": sf["num300"],
-                                    "n100": sf["num100"],
-                                    "n50": sf["num50"],
-                                    "nmiss": sf["num_miss"],
-                                    "ngeki": sf["num_geki"],
-                                    "nkatu": sf["num_katu"],
-                                    "grade": "N",
-                                    "passed": 1 if sf["perfect"] or sf["num_miss"] == 0 else 0,
-                                    "team": int(s.team),
-                                }
-                            )
-                        elif rc is not None:
-                            await _svc.database.execute(
-                                "INSERT INTO mp_match_scores "
-                                "(game_id, user_id, score, acc, max_combo, mods, n300, n100, n50, nmiss, ngeki, nkatu, grade, passed, team) "
-                                "VALUES (:game_id, :user_id, :score, :acc, :max_combo, :mods, :n300, :n100, :n50, :nmiss, :ngeki, :nkatu, :grade, :passed, :team)",
-                                {
-                                    "game_id": game_id,
-                                    "user_id": s.player.id,
-                                    "score": rc.score,
-                                    "acc": rc.acc,
-                                    "max_combo": rc.max_combo,
-                                    "mods": int(rc.mods),
-                                    "n300": rc.n300,
-                                    "n100": rc.n100,
-                                    "n50": rc.n50,
-                                    "nmiss": rc.nmiss,
-                                    "ngeki": rc.ngeki,
-                                    "nkatu": rc.nkatu,
-                                    "grade": rc.grade.name if hasattr(rc.grade, "name") else str(rc.grade),
-                                    "passed": 1 if rc.passed else 0,
-                                    "team": int(s.team),
-                                }
-                            )
-                except Exception as exc:
-                    from app.logging import log, Ansi
-                    log(f"Failed to save match scores: {exc}", Ansi.LYELLOW)
-            app.state.loop.create_task(_save_scores())
-
-        if player.match.is_scrimming:
-            # determine winner, update match points & inform players.
-            asyncio.create_task(  # type: ignore[unused-awaitable]
-                player.match.update_matchpoints(was_playing),
-            )
+        slot.status = SlotStatus.complete
+        # ends the game (results, history, scores) once nobody is playing
+        player.match.check_complete()
 
 
 @register(ClientPackets.MATCH_CHANGE_MODS)
@@ -2098,14 +1951,13 @@ class MatchLoadComplete(BasePacket):
 
         # our player has loaded in and is ready to play.
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None:
+            return
 
         slot.loaded = True
 
-        # check if all players are loaded,
-        # if so, tell all players to begin.
-        if not any(map(is_playing, player.match.slots)):
-            player.match.enqueue(app.packets.match_all_players_loaded(), lobby=False)
+        # tell everybody to begin once all players are loaded
+        player.match.check_all_loaded()
 
 
 @register(ClientPackets.MATCH_NO_BEATMAP)
@@ -2115,7 +1967,8 @@ class MatchNoBeatmap(BasePacket):
             return
 
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None or slot.status in (SlotStatus.playing, SlotStatus.complete):
+            return  # no status changes during a game
 
         slot.status = SlotStatus.no_map
         player.match.enqueue_state(lobby=False)
@@ -2128,7 +1981,8 @@ class MatchNotReady(BasePacket):
             return
 
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None or slot.status in (SlotStatus.playing, SlotStatus.complete):
+            return  # no status changes during a game
 
         slot.status = SlotStatus.not_ready
         player.match.enqueue_state(lobby=False)
@@ -2143,8 +1997,11 @@ class MatchFailed(BasePacket):
         # find the player's slot id, and enqueue that
         # they've failed to all other players in the match.
         slot_id = player.match.get_slot_id(player)
-        assert slot_id is not None
+        if slot_id is None:
+            return
 
+        # NF players never send this; a later frame with hp > 0 means revive
+        player.match.slots[slot_id].failed = True
         player.match.enqueue(app.packets.match_player_failed(slot_id), lobby=False)
 
 
@@ -2155,7 +2012,8 @@ class MatchHasBeatmap(BasePacket):
             return
 
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None or slot.status in (SlotStatus.playing, SlotStatus.complete):
+            return  # no status changes during a game
 
         slot.status = SlotStatus.not_ready
         player.match.enqueue_state(lobby=False)
@@ -2168,17 +2026,12 @@ class MatchSkipRequest(BasePacket):
             return
 
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None:
+            return
 
         slot.skipped = True
-        player.match.enqueue(app.packets.match_player_skipped(player.id))
-
-        for slot in player.match.slots:
-            if slot.status == SlotStatus.playing and not slot.skipped:
-                return
-
-        # all users have skipped, enqueue a skip.
-        player.match.enqueue(app.packets.match_skip(), lobby=False)
+        player.match.enqueue(app.packets.match_player_skipped(player.id), lobby=False)
+        player.match.check_all_skipped()
 
 
 @register(ClientPackets.CHANNEL_JOIN, restricted=True)
@@ -2228,7 +2081,7 @@ class MatchTransferHost(BasePacket):
                 )
             except Exception as exc:
                 log(f"Failed to insert host_change event: {exc}", Ansi.LYELLOW)
-        player.match.host.enqueue(app.packets.match_transfer_host())
+        target.enqueue(app.packets.match_transfer_host())
         player.match.enqueue_state()
 
 
@@ -2347,9 +2200,13 @@ class MatchChangeTeam(BasePacket):
         if player.match is None:
             return
 
+        if player.match.in_progress:
+            return
+
         # toggle team
         slot = player.match.get_slot(player)
-        assert slot is not None
+        if slot is None:
+            return
 
         if slot.team == MatchTeams.blue:
             slot.team = MatchTeams.red
