@@ -11,6 +11,7 @@ from urllib.parse import quote
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import status
+from fastapi.param_functions import Header
 from fastapi.param_functions import Query
 from fastapi.responses import ORJSONResponse
 from fastapi.responses import Response
@@ -18,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials as HTTPCredentials
 from fastapi.security import HTTPBearer
 
 import app.packets
+import app.settings
 import app.state
 import app.usecases.performance
 from app.constants import regexes
@@ -40,6 +42,24 @@ SCREENSHOTS_PATH = SystemPath.cwd() / ".data/ss"
 
 
 router = APIRouter()
+
+
+def is_internal_request(
+    x_internal_key: str | None = Header(None, include_in_schema=False),
+) -> bool:
+    """True when the request comes from our own frontend (shared secret)."""
+    import secrets
+
+    key = app.settings.INTERNAL_API_KEY
+    return bool(key) and x_internal_key is not None and secrets.compare_digest(x_internal_key, key)
+
+
+def _hidden(priv: int, internal: bool) -> bool:
+    """Restricted players are hidden from the public api, like on osu!."""
+    return not (priv & 1) and not internal
+
+
+_PLAYER_NOT_FOUND = {"status": "Player not found."}
 http_bearer_scheme = HTTPBearer(auto_error=False)
 
 # NOTE: The V1 APIs should not be used if a V2 API is available.
@@ -155,6 +175,8 @@ async def api_online() -> Response:
     bots = []
     
     for p in app.state.sessions.players:
+        if p.restricted:
+            continue
         player_info = {"id": p.id, "name": p.name}
         
         if p.is_bot_client:
@@ -213,6 +235,7 @@ async def api_get_player_info(
     scope: Literal["stats", "info", "all"],
     user_id: int | None = Query(None, alias="id", ge=3, le=2_147_483_647),
     username: str | None = Query(None, alias="name", pattern=regexes.USERNAME.pattern),
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """Return information about a given player."""
     if not (username or user_id) or (username and user_id):
@@ -227,7 +250,7 @@ async def api_get_player_info(
     else:  # if user_id
         user_info = await users_repo.fetch_one(id=user_id)
 
-    if user_info is None:
+    if user_info is None or _hidden(user_info["priv"], internal):
         return ORJSONResponse(
             {"status": "Player not found."},
             status_code=status.HTTP_404_NOT_FOUND,
@@ -291,6 +314,7 @@ async def api_get_player_info(
 async def api_get_player_status(
     user_id: int | None = Query(None, alias="id", ge=3, le=2_147_483_647),
     username: str | None = Query(None, alias="name", pattern=regexes.USERNAME.pattern),
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """Return a players current status, if they are online."""
     if username and user_id:
@@ -317,7 +341,7 @@ async def api_get_player_status(
         else:  # if userid
             row = await users_repo.fetch_one(id=user_id)
 
-        if not row:
+        if not row or _hidden(row["priv"], internal):
             return ORJSONResponse(
                 {"status": "Player not found."},
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -332,6 +356,9 @@ async def api_get_player_status(
                 },
             },
         )
+
+    if _hidden(player.priv, internal):
+        return ORJSONResponse(_PLAYER_NOT_FOUND, status_code=status.HTTP_404_NOT_FOUND)
 
     if player.status.map_md5:
         bmap = await Beatmap.from_md5(player.status.map_md5)
@@ -366,6 +393,7 @@ async def api_get_player_scores(
     limit: int = Query(25, ge=1, le=100),
     include_loved: bool = False,
     include_failed: bool = True,
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """Return a list of a given user's recent/best scores."""
     if mode_arg in (
@@ -395,7 +423,7 @@ async def api_get_player_scores(
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
-    if not player:
+    if not player or _hidden(player.priv, internal):
         return ORJSONResponse(
             {"status": "Player not found."},
             status_code=status.HTTP_404_NOT_FOUND,
@@ -547,6 +575,7 @@ async def api_get_player_most_played(
     username: str | None = Query(None, alias="name", pattern=regexes.USERNAME.pattern),
     mode_arg: int = Query(0, alias="mode", ge=0, le=11),
     limit: int = Query(25, ge=1, le=100),
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """Return the most played beatmaps of a given player."""
     # NOTE: this will almost certainly not scale well, lol.
@@ -570,6 +599,9 @@ async def api_get_player_most_played(
             {"status": "Must provide either id or name."},
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+
+    if player and _hidden(player.priv, internal):
+        player = None
 
     if not player:
         return ORJSONResponse(
@@ -739,9 +771,15 @@ async def api_get_map_scores(
 @router.get("/get_score_info")
 async def api_get_score_info(
     score_id: int = Query(..., alias="id", ge=0, le=9_223_372_036_854_775_807),
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """Return information about a given score."""
     score = await scores_repo.fetch_one(score_id)
+
+    if score is not None and not internal:
+        owner = await users_repo.fetch_one(id=score["userid"])
+        if owner is None or _hidden(owner["priv"], internal):
+            score = None
 
     if score is None:
         return ORJSONResponse(
@@ -756,6 +794,7 @@ async def api_get_score_info(
 async def api_get_replay(
     score_id: int = Query(..., alias="id", ge=0, le=9_223_372_036_854_775_807),
     include_headers: bool = True,
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """\
     Return a given replay (including headers).
@@ -763,6 +802,14 @@ async def api_get_replay(
     Note that this endpoint does not increment
     the player's total replay views.
     """
+    if not internal:
+        score_row = await scores_repo.fetch_one(score_id)
+        owner = await users_repo.fetch_one(id=score_row["userid"]) if score_row else None
+        if owner is not None and _hidden(owner["priv"], internal):
+            return ORJSONResponse(
+                {"status": "Replay not found."},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
     # fetch replay file & make sure it exists
     replay_file = REPLAYS_PATH / f"{score_id}.osr"
     if not replay_file.exists():
@@ -979,6 +1026,7 @@ async def api_get_global_leaderboard(
 @router.get("/get_clan")
 async def api_get_clan(
     clan_id: int = Query(..., alias="id", ge=1, le=2_147_483_647),
+    internal: bool = Depends(is_internal_request),
 ) -> Response:
     """Return information of a given clan."""
     clan = await clans_repo.fetch_one(id=clan_id)
@@ -1006,6 +1054,7 @@ async def api_get_clan(
                     "rank": ("Member", "Officer", "Owner")[member["clan_priv"] - 1],
                 }
                 for member in clan_members
+                if not _hidden(member["priv"], internal)
             ],
             "owner": {
                 "id": owner.id,
