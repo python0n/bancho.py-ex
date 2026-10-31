@@ -336,6 +336,27 @@ async def _bss_get_next_beatmap_ids(count: int) -> list[int]:
     return list(range(start_id, start_id + count))
 
 
+async def _bss_set_access_error(player: Player, set_id: int) -> str | None:
+    """Return why `player` may not upload into `set_id`, or None if allowed.
+
+    Only sets from the BSS pool (set_id >= BSS_ID_OFFSET) can be written to,
+    so official osu! maps can never be overwritten, and only by the player
+    who uploaded the existing maps of that set.
+    """
+    if player.restricted:
+        return "restricted"
+    if set_id < BSS_ID_OFFSET:
+        return "not a BSS set"
+    rows = await app.state.services.database.fetch_all(
+        "SELECT DISTINCT creator FROM maps WHERE set_id = :set_id",
+        {"set_id": set_id},
+    )
+    for row in rows:
+        if (row["creator"] or "").lower() != player.name.lower():
+            return f"owned by {row['creator']}"
+    return None
+
+
 def _parse_osu_file_metadata(content: bytes) -> dict[str, Any]:
     """Parse a .osu file and extract metadata."""
     metadata: dict[str, Any] = {
@@ -747,6 +768,15 @@ async def _bss_process_osu_files(
 
         # Check if this map already exists (by md5 OR by set_id+version)
         existing = await maps_repo.fetch_one(md5=md5)
+        if existing and existing["set_id"] != set_id:
+            # the same .osu already belongs to another set (e.g. an official
+            # map) - never move it into this BSS set
+            log(
+                f"[BSS] {filename} matches map {existing['id']} from set "
+                f"{existing['set_id']}, skipped",
+                Ansi.LYELLOW,
+            )
+            continue
         if not existing:
             # md5 changed (map updated) — find by set_id + version
             existing_by_version = await app.state.services.database.fetch_one(
@@ -888,6 +918,10 @@ async def bmsubmitGetID(
 
     num_diffs = max(len(bmap_ids), 1)
 
+    if set_id <= 0 and player.restricted:
+        log(f"[BSS] {player} is restricted, submission denied", Ansi.LYELLOW)
+        return Response(content="1")
+
     if set_id <= 0:
         # New submission
         new_set_id = await _bss_get_next_set_id()
@@ -896,12 +930,10 @@ async def bmsubmitGetID(
         log(f"[BSS] new submission: set={new_set_id} maps={new_bmap_ids}", Ansi.LCYAN)
     else:
         # Update existing
-        existing_maps = await maps_repo.fetch_many(set_id=set_id)
-        if existing_maps:
-            creator = existing_maps[0]["creator"]
-            if creator.lower() != player.name.lower():
-                log(f"[BSS] {player} tried to update set {set_id} owned by {creator}", Ansi.LYELLOW)
-                return Response(content="1")
+        access_error = await _bss_set_access_error(player, set_id)
+        if access_error is not None:
+            log(f"[BSS] {player} denied update of set {set_id}: {access_error}", Ansi.LYELLOW)
+            return Response(content="1")
 
         new_set_id = set_id
         new_bmap_ids = list(bmap_ids)
@@ -939,6 +971,11 @@ async def bmsubmitUpload(
 
     if set_id <= 0:
         log("[BSS] upload with invalid set_id", Ansi.LRED)
+        return Response(content="5")
+
+    access_error = await _bss_set_access_error(player, set_id)
+    if access_error is not None:
+        log(f"[BSS] {player} denied upload to set {set_id}: {access_error}", Ansi.LRED)
         return Response(content="5")
 
     form = await request.form()
