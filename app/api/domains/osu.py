@@ -2698,12 +2698,9 @@ async def osuSubmitModularSelector(
         if app.metrics.enabled:
             app.metrics.increment("ex_submitted_scores")
 
-        if score.status == SubmissionStatus.BEST:
-            if app.state.services.datadog:
-                app.state.services.datadog.increment("bancho.submitted_scores_best")  # type: ignore[no-untyped-call]
-
-            if app.metrics.enabled:
-                app.metrics.increment("ex_submitted_scores_best")
+        # "#N" notification and #1 announcement go by the leaderboard entry:
+        # best pp on rx/ap, best score on vanilla (also for status 3 plays)
+        if score.leaderboard_best:
             if score.bmap.has_leaderboard:
                 if score.bmap.status == RankedStatus.Loved and score.mode in (
                     GameMode.VANILLA_OSU,
@@ -2721,7 +2718,7 @@ async def osuSubmitModularSelector(
                     ),
                 )
 
-                if score.rank == 1 and not score.player.restricted and score.status == 2 and _is_ranked_for_first_places(score.bmap.status):
+                if score.rank == 1 and not score.player.restricted and _is_ranked_for_first_places(score.bmap.status):
                     announce_chan = app.state.sessions.channels.get_by_name("#announce")
 
                     ann = [
@@ -2741,7 +2738,8 @@ async def osuSubmitModularSelector(
                         "SELECT u.id, name FROM users u "
                         "INNER JOIN scores s ON u.id = s.userid "
                         "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
-                        "AND s.status = 2 AND u.priv & 1 "
+                        + ("AND s.status = 2 " if scoring_metric == "pp" else "AND s.status IN (2, 3) ")
+                        + "AND u.priv & 1 "
                         f"ORDER BY s.{scoring_metric} DESC LIMIT 1",
                         {"map_md5": score.bmap.md5, "mode": score.mode},
                     )
@@ -2794,6 +2792,12 @@ async def osuSubmitModularSelector(
                             app.metrics.increment("ex_first_place_webhook")
 
 
+        if score.status == SubmissionStatus.BEST:
+            if app.state.services.datadog:
+                app.state.services.datadog.increment("bancho.submitted_scores_best")  # type: ignore[no-untyped-call]
+
+            if app.metrics.enabled:
+                app.metrics.increment("ex_submitted_scores_best")
             # this score is our best score.
             # Lock + reset WSZYSTKICH BEST/SCORE_BEST + INSERT atomowo.
             pp_db = pp_to_db(score.pp)
@@ -3322,15 +3326,18 @@ async def get_leaderboard_scores(
 
         if personal_best_score_row is not None:
             # calculate the rank of the score.
+            statuses = "(2)" if scoring_metric == "pp" else "(2, 3)"
             p_best_rank = 1 + await app.state.services.database.fetch_val(
-                "SELECT COUNT(*) FROM scores s "
+                "SELECT COUNT(DISTINCT s.userid) FROM scores s "
                 "INNER JOIN users u ON u.id = s.userid "
                 "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
-                "AND s.status = 2 AND u.priv & 1 "
+                f"AND s.status IN {statuses} AND u.priv & 1 "
+                "AND s.userid != :user_id "
                 f"AND s.{scoring_metric} > :score",
                 {
                     "map_md5": map_md5,
                     "mode": mode,
+                    "user_id": player.id,
                     "score": personal_best_score_row["_score"],
                 },
                 column=0,  # COUNT(*)

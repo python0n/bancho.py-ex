@@ -156,6 +156,9 @@ class Score:
 
         self.rank: int | None = None
         self.prev_best: Score | None = None
+        # True when this play is the player's new entry on the map leaderboard
+        # (best pp on rx/ap, best score on vanilla) - drives "#N" and #1 messages
+        self.leaderboard_best: bool = False
 
     def toJSON(self) -> str:
         """Convert Score object to JSON string with primitive values."""
@@ -342,11 +345,15 @@ class Score:
             scoring_metric = "score"
             score = self.score
 
+        # pp leaderboards rank by the best pp play (status 2); score
+        # leaderboards by each player's best score, which is status 3 when the
+        # player has one, else status 2 - so count players, not rows
+        statuses = "(2)" if scoring_metric == "pp" else "(2, 3)"
         num_better_scores: int | None = await app.state.services.database.fetch_val(
-            "SELECT COUNT(*) AS c FROM scores s "
+            "SELECT COUNT(DISTINCT s.userid) AS c FROM scores s "
             "INNER JOIN users u ON u.id = s.userid "
             "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
-            "AND s.status = 2 AND u.priv & 1 "
+            f"AND s.status IN {statuses} AND u.priv & 1 "
             "AND u.id != :self_id "  # nie licz wlasnego starego #1 (self-snipe)
             f"AND s.{scoring_metric} > :score",
             {
@@ -430,6 +437,15 @@ class Score:
         else:
             # Pierwszy score na tej mapie
             self.status = SubmissionStatus.BEST
+
+        if self.mode >= GameMode.RELAX_OSU:
+            self.leaderboard_best = self.status == SubmissionStatus.BEST
+        else:
+            prev_best_score = max(
+                [r["score"] for r in pp_recs] + [r["score"] for r in score_recs],
+                default=None,
+            )
+            self.leaderboard_best = prev_best_score is None or self.score > prev_best_score
 
     def calculate_accuracy(self) -> float:
         """Calculate the accuracy of our score."""
