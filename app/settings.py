@@ -88,6 +88,10 @@ LOG_WITH_COLORS = read_bool(os.environ["LOG_WITH_COLORS"])
 ##          you could put your server at risk.
 DEVELOPER_MODE = read_bool(os.environ["DEVELOPER_MODE"])
 
+# shared secret the frontend (Shiina) sends in X-Internal-Key; requests with it
+# may see restricted players in the v1 api (needed for their own profile/staff)
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
+
 with open("pyproject.toml", "rb") as f:
     VERSION = tomllib.load(f)["tool"]["poetry"]["version"]
 WEB_DOMAIN = DOMAIN
