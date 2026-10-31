@@ -216,9 +216,13 @@ async def fetch_count(
     filename: str | None = None,
     mode: int | None = None,
     frozen: bool | None = None,
+    group_by_set: bool = False,
 ) -> int:
-    """Fetch the number of maps in the database."""
-    select_stmt = select(func.count().label("count")).select_from(MapsTable)
+    """Fetch the number of maps (or of mapsets, with group_by_set) in the database."""
+    if group_by_set:
+        select_stmt = select(func.count(func.distinct(MapsTable.set_id)).label("count")).select_from(MapsTable)
+    else:
+        select_stmt = select(func.count().label("count")).select_from(MapsTable)
     if server is not None:
         select_stmt = select_stmt.where(MapsTable.server == server)
     if set_id is not None:
