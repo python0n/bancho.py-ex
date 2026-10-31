@@ -1,135 +1,103 @@
-# **bancho.py-ex** — taksiegra.ovh fork
+# bancho.py-ex - taksiegra fork
 
 ![GitHub last commit](https://img.shields.io/github/last-commit/python0n/bancho.py-ex/dev?label=Last%20commit&color=1783a3)
 ![GitHub License](https://img.shields.io/github/license/python0n/bancho.py-ex?label=License&color=1783a3)
-![Static Badge](https://img.shields.io/badge/upstream-osu--NoLimits%2Fbancho.py--ex-1783a3)
-![Static Badge](https://img.shields.io/badge/base-osuAkatsuki%2Fbancho.py-1783a3)
+![Upstream](https://img.shields.io/badge/upstream-osu--NoLimits%2Fbancho.py--ex-1783a3)
+![Base](https://img.shields.io/badge/base-osuAkatsuki%2Fbancho.py-1783a3)
 
-An osu! server backend, running [osu.taksiegra.ovh](https://osu.taksiegra.ovh).
+osu! server behind [taksiegra](https://osu.taksiegra.ovh). It is a fork of
+[bancho.py-ex](https://github.com/osu-NoLimits/bancho.py-ex) by osu!NoLimits, which itself is built on
+[bancho.py](https://github.com/osuAkatsuki/bancho.py) by cmyui and the osu!Akatsuki team.
 
-> **This is a fork of a fork.** The base project is
-> [**bancho.py**](https://github.com/osuAkatsuki/bancho.py) by **cmyui** and the
-> osu!Akatsuki team. [**bancho.py-ex**](https://github.com/osu-NoLimits/bancho.py-ex)
-> by **osu!NoLimits** adapts it for public server hosting. This fork builds on
-> bancho.py-ex with tournament client support, a full IRC multiplayer
-> implementation, and a number of score-submission fixes.
->
-> All of it is MIT — see [LICENSE](/LICENSE), which retains the original
-> copyright.
->
-> For installation, use the
-> [upstream documentation](https://osu-nolimits.github.io/wiki/); this fork does
-> not change the setup process.
+Installation works like upstream, so use the [upstream wiki](https://osu-nolimits.github.io/wiki/).
+This page lists what the fork changes. The version in `pyproject.toml` (5.x) is the one shown in our
+changelog.
 
----
+## From bancho.py-ex
 
-## ✨ Features from bancho.py-ex
+- Redis pubsub for ranking maps, restricting, wiping, alerts, donator status and privileges
+  ([docs](https://github.com/osu-NoLimits/bancho.py-ex/wiki/Pubsubs)).
+- Internal API on `localhost:10000`.
+- Optional: pp cap autoban, IRC server, Prometheus metrics, webhook for first places, osu! 2016 client.
+- Server name and Discord invite set in `.env`.
+- Beatmap submission from the osu! editor (BSS), `.osz` built on demand at `/d/<set_id>`.
+- pp stored as `DECIMAL(16,3)` and absurd scores blocked before they are saved.
 
-- 🔁 **Redis PubSub support** ([docs](https://github.com/osu-NoLimits/bancho.py-ex/wiki/Pubsubs)):
-  - Rank or unrank beatmaps
-  - Restrict / unrestrict users
-  - Wipe user data
-  - Send alerts to all online players
-  - Grant donator status
-  - Modify user privileges
-- 💼 **Internal API** on `localhost:10000`
-- 🪫 **PP cap autoban** (optional)
-- 💬 **IRC server** (optional)
-- 📊 **Prometheus metrics** (optional)
-- 🥇 **Webhook for first-place scores** (optional)
-- 🕹️ **osu! 2016 client support** (optional)
-- ⚙️ **Server name and Discord invite configurable via `.env`** — no code changes required
-- 🛠️ **Fixes and performance optimizations**
+## What the fork adds
 
----
+### Beatmap submission (BSS)
+- Every uploaded set has an owner (`bss_sets` table). Only the owner can update a set, only inside
+  the BSS id range, and restricted players cannot upload at all.
+- File type allow list and size limits for the `.osz` contents; storyboard subfolders are kept.
+- A ranked set that gets updated goes back to Pending.
+- Star rating and max combo of each difficulty from osz2-service, which is reached over the
+  Docker network only (no public port).
+- After an update the leaderboard of the right difficulty is used, not always the first one.
 
-## **Added in this fork**
+### Scores and pp
+- No duplicated pp: the best score is chosen and saved inside one transaction.
+- Failed scores and best-by-score scores are saved instead of dropped.
+- One leaderboard row per player.
+- In score based modes the #1, placements, personal bests and #1 announcements go by the highest
+  score; Relax and Autopilot go by pp. Beating your own #1 is not announced.
+- Pinned scores (`scores.pinned`, `scores.pin_order`).
 
-### 🏆 Tournament client support
-- Authentication for the tourney client, which double-MD5s the password before sending it
-- `TOURNAMENT` and `TOURNEY_MANAGER` privileges, honoured on packets 93/108/109
-- Score updates forwarded to spectators; `match_start` fix
-- Presence self-heal and correct handling of multiple simultaneous sessions on logout
+### Multiplayer
+- A match never hangs: leaving or losing connection while loading, skipping or playing finishes
+  that step for everyone else.
+- Match results are saved from the score frames the client sends, like official bancho, with
+  accuracy and grade calculated the osu-web way, mods (ScoreV2 included) and the pass state.
+- Results in the match chat are sorted by the win condition; the history link points to the
+  match page on the website.
+- `!mp` commands follow the osu! wiki. Rooms made with `!mp make` close after 30 minutes
+  without players. Locking a taken slot and `!mp kick` really remove the player.
+- Match history in `mp_match_games`, `mp_match_scores` and `mp_match_events`.
+- Tournament client: login, `TOURNAMENT` and `TOURNEY_MANAGER` privileges, scores for spectators.
 
-### 💬 IRC multiplayer
-- Full IRC server integration with multi-room `seq_id` support (`app/api/ircserver/`)
-- `!mp` command set matching the osu! wiki, including `!mp make` and `!mp close`
-- Two-way chat sync between the game client and IRC, with BanchoBot responses forwarded to IRC
-- `mp_timer` and `mp_start` countdown alerts relayed to IRC clients
-- Per-room slot isolation, graceful handling of an IRC user hosting a match, and match cleanup with `ended_at`
+### IRC
+- The same rules as in the game: silence, read only channels, blocked private messages,
+  2000 character limit; messages to offline players go to their mailbox.
+- Private messages between IRC users and from the game to IRC users work, so do joining and
+  leaving channels.
 
-### 🎯 Scores & PP
-- **PP duplication fixed** — atomic lock, reset and insert inside a transaction, ordered by PP
-- `FAILED` and `SCORE_BEST` scores are now persisted instead of being silently dropped
-- Leaderboard deduplication — one row per user across status 2 and 3
-- **Pinned scores** — `scores.pinned` and `scores.pin_order`, populated on submission
-- Self-snipe no longer triggers a "#1" announcement (`calculate_placement` ignores the player's own scores)
-- `DECIMAL` PP cast to float in the `api_get_player_scores` response
+### Accounts and moderation
+- Restricted players are hidden from other players in the public `/v1` API. The website sends
+  `X-Internal-Key` (`INTERNAL_API_KEY` in `.env`) to see them for staff.
+- A wrong password no longer logs out an idle session of the same account.
+- Login rate limit per IP; no plaintext password cache.
+- Clan changes made on the website reach the game at once (`clan_change` pubsub).
 
-### 📦 Beatmap submission
-- Update-in-place for resubmitted maps, with star-rating recalculation
-- Redis publish carrying `map_ids` on submission
-- `osz2-service` port and MD5 mismatch on resubmission fixed
+### Redis
+- `ex:map_status_change` on rank, love and unrank; `#announce` and `#osu` messages; BSS uploads.
+  Our Discord bot listens to these.
+- Connection and pubsub leaks fixed.
 
-### 🔁 Redis
-- `ex:map_status_change` published on rank / love / unrank
-- `#announce` and `#osu` channel messages published to Redis
-- Connection and pubsub leaks fixed
+## Settings added in `.env`
 
-### 🛡️ Security & stability
-- Plaintext password cache removed from `authenticate()`
-- Per-IP rate limiting on login endpoints
-- bcrypt cache handles `pw_bcrypt` arriving as either `str` or `bytes`
-- Client hash validation normalised, so valid logins are no longer rejected
-- `WEB_DOMAIN` alias and IP resolver safety fixes
-- `/users/@name` redirect; "Previous #1" chat links use `osu.{domain}`
+| Setting | What it does |
+| --- | --- |
+| `INTERNAL_API_KEY` | key the website sends to see restricted players; same value in Shiina's `.env` |
+| `OSZ2_SERVICE_URL` | address of osz2-service, e.g. `http://osz2-service:8080` |
 
-### 🎮 Multiplayer data
-- Match history recorded to `mp_match_games`, `mp_match_scores`, `mp_match_events`
-- Game mods saved per game, OR-ed with player mods under freemods
-- `mp_match_games` written on `!mp start`, with the correct `game_id` in `_save_scores`
+## Frontend
 
-### Also carried from bancho.py-ex and extended
-- **Beatmap Submission System** — submit from the osu! editor, `.osu` metadata parsing and star rating via `akatsuki_pp_py`, `/d/{set_id}` building `.osz` on demand, osz2-service integration
-- **osu!direct mirror fallback** — failover on Cloudflare errors (520–527, 530), no-video variant via `/d/n`
-- **PP sanitization** — absurd scores blocked before insertion, with configurable autoban
-- **Floating-point PP** — `DECIMAL(16,3)` throughout, preventing overflow and truncation
-- **Improved score webhooks** — floating-point PP, try counter in embed footers
+The website is our fork of [Shiina-Web](https://github.com/python0n/Shiina-Web). Other bancho.py
+frontends should work too.
 
----
+## Changelog
 
-## 📋 Changelog
+[taksiegra.ovh/changelog](https://taksiegra.ovh/changelog/)
 
-Full changelog with all updates: **[taksiegra.ovh/changelog/](https://taksiegra.ovh/changelog/)**
+## License and credits
 
----
+MIT, see [LICENSE](/LICENSE). The original work is copyright cmyui (2021) and the osu!Akatsuki team;
+this fork keeps the notice and the same licence.
 
-## 🌐 Frontend
-
-This server runs against a fork of
-[Shiina-Web](https://github.com/python0n/Shiina-Web). Any other
-**bancho.py**-based frontend should work as well.
-
----
-
-## 📄 License
-
-MIT — see [LICENSE](/LICENSE).
-
-Copyright for the original work belongs to **cmyui** (2021) and the
-osu!Akatsuki team. This fork is distributed under the same license, with the
-original copyright notice retained as MIT requires.
-
----
-
-## **Credits**
-
-- [bancho.py](https://github.com/osuAkatsuki/bancho.py) — cmyui and osu!Akatsuki
-- [bancho.py-ex](https://github.com/osu-NoLimits/bancho.py-ex) — osu!NoLimits
+- [bancho.py](https://github.com/osuAkatsuki/bancho.py) - cmyui and osu!Akatsuki
+- [bancho.py-ex](https://github.com/osu-NoLimits/bancho.py-ex) - osu!NoLimits
 
 <a href="https://github.com/osu-NoLimits/bancho.py-ex/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=osu-NoLimits/bancho.py-ex" />
+  <img src="https://contrib.rocks/image?repo=osu-NoLimits/bancho.py-ex" alt="bancho.py-ex contributors" />
 </a>
 
-Fork maintained by [python0n](https://github.com/python0n) for
-[taksiegra.ovh](https://taksiegra.ovh).
+Fork maintained by [python0n](https://github.com/python0n).
