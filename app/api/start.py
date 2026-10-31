@@ -24,6 +24,53 @@ async def start_pubsub_recievers():
     asyncio.create_task(channel_wipe_reciever())
     asyncio.create_task(channel_country_change_reciever())
     asyncio.create_task(channel_name_change_reciever())
+    asyncio.create_task(channel_clan_change_reciever())
+
+
+async def channel_clan_change_reciever():
+    """Shiina changed someone's clan (join, leave, kick, create, disband):
+    refresh the clan of online players so it's right without logging in again.
+    Payload: {"ids": [user ids]} and/or {"clan_id": id} for every member of a clan."""
+    from app.constants.privileges import ClanPrivileges
+
+    pubsub = app.state.services.redis.pubsub()
+    await pubsub.subscribe("clan_change")
+
+    log("Subscribed to 'clan_change' channel.", Ansi.LGREEN)
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            try:
+                data = orjson.loads(message["data"])
+                ids = {int(i) for i in data.get("ids", [])}
+                clan_id = data.get("clan_id")
+                targets = [
+                    p for p in app.state.sessions.players
+                    if p.id in ids or (clan_id is not None and p.clan_id == int(clan_id))
+                ]
+                for p in targets:
+                    row = await app.state.services.database.fetch_one(
+                        "SELECT clan_id, clan_priv FROM users WHERE id = :id",
+                        {"id": p.id},
+                    )
+                    if row is None:
+                        continue
+                    if row["clan_id"]:
+                        p.clan_id = row["clan_id"]
+                        p.clan_priv = ClanPrivileges(row["clan_priv"])
+                    else:
+                        p.clan_id = None
+                        p.clan_priv = None
+                log(f"EX | Clan Change | refreshed {len(targets)} online player(s)", Ansi.LBLUE)
+            except Exception as e:
+                log(f"EX | Clan Change | bad message: {e!r}", Ansi.LRED)
+    except asyncio.CancelledError:
+        log("Channel clan_change receiver task cancelled.", Ansi.LYELLOW)
+    finally:
+        await pubsub.unsubscribe("clan_change")
+        log("Unsubscribed from 'clan_change'.", Ansi.LRED)
 
 async def channel_name_change_reciever():
     pubsub = app.state.services.redis.pubsub()
