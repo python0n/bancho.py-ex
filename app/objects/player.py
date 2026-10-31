@@ -616,7 +616,8 @@ class Player:
             self.enqueue(app.packets.match_join_fail())
             return False
 
-        if self is not match.host:
+        is_host = match.host is self
+        if not is_host:
             # match already exists, we're simply joining.
             # NOTE: staff members have override to pw and can
             # simply use any to join a pw protected match.
@@ -624,15 +625,18 @@ class Player:
                 log(f"{self} tried to join {match} w/ incorrect pw.", Ansi.LYELLOW)
                 self.enqueue(app.packets.match_join_fail())
                 return False
+
+        if is_host and all(s.empty() for s in match.slots) and match.slots[0].status == SlotStatus.open:
+            # match is being created
+            slot_id = 0
+        else:
+            # joining (also the host of a room made with !mp make, who
+            # must not take over the slot of someone already sitting there)
             slot_id = match.get_free()
             if slot_id is None:
                 log(f"{self} tried to join a full match.", Ansi.LYELLOW)
                 self.enqueue(app.packets.match_join_fail())
                 return False
-
-        else:
-            # match is being created
-            slot_id = 0
 
         if not self.join_channel(match.chat):
             log(f"{self} failed to join {match.chat}.", Ansi.LYELLOW)
@@ -642,7 +646,8 @@ class Player:
         if lobby in self.channels:
             self.leave_channel(lobby)
 
-        slot: Slot = match.slots[0 if slot_id == -1 else slot_id]
+        slot: Slot = match.slots[slot_id]
+        match.cancel_empty_close()
 
         # if in a teams-vs mode, switch team from neutral to red.
         if match.team_type in (MatchTeamTypes.team_vs, MatchTeamTypes.tag_team_vs):
@@ -656,10 +661,7 @@ class Player:
         self.match = match
 
         if _is_first_player:
-            match_id = getattr(match, "web_id", None) or match.id
-            match.chat.send_bot(
-                f"Room name: {match.name}, History: https://osu.ppy.sh/mp/{match_id}"
-            )
+            match.chat.send_bot(f"Room name: {match.name}, History: {match.history_url}")
 
         slot_idx = match.slots.index(slot) + 1
         match.chat.send_bot(f"{self.name} joined in slot {slot_idx}.")
@@ -695,7 +697,12 @@ class Player:
 
         self.leave_channel(self.match.chat)
 
-        if all(s.empty() for s in self.match.slots):
+        if all(s.empty() for s in self.match.slots) and self.match.ref_made:
+            # rooms made with !mp make stay open for a while when empty
+            self.match.in_progress = False
+            self.match.schedule_empty_close()
+            self.match.enqueue_state()
+        elif all(s.empty() for s in self.match.slots):
             # multi is now empty, chat has been removed.
             # remove the multi from the channels list.
             log(f"Match {self.match} finished.")
@@ -734,12 +741,12 @@ class Player:
                 lobby.enqueue(app.packets.dispose_match(self.match.id))
 
         else:  # multi is not empty
-            if self is self.match.host:
+            if self.match.host_id == self.id:
                 # player was host, trasnfer to first occupied slot
                 for s in self.match.slots:
                     if s.player is not None:
                         self.match.host_id = s.player.id
-                        self.match.host.enqueue(app.packets.match_transfer_host())
+                        s.player.enqueue(app.packets.match_transfer_host())
                         break
 
             if self in self.match.referees:
@@ -748,6 +755,11 @@ class Player:
 
             # notify others of our deprature
             self.match.enqueue_state()
+
+            # quitting can end the loading, skip or play phase for the rest
+            self.match.check_all_loaded()
+            self.match.check_all_skipped()
+            self.match.check_complete()
 
         self.match = None
 

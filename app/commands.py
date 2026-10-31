@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+
 import importlib.metadata
 import os
 import pprint
@@ -1458,6 +1460,11 @@ if app.settings.DEVELOPER_MODE:
 """
 
 
+# set by the IRC server while it runs a command, so commands know whether
+# they were typed in IRC or in the game (one session can have both open)
+via_irc: contextvars.ContextVar[bool] = contextvars.ContextVar("via_irc", default=False)
+
+
 def ensure_match(
     f: Callable[[Context, Match], Awaitable[str | None]],
 ) -> Callable[[Context], Awaitable[str | None]]:
@@ -1542,9 +1549,10 @@ async def mp_make(ctx: Context) -> str | None:
     )
 
     app.state.sessions.matches[match_id] = match
-    app.state.sessions.matches.register(seq_id, match_id)
+    app.state.sessions.matches.register(match_id, seq_id)
     app.state.sessions.channels.append(chat_channel)
     match.chat = chat_channel
+    match.ref_made = True
 
     try:
         match.web_id = await app.state.services.database.execute(
@@ -1559,14 +1567,17 @@ async def mp_make(ctx: Context) -> str | None:
     except Exception as exc:
         log(f"Failed to insert mp_matches for match {match_id}: {exc}", Ansi.LYELLOW)
 
-    if getattr(ctx.player, "irc_client", False):
-        # IRC clients must not occupy a slot — they're just managing the match.
-        # Manually join the channel and set match reference without entering a slot.
+    # typed in the game: the referee sits in the room. Typed in IRC (or no
+    # game client at all): they only manage it, without taking a slot.
+    from_game = not via_irc.get() and ctx.player.client_details is not None
+    if from_game:
+        ctx.player.join_match(match, "")
+    else:
         ctx.player.join_channel(match.chat)
         ctx.player.match = match
+        match.chat.send_bot(f"Room name: {match.name}, History: {match.history_url}")
         match.enqueue_state()  # broadcast to #lobby so game clients see it
-    else:
-        ctx.player.join_match(match, "")
+        match.schedule_empty_close()
     return f"Match created: join #multi_{seq_id}"
 
 
@@ -1627,11 +1638,7 @@ async def mp_settings(ctx: Context, match: Match) -> str | None:
         mods_str = ", ".join(name for mod, name in _MOD_FULL_NAMES if match.mods & mod) or "NoMod"
 
     player_count = sum(1 for s in match.slots if s.player is not None)
-    match_id = getattr(match, "web_id", None) or match.id
-
-    match.chat.send_bot(
-        f"Room name: {match.name}, History: https://osu.ppy.sh/mp/{match_id}"
-    )
+    match.chat.send_bot(f"Room name: {match.name}, History: {match.history_url}")
     match.chat.send_bot(
         f"Beatmap: https://osu.ppy.sh/b/{match.map_id} {match.map_name}"
     )
@@ -1698,8 +1705,7 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
                 # make sure player didn't leave the
                 # match since queueing this start lol...
                 # IRC hosts never occupy a slot, so skip this check for them.
-                is_irc_host = getattr(ctx.player, "irc_client", False)
-                if not is_irc_host and ctx.player not in {slot.player for slot in match.slots}:
+                if ctx.player.match is not match:
                     msg = "Player left match? (cancelled)"
                     match.chat.send_bot(msg)
                     return
@@ -1753,12 +1759,7 @@ async def mp_abort(ctx: Context, match: Match) -> str | None:
     if not match.in_progress:
         return "Abort what?"
 
-    match.unready_players(expected=SlotStatus.playing)
-    match.reset_players_loaded_status()
-
-    match.in_progress = False
-    match.enqueue(app.packets.match_abort())
-    match.enqueue_state()
+    match.abort()
     return "Match aborted."
 
 
@@ -1873,7 +1874,7 @@ async def mp_host(ctx: Context, match: Match) -> str | None:
 
     match.host_id = target.id
 
-    match.host.enqueue(app.packets.match_transfer_host())
+    target.enqueue(app.packets.match_transfer_host())
     match.enqueue_state(lobby=True)
     return "Match host updated."
 
@@ -2360,10 +2361,8 @@ async def mp_kick(ctx: Context, match: Match) -> str | None:
     if target is match.host:
         return "You can't kick the host!"
 
-    slot = match.get_slot(target)
-    assert slot is not None
-    slot.reset()
-    match.enqueue_state()
+    target.leave_match()
+    target.enqueue(app.packets.dispose_match(match.id))
     return f"{target.name} was kicked from the match."
 
 
@@ -2588,48 +2587,7 @@ async def mp_set(ctx: Context, match: Match) -> str | None:
 @ensure_match
 async def mp_close(ctx: Context, match: Match) -> str | None:
     """Close the current match, removing all players."""
-    # Cancel any running timers first
-    if match.starting is not None:
-        match.starting["start"].cancel()
-        for alert in match.starting["alerts"]:
-            alert.cancel()
-        match.starting = None
-
-    # Notify all slotted players before removing them so their clients close the lobby
-    slotted = [(slot, slot.player) for slot in match.slots if slot.player is not None]
-    for slot, p in slotted:
-        slot.reset()
-    # Send empty match state to all players still in the channel — this makes
-    # the osu! client automatically leave the match lobby UI
-    match.enqueue_state(lobby=False)
-
-    # Now clean up server-side references
-    for _, p in slotted:
-        p.leave_channel(match.chat)
-        p.match = None
-
-    # Clean up IRC host's match reference if not in a slot
-    if ctx.player.match is match:
-        ctx.player.leave_channel(match.chat)
-        ctx.player.match = None
-
-    # Mark match as ended in the database
-    if match.web_id:
-        try:
-            await app.state.services.database.execute(
-                "UPDATE mp_matches SET ended_at = NOW() WHERE id = :id",
-                {"id": match.web_id},
-            )
-        except Exception as exc:
-            log(f"Failed to update mp_matches ended_at for match {match.id}: {exc}", Ansi.LYELLOW)
-
-    # Force-remove match from sessions and notify lobby
-    app.state.sessions.matches.remove(match)
-
-    lobby = app.state.sessions.channels.get_by_name("#lobby")
-    if lobby:
-        lobby.enqueue(app.packets.dispose_match(match.id))
-
+    match.close()
     return None
 
 
