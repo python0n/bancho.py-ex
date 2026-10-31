@@ -315,15 +315,105 @@ def authenticate_player_session(
 
 # ===================== BSS Helper Functions =====================
 
+# files that may be stored from a BSS upload and served back in the .osz
+BSS_ALLOWED_EXTENSIONS = frozenset({
+    ".osu", ".osb",
+    ".mp3", ".ogg", ".wav",
+    ".jpg", ".jpeg", ".png",
+})
+BSS_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".flv", ".m4v", ".mkv", ".wmv", ".webm"})
+BSS_MAX_UPLOAD_BYTES = 100 * 1024 * 1024    # one uploaded file (same limit as osz2-service)
+BSS_MAX_UNPACKED_BYTES = 300 * 1024 * 1024  # everything unpacked from one upload
+BSS_MAX_FILES = 500
+
+
+def _bss_safe_relpath(name: str) -> str | None:
+    """Clean a file path from an uploaded package, keeping subfolders
+    (storyboard sprites) but refusing anything that could leave the set folder
+    or isn't an allowed file type."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." or ":" in p for p in parts):
+        return None
+    suffix = SystemPath(parts[-1]).suffix.lower()
+    if suffix not in BSS_ALLOWED_EXTENSIONS and suffix not in BSS_VIDEO_EXTENSIONS:
+        return None
+    return "/".join(parts)
+
+
+def _bss_write_file(directory: SystemPath, relpath: str, data: bytes) -> None:
+    target = directory / relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+
+
+def _bss_clear_dir(directory: SystemPath) -> None:
+    """Remove files left from an earlier upload of the same set."""
+    import shutil
+
+    if not directory.exists():
+        return
+    for entry in directory.iterdir():
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
+def _bss_calc_difficulty(osu_path: SystemPath) -> tuple[float, int] | None:
+    """Star rating and max combo of a .osu file, the same way the server calculates pp."""
+    try:
+        import akatsuki_pp_py as rosu
+
+        perf = rosu.Calculator().performance(rosu.Beatmap(path=str(osu_path)))
+        return round(perf.difficulty.stars, 2), int(perf.difficulty.max_combo)
+    except Exception as e:
+        log(f"[BSS] difficulty calc failed for {osu_path.name}: {e}", Ansi.LYELLOW)
+        return None
+
+
+def _bss_evict_set_cache(set_id: int) -> None:
+    """Drop a BSS set and its maps from the in-memory cache so changes show up at once."""
+    app.state.cache.beatmapset.pop(set_id, None)
+    for key, bmap in list(app.state.cache.beatmap.items()):
+        if getattr(bmap, "set_id", None) == set_id:
+            app.state.cache.beatmap.pop(key, None)
+
+
 async def _bss_get_next_set_id() -> int:
-    """Get the next available beatmapset ID for BSS."""
-    stmt = sa_select(sa_func.max(MapsTable.set_id)).where(
-        MapsTable.set_id >= BSS_ID_OFFSET,
+    """Get the next available beatmapset ID for BSS (maps and reserved sets)."""
+    result = await app.state.services.database.fetch_val(
+        "SELECT GREATEST("
+        "COALESCE((SELECT MAX(set_id) FROM maps WHERE set_id >= :offset), 0), "
+        "COALESCE((SELECT MAX(set_id) FROM bss_sets), 0))",
+        {"offset": BSS_ID_OFFSET},
     )
-    result = await app.state.services.database.fetch_val(stmt)
-    if result is None:
+    if not result or result < BSS_ID_OFFSET:
         return BSS_ID_OFFSET
-    return result + 1
+    return int(result) + 1
+
+
+async def _bss_reserve_set(owner_id: int) -> int:
+    """Reserve a new BSS set id for `owner_id`, so two submissions can't get the same one."""
+    for _ in range(5):
+        set_id = await _bss_get_next_set_id()
+        try:
+            await app.state.services.database.execute(
+                "INSERT INTO bss_sets (set_id, owner_id, created_at, updated_at) "
+                "VALUES (:set_id, :owner_id, NOW(), NOW())",
+                {"set_id": set_id, "owner_id": owner_id},
+            )
+            return set_id
+        except Exception as e:  # duplicate key - someone else took it, try the next one
+            log(f"[BSS] set id {set_id} taken ({e}), retrying", Ansi.LYELLOW)
+    raise RuntimeError("could not reserve a BSS set id")
+
+
+async def _bss_get_set_owner(set_id: int) -> int | None:
+    owner = await app.state.services.database.fetch_val(
+        "SELECT owner_id FROM bss_sets WHERE set_id = :set_id",
+        {"set_id": set_id},
+    )
+    return None if owner is None else int(owner)
 
 
 async def _bss_get_next_beatmap_ids(count: int) -> list[int]:
@@ -340,20 +430,36 @@ async def _bss_set_access_error(player: Player, set_id: int) -> str | None:
     """Return why `player` may not upload into `set_id`, or None if allowed.
 
     Only sets from the BSS pool (set_id >= BSS_ID_OFFSET) can be written to,
-    so official osu! maps can never be overwritten, and only by the player
-    who uploaded the existing maps of that set.
+    so official osu! maps can never be overwritten, and only by the owner
+    stored in bss_sets (by user id, so a name change doesn't matter).
     """
     if player.restricted:
         return "restricted"
     if set_id < BSS_ID_OFFSET:
         return "not a BSS set"
+
+    owner_id = await _bss_get_set_owner(set_id)
+    if owner_id is not None:
+        if owner_id != player.id:
+            return f"owned by user {owner_id}"
+        return None
+
+    # older set without an owner row: fall back to the creator name of its
+    # maps, and take ownership if it matches
     rows = await app.state.services.database.fetch_all(
         "SELECT DISTINCT creator FROM maps WHERE set_id = :set_id",
         {"set_id": set_id},
     )
+    if not rows:
+        return "set id was never assigned"
     for row in rows:
         if (row["creator"] or "").lower() != player.name.lower():
             return f"owned by {row['creator']}"
+    await app.state.services.database.execute(
+        "INSERT IGNORE INTO bss_sets (set_id, owner_id, created_at, updated_at) "
+        "VALUES (:set_id, :owner_id, NOW(), NOW())",
+        {"set_id": set_id, "owner_id": player.id},
+    )
     return None
 
 
@@ -460,26 +566,39 @@ def _parse_osu_file_metadata(content: bytes) -> dict[str, Any]:
 
 
 def _bss_try_extract_zip(data: bytes, output_dir: SystemPath) -> list[tuple[str, bytes]]:
-    """Try to extract .osu files from a zip/osz/osz2 file."""
+    """Try to extract .osu files from a zip/osz/osz2 file.
+
+    Only allowed file types are kept, paths can't leave the set folder, and
+    the archive is refused if it unpacks to too many files or too many bytes.
+    """
     import zipfile
     import io
 
     osu_files: list[tuple[str, bytes]] = []
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            for name in zf.namelist():
-                if name.endswith(".osu"):
-                    file_data = zf.read(name)
-                    safe = name.replace("/", "_").replace("\\", "_")
-                    (output_dir / safe).write_bytes(file_data)
-                    osu_files.append((name, file_data))
-                elif not name.endswith("/"):
-                    safe = name.replace("/", "_").replace("\\", "_")
-                    (output_dir / safe).write_bytes(zf.read(name))
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if len(infos) > BSS_MAX_FILES:
+                log(f"[BSS] archive has {len(infos)} files, refused", Ansi.LRED)
+                return []
+            if sum(i.file_size for i in infos) > BSS_MAX_UNPACKED_BYTES:
+                log("[BSS] archive unpacks to too much data, refused", Ansi.LRED)
+                return []
+            for info in infos:
+                rel = _bss_safe_relpath(info.filename)
+                if rel is None:
+                    log(f"[BSS] skipped file from archive: {info.filename}", Ansi.LYELLOW)
+                    continue
+                file_data = zf.read(info)
+                _bss_write_file(output_dir, rel, file_data)
+                if rel.lower().endswith(".osu"):
+                    osu_files.append((rel, file_data))
             if osu_files:
                 log(f"[BSS] extracted {len(osu_files)} .osu files from archive", Ansi.LCYAN)
-    except Exception:
-        pass  # not a valid zip — encrypted osz2 or other format
+    except zipfile.BadZipFile:
+        pass  # not a zip - encrypted osz2
+    except Exception as e:
+        log(f"[BSS] archive extraction failed: {e}", Ansi.LYELLOW)
     return osu_files
 
 
@@ -792,6 +911,15 @@ async def _bss_process_osu_files(
                 existing = existing_by_version
         if existing:
             log(f"[BSS] map {md5} already exists as id={existing['id']}, updating", Ansi.LCYAN)
+            if existing["md5"] != md5 and existing["status"] in (2, 3, 4, 5):
+                # a ranked/approved/qualified/loved map got new content: it has
+                # to be checked again, like on osu! when a map is updated
+                log(
+                    f"[BSS] map {existing['id']} changed while status={existing['status']}, "
+                    f"moved back to pending",
+                    Ansi.LYELLOW,
+                )
+                await maps_repo.partial_update(id=existing["id"], status=0)
             await maps_repo.partial_update(
                 id=existing["id"],
                 set_id=set_id,
@@ -815,17 +943,12 @@ async def _bss_process_osu_files(
             osu_file_path.write_bytes(file_data)
             if md5 in app.state.cache.unsubmitted:
                 app.state.cache.unsubmitted.discard(md5)
-            # Przelicz SR po update
-            try:
-                import akatsuki_pp_py as rosu
-                bm = rosu.Beatmap(path=str(osu_file_path))
-                calc = rosu.Calculator()
-                perf = calc.performance(bm)
-                sr = perf.difficulty.stars
-                await maps_repo.partial_update(id=existing["id"], diff=round(sr, 2))
-                log(f"[BSS] SR updated for {existing['id']}: {sr:.2f}", Ansi.LGREEN)
-            except Exception as e:
-                log(f"[BSS] SR calc failed for {existing['id']}: {e}", Ansi.LYELLOW)
+            # Przelicz SR i max combo po update
+            calc_result = _bss_calc_difficulty(osu_file_path)
+            if calc_result is not None:
+                sr, max_combo = calc_result
+                await maps_repo.partial_update(id=existing["id"], diff=sr, max_combo=max_combo)
+                log(f"[BSS] SR updated for {existing['id']}: {sr:.2f} ({max_combo}x)", Ansi.LGREEN)
             continue
 
         assigned_ids = await _bss_get_next_beatmap_ids(1)
@@ -880,17 +1003,12 @@ async def _bss_process_osu_files(
         osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
         osu_file_path.write_bytes(file_data)
 
-        # Calculate star rating
-        try:
-            import akatsuki_pp_py as rosu
-            bm = rosu.Beatmap(path=str(osu_file_path))
-            calc = rosu.Calculator()
-            perf = calc.performance(bm)
-            sr = perf.difficulty.stars
-            await maps_repo.partial_update(id=beatmap_id, diff=round(sr, 2))
-            log(f"[BSS] SR for {beatmap_id}: {sr:.2f}", Ansi.LGREEN)
-        except Exception as e:
-            log(f"[BSS] SR calc failed for {beatmap_id}: {e}", Ansi.LYELLOW)
+        # Calculate star rating and max combo
+        calc_result = _bss_calc_difficulty(osu_file_path)
+        if calc_result is not None:
+            sr, max_combo = calc_result
+            await maps_repo.partial_update(id=beatmap_id, diff=sr, max_combo=max_combo)
+            log(f"[BSS] SR for {beatmap_id}: {sr:.2f} ({max_combo}x)", Ansi.LGREEN)
 
         # Clear cached unsubmitted state
         if md5 in app.state.cache.unsubmitted:
@@ -924,7 +1042,7 @@ async def bmsubmitGetID(
 
     if set_id <= 0:
         # New submission
-        new_set_id = await _bss_get_next_set_id()
+        new_set_id = await _bss_reserve_set(player.id)
         new_bmap_ids = await _bss_get_next_beatmap_ids(num_diffs)
         full_submit = 1
         log(f"[BSS] new submission: set={new_set_id} maps={new_bmap_ids}", Ansi.LCYAN)
@@ -984,29 +1102,50 @@ async def bmsubmitUpload(
     submission_dir = SUBMISSIONS_PATH / str(set_id)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
+    def _is_package(name: str, filename: str) -> bool:
+        return filename.lower().endswith((".osz2", ".osz")) or name in ("osz2", "osz")
+
+    uploads = [
+        (name, value) for name, value in form.multi_items()
+        if name not in ("u", "h", "t", "s") and isinstance(value, StarletteUploadFile)
+    ]
+    for name, value in uploads:
+        if (value.size or 0) > BSS_MAX_UPLOAD_BYTES:
+            log(f"[BSS] {value.filename} is too large ({value.size} bytes), upload refused", Ansi.LRED)
+            return Response(content="5")
+
+    # a full package replaces the whole set, so drop files from earlier uploads
+    if any(_is_package(name, value.filename or name) for name, value in uploads):
+        _bss_clear_dir(submission_dir)
+
     osu_files_found: list[tuple[str, bytes]] = []
     osz2_data: bytes | None = None  # keep track of osz2 for fallback
 
-    for field_name, field_value in form.items():
-        if field_name in ("u", "h", "t", "s"):
+    for field_name, field_value in uploads:
+        file_data = await field_value.read(BSS_MAX_UPLOAD_BYTES + 1)
+        if len(file_data) > BSS_MAX_UPLOAD_BYTES:
+            log(f"[BSS] {field_value.filename} is too large, upload refused", Ansi.LRED)
+            return Response(content="5")
+        filename = field_value.filename or field_name
+
+        log(f"[BSS] received file: {filename} ({len(file_data)} bytes)", Ansi.LCYAN)
+
+        if _is_package(field_name, filename):
+            (submission_dir / "upload.osz2").write_bytes(file_data)
+            osz2_data = file_data
+            extracted = _bss_try_extract_zip(file_data, submission_dir)
+            osu_files_found.extend(extracted)
             continue
 
-        if isinstance(field_value, StarletteUploadFile):
-            file_data = await field_value.read()
-            filename = field_value.filename or field_name
-
-            log(f"[BSS] received file: {filename} ({len(file_data)} bytes)", Ansi.LCYAN)
-
-            safe_filename = filename.replace("/", "_").replace("\\", "_")
-            (submission_dir / safe_filename).write_bytes(file_data)
-
-            if filename.endswith(".osu") or field_name == "osu":
-                osu_files_found.append((filename, file_data))
-            elif filename.endswith((".osz2", ".osz")) or field_name in ("osz2", "osz"):
-                (submission_dir / "upload.osz2").write_bytes(file_data)
-                osz2_data = file_data
-                extracted = _bss_try_extract_zip(file_data, submission_dir)
-                osu_files_found.extend(extracted)
+        rel = _bss_safe_relpath(filename)
+        if rel is None and field_name == "osu":
+            rel = _bss_safe_relpath(SystemPath(filename).name + ".osu")
+        if rel is None:
+            log(f"[BSS] skipped file: {filename}", Ansi.LYELLOW)
+            continue
+        _bss_write_file(submission_dir, rel, file_data)
+        if rel.lower().endswith(".osu"):
+            osu_files_found.append((rel, file_data))
 
     if osu_files_found:
         await _bss_process_osu_files(osu_files_found, set_id, player)
@@ -1016,18 +1155,26 @@ async def bmsubmitUpload(
         decrypted = await _bss_decrypt_osz2(osz2_data)
 
         if decrypted and decrypted.get("files"):
-            # Save all decrypted files (audio, images, .osu, etc.)
-            for fname, file_b64 in decrypted["files"].items():
+            # Save the decrypted files (audio, images, .osu, etc.) that are allowed
+            unpacked_bytes = 0
+            for fname, file_b64 in list(decrypted["files"].items())[:BSS_MAX_FILES]:
+                rel = _bss_safe_relpath(fname)
+                if rel is None:
+                    log(f"[BSS] skipped decrypted file: {fname}", Ansi.LYELLOW)
+                    continue
                 try:
                     file_bytes = base64.b64decode(file_b64)
                 except Exception:
                     log(f"[BSS] failed to decode file: {fname}", Ansi.LYELLOW)
                     continue
 
-                safe_name = fname.replace("/", "_").replace("\\", "_")
-                (submission_dir / safe_name).write_bytes(file_bytes)
+                unpacked_bytes += len(file_bytes)
+                if unpacked_bytes > BSS_MAX_UNPACKED_BYTES:
+                    log("[BSS] decrypted package is too large, rest skipped", Ansi.LRED)
+                    break
+                _bss_write_file(submission_dir, rel, file_bytes)
 
-                if fname.endswith(".osu"):
+                if rel.lower().endswith(".osu"):
                     osu_files_found.append((fname, file_bytes))
                     log(f"[BSS] extracted .osu: {fname} ({len(file_bytes)} bytes)", Ansi.LCYAN)
 
@@ -1051,6 +1198,12 @@ async def bmsubmitUpload(
                 await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
     else:
         log(f"[BSS] no files found in upload for set {set_id}", Ansi.LYELLOW)
+
+    await app.state.services.database.execute(
+        "UPDATE bss_sets SET updated_at = NOW() WHERE set_id = :set_id",
+        {"set_id": set_id},
+    )
+    _bss_evict_set_cache(set_id)
 
     import json as _json
     _bss_map_rows = await app.state.services.database.fetch_all(
@@ -3269,10 +3422,30 @@ async def getScores(
         bss_maps = await maps_repo.fetch_many(set_id=map_set_id)
         if bss_maps:
             already_exists = next((m for m in bss_maps if m["md5"] == map_md5), None)
+            target = None
+            if not already_exists:
+                # only the set owner's client may correct the md5, and only
+                # for the difficulty it actually has open
+                if await _bss_get_set_owner(map_set_id) == player.id:
+                    target = next((m for m in bss_maps if m["filename"] == map_filename), None)
+                    if target is None:
+                        version_match = re.search(r"\[(.+)\]\.osu$", map_filename)
+                        if version_match:
+                            target = next(
+                                (m for m in bss_maps if m["version"] == version_match.group(1)),
+                                None,
+                            )
+                    if target is None and len(bss_maps) == 1:
+                        target = bss_maps[0]
+                if target is None:
+                    log(
+                        f"[BSS] md5 mismatch for set {map_set_id} ({map_filename}) "
+                        f"from {player}, left unchanged",
+                        Ansi.LYELLOW,
+                    )
             if already_exists:
                 bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
-            else:
-                target = bss_maps[0]
+            elif target is not None:
                 log(
                     f"[BSS] md5 mismatch fix: {target['md5']} -> {map_md5} "
                     f"for map {target['id']}",
@@ -3689,12 +3862,21 @@ async def get_osz(
                     zf.writestr(m["filename"], osu_path.read_bytes())
                     has_files = True
 
-            # Include audio/bg from submissions dir if available
+            # Include audio/bg/storyboard from submissions dir if available
             sub_dir = SUBMISSIONS_PATH / str(set_id_int)
             if sub_dir.exists():
-                for f in sub_dir.iterdir():
-                    if f.is_file() and "." in f.name and not f.name.endswith((".osz2", ".osz", ".osu")):
-                        zf.writestr(f.name, f.read_bytes())
+                for f in sorted(sub_dir.rglob("*")):
+                    if not f.is_file():
+                        continue
+                    suffix = f.suffix.lower()
+                    if suffix == ".osu":
+                        continue  # served from BEATMAPS_PATH above
+                    if suffix in BSS_VIDEO_EXTENSIONS:
+                        if no_video:
+                            continue
+                    elif suffix not in BSS_ALLOWED_EXTENSIONS:
+                        continue
+                    zf.writestr(f.relative_to(sub_dir).as_posix(), f.read_bytes())
 
         if not has_files:
             return Response(status_code=status.HTTP_404_NOT_FOUND)
