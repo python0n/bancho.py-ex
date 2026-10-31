@@ -172,6 +172,17 @@ create table mapsets
 		unique (id)
 );
 
+create table bss_sets
+(
+	set_id int not null
+		primary key,
+	owner_id int not null,
+	created_at datetime default CURRENT_TIMESTAMP not null,
+	updated_at datetime default CURRENT_TIMESTAMP not null
+);
+create index bss_sets_owner_id_index
+	on bss_sets (owner_id);
+
 create table map_requests
 (
 	id int auto_increment

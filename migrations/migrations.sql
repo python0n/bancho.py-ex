@@ -479,3 +479,8 @@ create index scores_fetch_leaderboard_generic_index
 # v5.3.0
 alter table scores add column pinned    tinyint(1) not null default 0;
 alter table scores add column pin_order int        not null default 0;
+
+# v5.12.0
+create table bss_sets ( set_id int not null primary key, owner_id int not null, created_at datetime default CURRENT_TIMESTAMP not null, updated_at datetime default CURRENT_TIMESTAMP not null );
+create index bss_sets_owner_id_index on bss_sets (owner_id);
+insert ignore into bss_sets (set_id, owner_id, created_at, updated_at) select m.set_id, min(u.id), min(m.last_update), max(m.last_update) from maps m join users u on u.name = m.creator where m.set_id >= 1073741824 group by m.set_id;
