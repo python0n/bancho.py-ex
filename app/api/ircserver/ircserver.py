@@ -220,13 +220,13 @@ class IRCClient:
  
         # GET TOPIC
         if not topic_parts:
-            await self.add_queue(f":{NAME} 332 {self.player.name} {channel.name} :{channel.topic}")
+            await self.add_queue(f":{NAME} 332 {self.player.name} {channel.real_name} :{channel.topic}")
         # SET TOPIC
         else:
             if not self.player in channel.moderators:
-                raise BanchoIRCException(482, f"{channel.name} :You're not a channel operator")
+                raise BanchoIRCException(482, f"{channel.real_name} :You're not a channel operator")
             channel.topic = " :".join(topic_parts)
-            await self.add_queue(f":{self.player.name} TOPIC {channel.name} :{channel.topic}")
+            await self.add_queue(f":{self.player.name} TOPIC {channel.real_name} :{channel.topic}")
  
     async def handler_names(self, args: str) -> None:
         if self.player is None:
@@ -242,8 +242,8 @@ class IRCClient:
             raise BanchoIRCException(442, f"{channel_name} :You're not in this channel")
  
         members = " ".join([p.name for p in channel.players])
-        await self.add_queue(f":{NAME} 353 {self.player.name} = {channel.name} :{members}")
-        await self.add_queue(f":{NAME} 366 {self.player.name} {channel.name} :End of NAMES list")
+        await self.add_queue(f":{NAME} 353 {self.player.name} = {channel.real_name} :{members}")
+        await self.add_queue(f":{NAME} 366 {self.player.name} {channel.real_name} :End of NAMES list")
  
     async def handler_ping(self, args: str) -> None:
         if self.player is None:
@@ -263,6 +263,19 @@ class IRCClient:
             msg = msg[1:]
         elif msg.startswith(":"):
             msg = msg[1:]
+
+        if self.player.silenced:
+            await self.add_queue(f":{NAME} 404 {self.player.name} {recipient} :You are silenced")
+            return
+
+        msg = msg.strip()
+        if not msg:
+            return
+        if len(msg) > 2000:
+            msg = f"{msg[:2000]}... (truncated)"
+            await self.add_queue(
+                f":{NAME} NOTICE {self.player.name} :Your message was truncated (exceeded 2000 characters).",
+            )
 
         if msg.startswith("!mp close"):
             log(f"Trying to part channel {recipient}", Ansi.LYELLOW)
@@ -287,6 +300,13 @@ class IRCClient:
                         f"{recipient} :Cannot send message to the channel",
                     )
 
+            if not channel.can_write(self.player.priv):
+                # e.g. #announce: read-only for players
+                raise BanchoIRCException(
+                    404,
+                    f"{recipient} :Cannot send message to the channel",
+                )
+
             await self.send_message(self.player, recipient, msg)
  
             for client in await self.server.authorized_clients:
@@ -298,6 +318,24 @@ class IRCClient:
                     )
         else:
             log(f"[IRC] Private message from {self.player.name} to {recipient}: {msg}", Ansi.LMAGENTA)
+            target = await app.state.sessions.players.from_cache_or_sql(name=make_safe_name(recipient))
+            if target is not None and not target.is_bot_client:
+                if self.player.id in target.blocks or (
+                    target.pm_private and self.player.id not in target.friends
+                ):
+                    await self.add_queue(f":{NAME} 404 {self.player.name} {recipient} :{target.name} doesn't accept your messages")
+                    return
+                if target.silenced:
+                    await self.add_queue(f":{NAME} 404 {self.player.name} {recipient} :{target.name} is silenced")
+                    return
+                if not target.is_online:
+                    # offline players get it as mail on their next login, like in the game
+                    from app.repositories import mail as mail_repo
+                    await mail_repo.create(from_id=self.player.id, to_id=target.id, msg=msg)
+                    await self.add_queue(
+                        f":{NAME} NOTICE {self.player.name} :{target.name} is offline, they will get your message on their next login.",
+                    )
+                    return
             await self.send_message(self.player, recipient, msg)
  
             for client in await self.server.authorized_clients:
@@ -331,26 +369,21 @@ class IRCClient:
  
         channel = channel.split(" ")[0]
         chan = app.state.sessions.channels.get_by_name(channel)
- 
-        if len(chan.players) == 0:
-            if chan.name.startswith("#multi_"):
-                app.state.sessions.channels.remove(chan)
-                log(f"Auto-removed empty channel: {chan.name}", Ansi.LYELLOW)
- 
+
         if not chan:
             raise BanchoIRCException(
                 403,
                 f"{channel} :No channel named {channel} has been found",
             )
- 
+
         if chan in self.player.channels:
             for client in await self.server.authorized_clients:
                 assert client.player is not None
- 
+
                 if chan in client.player.channels:
-                    await client.add_queue(f":{self.player.name} PART :{chan.name}")
- 
-            await self.player.leave_channel(chan)
+                    await client.add_queue(f":{self.player.name} PART :{chan.real_name}")
+
+            self.player.leave_channel(chan)
         else:
             raise BanchoIRCException(
                 442,
@@ -529,17 +562,17 @@ class IRCClient:
                 assert client.player is not None
  
                 if chan in client.player.channels:
-                    await client.add_queue(f":{self.player.name} JOIN :{chan.get_realname()}")
+                    await client.add_queue(f":{self.player.name} JOIN :{chan.real_name}")
  
             if chan.topic:
-                await self.add_queue(f"332 {chan.get_realname()} :{chan.topic}")
+                await self.add_queue(f"332 {chan.real_name} :{chan.topic}")
             else:
-                await self.add_queue(f"331 {chan.get_realname()} :No topic is set")
+                await self.add_queue(f"331 {chan.real_name} :No topic is set")
  
             nicks = " ".join([x.name for x in chan.players])
-            await self.add_queue(f":{NAME} 353 {self.player.name} = {chan.get_realname()} :{nicks}")
+            await self.add_queue(f":{NAME} 353 {self.player.name} = {chan.real_name} :{nicks}")
             await self.add_queue(
-                f":{NAME} 366 {self.player.name} {chan.get_realname()} :End of NAMES list",
+                f":{NAME} 366 {self.player.name} {chan.real_name} :End of NAMES list",
             )
         else:
             raise BanchoIRCException(
@@ -587,7 +620,6 @@ class IRCClient:
                 log(
                     f"{fro} @ {channel}: {message}",
                     Ansi.LCYAN,
-                    file=".data/logs/chat.log",
                 )
         else:
             recipient = await app.state.sessions.players.from_cache_or_sql(
@@ -619,7 +651,6 @@ class IRCClient:
                 log(
                     f"{fro} @ {recipient}: {message}",
                     Ansi.LCYAN,
-                    file=".data/logs/chat.log",
                 )
  
         return 1
@@ -661,7 +692,7 @@ class IRCServer:
                 assert client.player is not None
  
                 if channel in client.player.channels:
-                    await client.add_queue(f":{player.name} JOIN {channel.name}")
+                    await client.add_queue(f":{player.name} JOIN {channel.real_name}")
         except TypeError:
             return
  
@@ -671,7 +702,7 @@ class IRCServer:
                 assert client.player is not None
  
                 if channel in client.player.channels:
-                    await client.add_queue(f":{player.name} PART {channel.name}")
+                    await client.add_queue(f":{player.name} PART {channel.real_name}")
         except TypeError:
             return
  
