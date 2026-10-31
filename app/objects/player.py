@@ -776,6 +776,15 @@ class Player:
         channel.append(self)  # add to channel.players
         self.channels.append(channel)  # add to player.channels
 
+        # IRC users in the channel see game players joining (joins made from
+        # IRC are announced by the IRC server itself)
+        irc = getattr(app.state.services, "irc", None)
+        if irc and not self.is_bot_client and not self.irc_client:
+            try:
+                app.state.loop.create_task(irc.bancho_join(self, channel))
+            except (RuntimeError, AttributeError):
+                pass
+
         self.enqueue(app.packets.channel_join(channel.name))
 
         chan_info_packet = app.packets.channel_info(
@@ -809,6 +818,13 @@ class Player:
 
         channel.remove(self)  # remove from c.players
         self.channels.remove(channel)  # remove from player.channels
+
+        irc = getattr(app.state.services, "irc", None)
+        if irc and not self.is_bot_client and not self.irc_client:
+            try:
+                app.state.loop.create_task(irc.bancho_part(self, channel))
+            except (RuntimeError, AttributeError):
+                pass
 
         if kick:
             self.enqueue(app.packets.channel_kick(channel.name))

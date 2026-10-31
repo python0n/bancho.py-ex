@@ -392,9 +392,8 @@ class SendMessage(BasePacket):
                 if irc:
                     await irc.bancho_message(player.name, t_chan.real_name, msg)
                 if cmd["resp"] is not None:
+                    # send_bot forwards to IRC itself
                     t_chan.send_bot(cmd["resp"])
-                    if irc:
-                        await irc.bancho_message(app.state.sessions.bot.name, t_chan.real_name, cmd["resp"])
             else:
                 staff = app.state.sessions.players.staff
                 t_chan.send_selective(
@@ -1263,6 +1262,10 @@ class SendPrivateMessage(BasePacket):
             # target is not bot, send the message normally if online
             if target.is_online:
                 target.send(msg, sender=player)
+                # players connected through IRC get it there too
+                irc = getattr(app.state.services, "irc", None)
+                if irc and target.irc_client:
+                    await irc.bancho_message(player.name, target.name, msg)
             else:
                 # inform user they're offline, but
                 # will receive the mail @ next login.
