@@ -2753,6 +2753,9 @@ async def osuSubmitModularSelector(
                                     name=prev_n1["name"],
                                 ),
                             )
+                        # bell on the website for the player who lost #1
+                        from app.usecases.notifications import notify_first_place_lost
+                        await notify_first_place_lost(dict(prev_n1), score.player.id, score.player.name, score.bmap)
 
                     assert announce_chan is not None
                     announce_chan.send(" ".join(ann), sender=score.player, to_self=True)

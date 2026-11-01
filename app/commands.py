@@ -747,6 +747,8 @@ async def _map(ctx: Context) -> str | None:
         await map_requests_repo.mark_batch_as_inactive(map_ids=modified_beatmap_ids)
     data = json.dumps({"map_ids": modified_beatmap_ids, "ranktype": ranktype, "type": ctx.args[0]})
     await app.state.services.redis.publish("ex:map_status_change", data)
+    from app.usecases.notifications import notify_map_status_change
+    await notify_map_status_change(modified_beatmap_ids, int(new_status), ctx.player.id)
     return f"{bmap.embed} updated to {new_status!s}."
 
 

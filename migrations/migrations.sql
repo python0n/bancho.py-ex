@@ -488,3 +488,7 @@ insert ignore into bss_sets (set_id, owner_id, created_at, updated_at) select m.
 # v5.17.0
 create index mail_from_to_index on mail (from_id, to_id);
 create index mail_to_read_index on mail (to_id, `read`);
+
+# v5.18.0
+create table notifications ( id int auto_increment primary key, user_id int not null, type varchar(32) not null, data text not null, link varchar(255) null, created_at datetime default CURRENT_TIMESTAMP not null, `read` tinyint(1) default 0 not null );
+create index notifications_user_index on notifications (user_id, `read`, id);

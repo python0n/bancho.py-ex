@@ -177,6 +177,8 @@ async def channel_rank_receiver():
                         "user_name": data.get("user_name"),
                     }).decode()
                 )
+                from app.usecases.notifications import notify_map_status_change
+                await notify_map_status_change([beatmap_id], int(status), data.get("user_id"))
     except asyncio.CancelledError:
         log("Channel rank receiver task cancelled.", Ansi.LYELLOW)
     finally:

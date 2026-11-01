@@ -199,6 +199,12 @@ async def approve_pending_replay(pending_id: int) -> dict[str, Any]:
         if bmap.status != RankedStatus.Pending:
             score.rank = await score.calculate_placement()
 
+        # who holds #1 before this score is saved (for the bell of the player who loses it)
+        previous_first = None
+        if score.leaderboard_best and score.rank == 1 and not player.restricted and _is_ranked_for_first_places(bmap.status):
+            from app.usecases.notifications import current_first_place
+            previous_first = await current_first_place(bmap.md5, int(score.mode))
+
         params = {
             "map_md5": bmap.md5,
             "score": score.score,
@@ -394,6 +400,11 @@ async def approve_pending_replay(pending_id: int) -> dict[str, Any]:
             if score.mods:
                 ann.insert(1, f"+{_fmt_mods_for_announce(score.mods)}")
             announce_chan.send(" ".join(ann), sender=player, to_self=True)
+
+    from app.usecases.notifications import notify
+    from app.usecases.notifications import notify_first_place_lost
+    await notify(player.id, "replay_accepted", {"map": bmap.full_name, "pp": round(score.pp, 2)}, f"/scores/{score.id}")
+    await notify_first_place_lost(previous_first, player.id, player.name, bmap)
 
     log(
         f"[replay-approve] pending {pending_id} -> score {score.id} "

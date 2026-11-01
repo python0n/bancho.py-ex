@@ -73,6 +73,11 @@ changelog.
   failing with "User already logged in"; closing the game keeps the chat connected.
 - Messages to offline players really go to their mailbox (offline players were seen as online before).
 
+### Notifications
+- `notifications` table read by the bell on our Shiina. Bancho adds: replay from the website accepted,
+  someone took your #1 on a map, a map of your BSS set changed status (rank, love, unrank) by someone
+  else. Shiina adds the rest itself.
+
 ### Accounts and moderation
 - Restricted players are hidden from other players in the public `/v1` API. The website sends
   `X-Internal-Key` (`INTERNAL_API_KEY` in `.env`) to see them for staff.
