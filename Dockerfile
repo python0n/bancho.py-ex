@@ -10,7 +10,9 @@ RUN apt update && apt install --no-install-recommends -y \
 COPY pyproject.toml poetry.lock ./
 RUN pip install -U pip poetry==2.2.1
 RUN poetry config virtualenvs.create false
-RUN poetry install --no-root
+# only the runtime dependencies: the dev group (pre-commit) would downgrade virtualenv,
+# which poetry itself uses to build py3rijndael, and the build fails on newer python:3.11 images
+RUN poetry install --no-root --only main
 # WebSocket support for the website chat (/ws/chat); uvicorn picks it up by itself
 RUN pip install --no-cache-dir websockets==12.0
 
