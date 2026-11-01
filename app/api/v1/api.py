@@ -85,6 +85,35 @@ http_bearer_scheme = HTTPBearer(auto_error=False)
 DATETIME_OFFSET = 0x89F7FF5F7B58000
 
 
+@router.post("/approve_replay", include_in_schema=False)
+async def api_approve_replay(
+    pending_id: int = Query(..., alias="id", ge=1),
+    internal: bool = Depends(is_internal_request),
+) -> Response:
+    """Save a replay uploaded on the website after an admin accepted it.
+
+    Only for the website (X-Internal-Key); the score goes through the same
+    steps as a score sent from the game."""
+    if not internal:
+        return ORJSONResponse(
+            {"status": "Forbidden."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    from app.usecases.replay_approval import ApprovalError
+    from app.usecases.replay_approval import approve_pending_replay
+
+    try:
+        result = await approve_pending_replay(pending_id)
+    except ApprovalError as e:
+        return ORJSONResponse(
+            {"status": "error", "code": e.code, "message": e.message},
+            status_code=e.http_status,
+        )
+
+    return ORJSONResponse(result)
+
+
 @router.get("/calculate_pp")
 async def api_calculate_pp(
     token: HTTPCredentials | None = Depends(http_bearer_scheme),

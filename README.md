@@ -41,6 +41,8 @@ changelog.
 - In score based modes the #1, placements, personal bests and #1 announcements go by the highest
   score; Relax and Autopilot go by pp. Beating your own #1 is not announced.
 - Pinned scores (`scores.pinned`, `scores.pin_order`).
+- Replays uploaded on the website and accepted by an admin are saved through `POST /v1/approve_replay`
+  (website only, `X-Internal-Key`) with the same rules as scores from the game, stats and rank included.
 
 ### Multiplayer
 - A match never hangs: leaving or losing connection while loading, skipping or playing finishes
@@ -76,7 +78,7 @@ changelog.
 
 | Setting | What it does |
 | --- | --- |
-| `INTERNAL_API_KEY` | key the website sends to see restricted players; same value in Shiina's `.env` |
+| `INTERNAL_API_KEY` | key the website sends to see restricted players and to save accepted replays; same value in Shiina's `.env` |
 | `OSZ2_SERVICE_URL` | address of osz2-service, e.g. `http://osz2-service:8080` |
 
 ## Frontend
