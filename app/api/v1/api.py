@@ -1112,19 +1112,24 @@ async def api_get_pool(
     for pool_map in await tourney_pool_maps_repo.fetch_many(pool_id=pool_id):
         bmap = await Beatmap.from_bid(pool_map["map_id"])
         if bmap is not None:
-            tourney_pool_maps[(pool_map["mods"], pool_map["slot"])] = bmap
+            tourney_pool_maps[(Mods(pool_map["mods"]), pool_map["slot"])] = bmap
 
-    pool_creator = app.state.sessions.players.get(id=tourney_pool["created_by"])
-
+    # the creator does not have to be online (the pool used to 404 when they were offline)
+    pool_creator = await users_repo.fetch_one(id=tourney_pool["created_by"])
     if pool_creator is None:
         return ORJSONResponse(
             {"status": "Pool creator not found."},
             status_code=status.HTTP_404_NOT_FOUND,
         )
+    creator_online = any(
+        p.id == pool_creator["id"] and not p.is_tourney_client
+        for p in app.state.sessions.players
+    )
+    creator_clan_id = pool_creator["clan_id"] or None
 
     pool_creator_clan = (
-        await clans_repo.fetch_one(id=pool_creator.clan_id)
-        if pool_creator.clan_id is not None
+        await clans_repo.fetch_one(id=creator_clan_id)
+        if creator_clan_id is not None
         else None
     )
 
@@ -1134,22 +1139,22 @@ async def api_get_pool(
             "name": tourney_pool["name"],
             "created_at": tourney_pool["created_at"],
             "created_by": {
-                "id": pool_creator.id,
-                "name": pool_creator.name,
-                "country": pool_creator.geoloc["country"]["acronym"],
+                "id": pool_creator["id"],
+                "name": pool_creator["name"],
+                "country": pool_creator["country"],
                 "clan": (
                     {
                         "id": pool_creator_clan["id"],
                         "name": pool_creator_clan["name"],
                         "tag": pool_creator_clan["tag"],
                         "members": await users_repo.fetch_count(
-                            clan_id=pool_creator.clan_id,
+                            clan_id=creator_clan_id,
                         ),
                     }
                     if pool_creator_clan is not None
                     else None
                 ),
-                "online": pool_creator.is_online,
+                "online": creator_online,
             },
             "maps": {
                 f"{mods!r}{slot}": {
