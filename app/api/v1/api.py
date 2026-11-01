@@ -247,6 +247,17 @@ async def api_search_players(
 @router.get("/get_player_count")
 async def api_get_player_count() -> Response:
     """Get the current amount of online players."""
+    # logged-in chat connections: IRC clients and the website chat (/ws/chat)
+    irc_clients, web_chat = 0, 0
+    irc = getattr(app.state.services, "irc", None)
+    if irc is not None:
+        for client in list(irc.clients):
+            if getattr(client, "player", None) is None:
+                continue
+            if getattr(client, "web_chat", False):
+                web_chat += 1
+            else:
+                irc_clients += 1
     return ORJSONResponse(
         {
             "status": "success",
@@ -254,6 +265,8 @@ async def api_get_player_count() -> Response:
                 # -1 for the bot, who is always online
                 "online": len(app.state.sessions.players.unrestricted) - 1,
                 "total": await users_repo.fetch_count(),
+                "irc": irc_clients,
+                "web_chat": web_chat,
             },
         },
     )
