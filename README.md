@@ -62,6 +62,17 @@ changelog.
 - Private messages between IRC users and from the game to IRC users work, so do joining and
   leaving channels.
 
+### Website chat
+- `/ws/chat`: the IRC protocol over a WebSocket, used by the chat page of our Shiina. The connection is
+  a normal client of the IRC server, so channels, PMs, mail, silences, blocks and `!mp` work the same.
+  The website logs the player in with a one-time ticket in Redis (`chat:ticket:<ticket>`), never with
+  the IRC key. Needs the `websockets` package, installed by the Dockerfile.
+- Private messages from the game, IRC and the website are kept in `mail` (PM history); the last 100
+  messages of public channels are kept in Redis for 7 days (`chat:history:<channel>`).
+- Logging into the game while only IRC or the website chat is open takes that session over instead of
+  failing with "User already logged in"; closing the game keeps the chat connected.
+- Messages to offline players really go to their mailbox (offline players were seen as online before).
+
 ### Accounts and moderation
 - Restricted players are hidden from other players in the public `/v1` API. The website sends
   `X-Internal-Key` (`INTERNAL_API_KEY` in `.env`) to see them for staff.

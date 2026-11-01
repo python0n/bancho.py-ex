@@ -11,6 +11,29 @@ if TYPE_CHECKING:
     from app.objects.player import Player
 
 
+CHANNEL_HISTORY_SIZE = 100
+CHANNEL_HISTORY_TTL = 7 * 24 * 3600
+
+
+async def save_channel_message(channel: str, sender: str, sender_id: int, msg: str) -> None:
+    """Last messages of a public channel in Redis (chat:history:<channel>)."""
+    import json as _json
+    import time as _time
+
+    key = f"chat:history:{channel}"
+    entry = _json.dumps(
+        {"time": int(_time.time()), "from": sender, "from_id": sender_id, "msg": msg},
+        ensure_ascii=False,
+    )
+    redis = app.state.services.redis
+    try:
+        await redis.lpush(key, entry)
+        await redis.ltrim(key, 0, CHANNEL_HISTORY_SIZE - 1)
+        await redis.expire(key, CHANNEL_HISTORY_TTL)
+    except Exception:
+        pass
+
+
 class Channel:
     """An osu! chat channel.
 
@@ -68,6 +91,17 @@ class Channel:
 
         return priv & self.read_priv != 0
 
+    def _save_history(self, sender: Player, msg: str) -> None:
+        """Keep the last messages of public channels for the website chat."""
+        if self.instance:
+            return
+        try:
+            app.state.loop.create_task(
+                save_channel_message(self.real_name, sender.name, sender.id, msg),
+            )
+        except (RuntimeError, AttributeError):
+            pass
+
     def can_write(self, priv: Privileges) -> bool:
         if not self.write_priv:
             return True
@@ -86,6 +120,8 @@ class Channel:
         for player in self.players:
             if sender.id not in player.blocks and (to_self or player.id != sender.id):
                 player.enqueue(data)
+
+        self._save_history(sender, msg)
 
         _chat_pub = {"#announce": "ex:announce", "#osu": "ex:chat:osu"}
         if self.real_name in _chat_pub:
@@ -114,6 +150,7 @@ class Channel:
                 sender_id=bot.id,
             ),
         )
+        self._save_history(bot, msg)
 
         # Forward to any IRC clients in this channel
         irc = getattr(app.state.services, "irc", None)

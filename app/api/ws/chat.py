@@ -1,434 +1,174 @@
+"""Website chat (Shiina /chat): the IRC protocol over a WebSocket.
+
+The browser sends and receives ordinary IRC lines, one per WebSocket text
+message. On the server side the connection is a normal IRC client of our IRC
+server, so channels, private messages, mail for offline players, silences,
+blocks, BanchoBot and !mp commands all work exactly like on IRC.
+
+Logging in: Shiina stores a one-time ticket in Redis
+(chat:ticket:<ticket> = user id, valid for 60 seconds) and the browser opens
+/ws/chat?ticket=<ticket>. The IRC key never reaches the browser.
+"""
+
 from __future__ import annotations
 
-import json
+import asyncio
 import re
-from typing import Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter
+from fastapi import WebSocket
+from fastapi import WebSocketDisconnect
 
-import app
-import app.settings
 import app.state
-from app import commands
-from app.logging import Ansi, log
-from app.objects.channel import Channel
-from app.objects.player import Player
-from app.utils import make_safe_name
-from app.ws_chat import hub
-
-BOT_NICK = "BanchoBot"
-SERVER_NAME = "banchobot"
+from app.logging import Ansi
+from app.logging import log
 
 router = APIRouter()
 
-_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-
-def _normalize_token(raw: str | None) -> str:
-    """Best-effort normalize the token coming from query params.
-
-    Users sometimes paste full URLs or prefixes like 'http://'. We try to extract a UUID if present.
-    """
-    if not raw:
-        return ""
-    s = raw.strip()
-    # Extract a UUID if one exists anywhere in the string.
-    m = _UUID_RE.search(s)
-    if m:
-        return m.group(0)
-    # Otherwise just strip common URL scheme prefixes.
-    if s.startswith(("http://", "https://")):
-        s = s.split("://", 1)[1]
-    return s
+TICKET_PREFIX = "chat:ticket:"
+_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+MAX_LINE = 4096
 
 
+class WebSocketWriter:
+    """The small part of asyncio.StreamWriter that IRCClient uses."""
 
-def _resolve_channel(name: str) -> Optional[Channel]:
-    if not name:
+    def __init__(self, ip: str) -> None:
+        self._ip = ip
+        self.lines: asyncio.Queue[str | None] = asyncio.Queue()
+        self._closed = False
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            return
+        for line in data.decode("utf-8", errors="replace").split("\r\n"):
+            if line:
+                self.lines.put_nowait(line)
+
+    async def drain(self) -> None:
         return None
 
-    chan_name = name.strip()
-    if not chan_name.startswith("#"):
-        chan_name = "#" + chan_name
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        if name == "peername":
+            return (self._ip, 0)
+        return default
 
-    chans = getattr(app.state.sessions, "channels", None)
-    if chans is None:
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self.lines.put_nowait(None)
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    async def wait_closed(self) -> None:
         return None
 
-    for candidate in (chan_name, chan_name.lstrip("#")):
-        try:
-            ch = chans.get_by_name(candidate)
-            if ch is not None:
-                return ch
-        except Exception:
-            continue
 
-    return None
+def _client_ip(ws: WebSocket) -> str:
+    for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        value = ws.headers.get(header)
+        if value:
+            return value.split(",")[0].strip()
+    return ws.client.host if ws.client else "127.0.0.1"
 
 
-async def _ws_login(ws: WebSocket, token: str) -> tuple[Optional[Player], bool]:
-    """Authenticate using the same token as IRC (irc_key). Returns (player, owns_session)."""
-    if not token:
-        return None, False
-
+async def _take_ticket(ticket: str) -> int | None:
+    if not _TICKET_RE.match(ticket or ""):
+        return None
+    redis = app.state.services.redis
+    key = TICKET_PREFIX + ticket
+    pipe = redis.pipeline()
+    pipe.get(key)
+    pipe.delete(key)
+    value, _ = await pipe.execute()
+    if value is None:
+        return None
     try:
-        p = await Player.from_irc(token)
-    except Exception:
-        # e.g. invalid token -> DB lookup returns None and Player.from_irc may raise
-        return None, False
-    if not p:
-        return None, False
-
-    if getattr(p, "restricted", False):
-        return None, False
-
-    players = app.state.sessions.players
-
-    existing: Optional[Player] = None
-    if hasattr(players, "get"):
-        try:
-            existing = players.get(p.id)
-        except Exception:
-            existing = None
-
-    if existing is None:
-        try:
-            for x in players:
-                if getattr(x, "id", None) == p.id:
-                    existing = x
-                    break
-        except Exception:
-            existing = None
-
-    if existing is not None:
-        p = existing
-        owns = False
-    else:
-        owns = True
-        await p.stats_from_sql_full()
-        # Keep it simple: no geoloc; WS is not latency-critical.
-        players.append(p)
-        user_data = app.packets.user_presence(p)  # type: ignore[attr-defined]
-        if user_data is not None:
-            players.enqueue(user_data)
-
-        # keep metrics consistent (logout() decrements)
-        if not getattr(p, "restricted", False):
-            try:
-                if app.state.services.datadog:
-                    app.state.services.datadog.increment("bancho.online_players")  # type: ignore[no-untyped-call]
-            except Exception:
-                pass
-            try:
-                if app.metrics.enabled:
-                    app.metrics.increment("ex_online_players")
-            except Exception:
-                pass
-
-    # mark as external chat client (helps future logic, harmless if unused)
-    p.ws_client = True  # type: ignore[attr-defined]
-    return p, owns
-
-
-async def _handle_send(ws: WebSocket, player: Player, conn_id: str, target: str, message: str) -> None:
-    target = (target or "").strip()
-    message = (message or "").strip()
-    if not target or not message:
-        await ws.send_json({"t": "err", "code": "bad_request", "msg": "target/message required"})
-        return
-
-    to_l = target.lower()
-
-    # BanchoBot routing (DM)
-    if to_l in {BOT_NICK.lower(), SERVER_NAME.lower(), "banchobot"}:
-        bot = getattr(app.state.sessions, "bot", None)
-        if not bot:
-            await ws.send_json({"t": "err", "code": "no_bot", "msg": "BanchoBot missing"})
-            return
-
-        if message.startswith(app.settings.COMMAND_PREFIX):
-            try:
-                old_ws_cmd = getattr(player, "_ws_cmd", False)
-                setattr(player, "_ws_cmd", True)
-                try:
-                    cmd = await commands.process_commands(player, bot, message)
-                finally:
-                    try:
-                        setattr(player, "_ws_cmd", old_ws_cmd)
-                    except Exception:
-                        pass
-            except Exception as exc:
-                log(f"[WSCHAT] command error: {exc}", Ansi.LRED)
-                cmd = None
-
-            if cmd and cmd.get("resp") is not None:
-                # echo outgoing (osu does this for non-hidden commands)
-                if not cmd.get("hidden", False):
-                    await ws.send_json(
-                        {
-                            "t": "dm",
-                            "from": player.name,
-                            "from_id": player.id,
-                            "to": BOT_NICK,
-                            "to_id": bot.id,
-                            "text": message,
-                        },
-                    )
-
-                resp_text = str(cmd["resp"])
-                # also deliver to in-game client (if connected)
-                try:
-                    player.send_bot(resp_text)
-                except Exception:
-                    pass
-
-                for line in resp_text.split("\n"):
-                    if line:
-                        await ws.send_json(
-                            {
-                                "t": "dm",
-                                "from": BOT_NICK,
-                                "from_id": bot.id,
-                                "to": player.name,
-                                "to_id": player.id,
-                                "text": line,
-                            },
-                        )
-        # chat4osu UX: auto-join the match channel after `!mp make` in BanchoBot PM
-        if message.lower().startswith(f"{app.settings.COMMAND_PREFIX}mp make"):
-            try:
-                chan_name = getattr(player, "_ws_last_match_chan", None)
-                if not chan_name and getattr(player, "match", None):
-                    chan_name = player.match.chat.real_name
-                if chan_name:
-                    await hub.join(conn_id, chan_name)
-                    ch = _resolve_channel(chan_name)
-                    if ch:
-                        player.join_channel(ch)
-                    await ws.send_json({"t": "joined", "chan": chan_name})
-            except Exception:
-                pass
-
-        return
-
-# Channel
-    if target.startswith("#"):
-        chan = _resolve_channel(target)
-        if not chan:
-            await ws.send_json({"t": "err", "code": "no_such_channel", "msg": target})
-            return
-
-        # Log (so WS-sent messages show up like in-game chat messages)
-        try:
-            log(f"{player} @ <{chan.name}>: {message}")
-        except Exception:
-            pass
-
-        # Join in bancho core so the player can receive channel packets if needed.
-        try:
-            player.join_channel(chan)
-        except Exception:
-            pass
-
-        cmd = None
-        if message.startswith(app.settings.COMMAND_PREFIX):
-            try:
-                old_ws_cmd = getattr(player, "_ws_cmd", False)
-                setattr(player, "_ws_cmd", True)
-                try:
-                    cmd = await commands.process_commands(player, chan, message)
-                finally:
-                    try:
-                        setattr(player, "_ws_cmd", old_ws_cmd)
-                    except Exception:
-                        pass
-            except Exception as exc:
-                log(f"[WSCHAT] command error: {exc}", Ansi.LRED)
-                cmd = None
-
-        if cmd:
-            if not cmd.get("hidden", False):
-                # to_self=True so the in-game client also sees WS-originated messages
-                chan.send(message, sender=player, to_self=True)
-                if cmd.get("resp") is not None:
-                    chan.send_bot(str(cmd["resp"]))
-            else:
-                # hidden: don't echo to channel; send response only to the sender
-                if cmd.get("resp") is not None:
-                    resp_text = str(cmd["resp"])
-                    try:
-                        player.send_bot(resp_text)
-                    except Exception:
-                        pass
-                    for line in resp_text.split("\n"):
-                        if line:
-                            await ws.send_json(
-                                {
-                                    "t": "dm",
-                                    "from": BOT_NICK,
-                                    "from_id": getattr(app.state.sessions, "bot", None).id if getattr(app.state.sessions, "bot", None) else 0,
-                                    "to": player.name,
-                                    "to_id": player.id,
-                                    "text": line,
-                                },
-                            )
-        else:
-            chan.send(message, sender=player, to_self=True)
-
-        return
-
-# Normal DM
-    recipient = await app.state.sessions.players.from_cache_or_sql(name=make_safe_name(target))
-    if not recipient:
-        await ws.send_json({"t": "err", "code": "no_such_user", "msg": target})
-        return
-
-    try:
-        recipient.send(message, sender=player, chan=None)
-    except Exception:
-        # fall back to raw enqueue (should rarely happen)
-        try:
-            recipient.enqueue(app.packets.send_message(player.name, message, recipient.name, player.id))  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    # Echo to sender WS so UI sees the message immediately
-    hub.publish_dm_echo(recipient.id, recipient.name, player.name, player.id, message)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @router.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket) -> None:
-    token = _normalize_token(ws.query_params.get("token"))
+    from app.api.ircserver.ircserver import NAME
+    from app.api.ircserver.ircserver import BanchoIRCException
+    from app.api.ircserver.ircserver import IRCClient
 
-    # Always accept first so auth failures don't surface as 500 during handshake.
     await ws.accept()
 
-    try:
-        player, owns_session = await _ws_login(ws, token)
-    except Exception:
-        # Defensive: token parsing / DB lookup should never crash the WS handshake.
-        await ws.send_json({"t": "err", "code": "auth_failed", "msg": "invalid token"})
+    irc = getattr(app.state.services, "irc", None)
+    if irc is None:
+        await ws.send_text(f":{NAME} ERROR :Chat is turned off on this server")
+        await ws.close(code=1011)
+        return
+
+    user_id = await _take_ticket(ws.query_params.get("ticket", ""))
+    if user_id is None:
+        await ws.send_text(f":{NAME} ERROR :Invalid or expired ticket, reload the page")
         await ws.close(code=1008)
         return
 
-    if not player:
-        await ws.send_json({"t": "err", "code": "auth_failed", "msg": "invalid token"})
+    player = await app.state.sessions.players.get_sql(id=user_id)
+    if player is None:
+        await ws.send_text(f":{NAME} ERROR :Unknown player")
         await ws.close(code=1008)
         return
 
-    conn = await hub.connect(ws, player.id, player.name, owns_session)
-
-    # auto-subscribe + join #osu
-    try:
-        await hub.join(conn.id, "#osu")
-        ch = _resolve_channel("#osu")
-        if ch:
-            try:
-                player.join_channel(ch)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    await ws.send_json({"t": "hello", "user": {"id": player.id, "name": player.name}})
-
-    # snapshot of currently connected WS users (for chat4osu sidebar)
-    try:
-        total = await hub.user_total()
-        users = await hub.user_list()
-        await ws.send_json({"t": "users", "total": total, "users": users})
-    except Exception:
-        pass
+    ip = _client_ip(ws)
+    writer = WebSocketWriter(ip)
+    client = IRCClient(irc, writer)  # type: ignore[arg-type]
+    client.ip = ip
 
     try:
+        client.player = await client.login_player(player)
+    except BanchoIRCException as e:
+        await ws.send_text(f":{NAME} {e.code} {e.error}")
+        await ws.close(code=1008)
+        return
+
+    client.web_chat = True  # type: ignore[attr-defined]
+    irc.clients.add(client)
+    log(f"[chat] {client.player} connected from the website ({ip})", Ansi.LCYAN)
+    await client.send_welcome_msg()
+
+    async def pump() -> None:
         while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                await ws.send_json({"t": "err", "code": "bad_json", "msg": "invalid json"})
-                continue
+            line = await writer.lines.get()
+            if line is None:
+                break
+            await ws.send_text(line)
 
-            t = msg.get("t")
-
-            if t == "ping":
-                await ws.send_json({"t": "pong"})
-                continue
-
-            if t == "users":
-                try:
-                    total = await hub.user_total()
-                    users = await hub.user_list()
-                    await ws.send_json({"t": "users", "total": total, "users": users})
-                except Exception:
-                    await ws.send_json({"t": "users", "total": 0, "users": []})
-                continue
-
-            if t == "join":
-                chan = str(msg.get("chan", "")).strip()
-                if not chan:
-                    await ws.send_json({"t": "err", "code": "bad_request", "msg": "chan required"})
+    pump_task = asyncio.create_task(pump())
+    try:
+        while not writer.is_closing():
+            text = await ws.receive_text()
+            if len(text) > MAX_LINE:
+                text = text[:MAX_LINE]
+            for line in text.replace("\r", "").split("\n"):
+                if not line.strip():
                     continue
-
-                await hub.join(conn.id, chan)
-                ch = _resolve_channel(chan)
-                if ch:
-                    try:
-                        player.join_channel(ch)
-                    except Exception:
-                        pass
-                await ws.send_json({"t": "joined", "chan": chan if chan.startswith("#") else "#" + chan})
-                continue
-
-            if t == "part":
-                chan = str(msg.get("chan", "")).strip()
-                if not chan:
-                    await ws.send_json({"t": "err", "code": "bad_request", "msg": "chan required"})
-                    continue
-                await hub.part(conn.id, chan)
-                await ws.send_json({"t": "parted", "chan": chan if chan.startswith("#") else "#" + chan})
-                continue
-
-            if t == "send":
-                target = str(msg.get("target", "")).strip()
-                text = str(msg.get("text", "")).strip()
-                await _handle_send(ws, player, conn.id, target, text)
-                continue
-
-            await ws.send_json({"t": "err", "code": "unknown_type", "msg": str(t)})
-
+                if line.split(" ", 1)[0].upper() in ("PASS", "USER", "NICK", "CAP"):
+                    continue  # already logged in with the ticket
+                await client.data_received((line + "\r\n").encode())
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        log(f"[chat] connection error: {e!r}", Ansi.LRED)
     finally:
+        irc.clients.discard(client)
+        if client.player is not None:
+            name = client.player.name
+            irc.release(client)
+            client.player = None
+            log(f"[chat] {name} left the website chat", Ansi.LYELLOW)
+        writer.close()
         try:
-            await hub.disconnect(conn.id)
-        finally:
-            # Update ws_client based on remaining connections.
-            remaining = 0
-            try:
-                remaining = await hub.user_conn_count(player.id)
-            except Exception:
-                remaining = 0
-
-            if remaining <= 0:
-                try:
-                    player.ws_client = False  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-
-                # If we deferred logout because WS was still connected (game client disconnected),
-                # or if WS created this session, clean it up now.
-                deferred = False
-                try:
-                    deferred = bool(getattr(player, "_deferred_logout", False))
-                except Exception:
-                    deferred = False
-
-                if deferred or owns_session:
-                    try:
-                        player._deferred_logout = False
-                    except Exception:
-                        pass
-                    try:
-                        player.logout()
-                    except Exception:
-                        pass
+            await asyncio.wait_for(pump_task, timeout=2)
+        except (asyncio.TimeoutError, Exception):
+            pump_task.cancel()
+        try:
+            await ws.close()
+        except Exception:
+            pass

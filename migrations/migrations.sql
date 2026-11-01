@@ -484,3 +484,7 @@ alter table scores add column pin_order int        not null default 0;
 create table bss_sets ( set_id int not null primary key, owner_id int not null, created_at datetime default CURRENT_TIMESTAMP not null, updated_at datetime default CURRENT_TIMESTAMP not null );
 create index bss_sets_owner_id_index on bss_sets (owner_id);
 insert ignore into bss_sets (set_id, owner_id, created_at, updated_at) select m.set_id, min(u.id), min(m.last_update), max(m.last_update) from maps m join users u on u.name = m.creator where m.set_id >= 1073741824 group by m.set_id;
+
+# v5.17.0
+create index mail_from_to_index on mail (from_id, to_id);
+create index mail_to_read_index on mail (to_id, `read`);

@@ -475,7 +475,12 @@ class Logout(BasePacket):
             # we'll block any logout request within 1 second from login.
             return
 
-        player.logout()
+        irc = getattr(app.state.services, "irc", None)
+        if irc is not None and not player.is_tourney_client and irc.clients_of(player):
+            # IRC or the website chat is still open: it keeps a session of its own
+            await irc.keep_chat_after_game_logout(player)
+        else:
+            player.logout()
 
         player.update_latest_activity_soon()
 
@@ -757,6 +762,21 @@ async def handle_osu_login_request(
     # disallow multiple sessions from a single user
     # with the exception of tourney spectator clients
     player = app.state.sessions.players.get(name=login_data["username"])
+    chat_takeover = None
+    irc = getattr(app.state.services, "irc", None)
+    if (
+        player
+        and osu_version.stream != "tourney"
+        and irc is not None
+        and not player.is_tourney_client
+        and any(c.owns_player for c in irc.clients_of(player))
+    ):
+        # the session belongs to IRC / the website chat only (no game client):
+        # the game takes it over and the chat stays connected to the new session
+        chat_takeover = irc.detach(player)
+        player.logout()
+        player = None
+
     if player and osu_version.stream != "tourney":
         # check if the existing session is still active
         if (login_time - player.last_recv_time) < 10:
@@ -1072,6 +1092,9 @@ async def handle_osu_login_request(
     # making them officially logged in.
     app.state.sessions.players.append(player)
 
+    if chat_takeover is not None and irc is not None:
+        await irc.attach(*chat_takeover, player, owns=False)
+
     if app.metrics.enabled:
         if not player.restricted:
             app.metrics.increment("ex_online_players")
@@ -1260,7 +1283,8 @@ class SendPrivateMessage(BasePacket):
 
         if target is not app.state.sessions.bot:
             # target is not bot, send the message normally if online
-            if target.is_online:
+            # a player loaded from sql has a token too, so check the session list
+            if app.state.sessions.players.get(id=target.id) is not None:
                 target.send(msg, sender=player)
                 # players connected through IRC get it there too
                 irc = getattr(app.state.services, "irc", None)

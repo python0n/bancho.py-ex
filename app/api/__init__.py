@@ -5,11 +5,13 @@ from fastapi import APIRouter
 
 from .v1 import apiv1_router
 from .v2 import apiv2_router
+from .ws.chat import router as ws_chat_router
 
 api_router = APIRouter()
 
 api_router.include_router(apiv1_router)
 api_router.include_router(apiv2_router)
+api_router.include_router(ws_chat_router)  # website chat, /ws/chat
 
 from . import start
 from . import utils

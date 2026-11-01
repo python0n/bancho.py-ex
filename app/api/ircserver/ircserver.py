@@ -29,6 +29,14 @@ from app.objects.player import Player
 from app.utils import make_safe_name
 
 NAME = "banchobot"
+
+
+def main_session(user_id: int) -> Player | None:
+    """The player's main session (game, IRC or website chat), never a tourney client."""
+    for p in app.state.sessions.players:
+        if p.id == user_id and not p.is_tourney_client:
+            return p
+    return None
 WHITE_SPACE = re.compile(r"\r?\n")
 
 class BanchoIRCException(Exception):
@@ -109,12 +117,17 @@ class IRCClient:
         if not player:
             raise BanchoIRCException(404, f"PLAYER :Incorrect username")
 
+        return await self.login_player(player)
+
+    async def login_player(self, player: Player) -> Player:
+        """Log in `player` (loaded from sql), reusing their session if they are online."""
         if player.restricted:
             raise BanchoIRCException(404, f"PLAYER :You can't login in restricted mode")
 
-        # If the player is already online (e.g. game client), reuse their session
-        # to avoid duplicate entries in channel NAMES replies.
-        existing = app.state.sessions.players.get(id=player.id)
+        # If the player is already online (game client, IRC or the website chat),
+        # reuse their session to avoid duplicate entries in channel NAMES replies.
+        # Tourney client sessions are only spectators, never the main session.
+        existing = main_session(player.id)
         if existing:
             existing.irc_client = True
             self.owns_player = False
@@ -124,7 +137,13 @@ class IRCClient:
 
         player.irc_client = True
         await player.stats_from_sql_full()
-        player.geoloc = await app.state.services.fetch_geoloc(self.ip_obj)
+        try:
+            geoloc = await app.state.services.fetch_geoloc(self.ip_obj)
+        except Exception as e:
+            log(f"IRC login: geolocation failed for {self.ip}: {e!r}", Ansi.LYELLOW)
+            geoloc = None
+        if geoloc:
+            player.geoloc = geoloc
 
         user_data = app.packets.user_presence(player)
         app.state.sessions.players.append(player)
@@ -134,9 +153,8 @@ class IRCClient:
         log(f"IRC login: {player.name}", Ansi.LCYAN)
         log(f"{player} logged in from IRC with {self.ip}", Ansi.LCYAN)
 
-
         return player
- 
+
     async def data_received(self, data: bytes) -> None:
         global cmd
         message = data.decode("utf-8")
@@ -328,7 +346,8 @@ class IRCClient:
                 if target.silenced:
                     await self.add_queue(f":{NAME} 404 {self.player.name} {recipient} :{target.name} is silenced")
                     return
-                if not target.is_online:
+                # a player loaded from sql has a token too, so check the session list
+                if main_session(target.id) is None:
                     # offline players get it as mail on their next login, like in the game
                     from app.repositories import mail as mail_repo
                     await mail_repo.create(from_id=self.player.id, to_id=target.id, msg=msg)
@@ -337,6 +356,13 @@ class IRCClient:
                     )
                     return
             await self.send_message(self.player, recipient, msg)
+            if target is not None and not target.is_bot_client:
+                # PM history (the website chat reads it); the game saves its PMs the same way
+                from app.repositories import mail as mail_repo
+                try:
+                    await mail_repo.create(from_id=self.player.id, to_id=target.id, msg=msg)
+                except Exception as e:
+                    log(f"[IRC] could not save PM history: {e!r}", Ansi.LYELLOW)
  
             for client in await self.server.authorized_clients:
                 assert client.player is not None
@@ -535,10 +561,7 @@ class IRCClient:
 
         # Logout once, outside the channel loop
         player_name = self.player.name
-        if self.owns_player:
-            self.player.logout()
-        else:
-            self.player.irc_client = False
+        self.server.release(self)
         self.player = None  # prevent the finally block from calling logout again
         log(f"{player_name} disconnected from IRC", Ansi.YELLOW)
 
@@ -682,6 +705,74 @@ class IRCServer:
         self.socket_server: asyncio.Server
         self.clients: set[IRCClient] = set()
  
+    def clients_of(self, player: Player) -> list[IRCClient]:
+        """IRC and website chat connections attached to this exact session."""
+        return [c for c in self.clients if getattr(c, "player", None) is player]
+
+    def release(self, client: IRCClient) -> None:
+        """A chat connection is gone: end the session only if nothing else uses it."""
+        player = client.player
+        if player is None:
+            return
+        others = [c for c in self.clients_of(player) if c is not client]
+        if others:
+            # another IRC/website connection keeps the session alive
+            if client.owns_player:
+                others[0].owns_player = True
+            return
+        if client.owns_player:
+            player.logout()
+        else:
+            player.irc_client = False
+
+    def detach(self, player: Player) -> tuple[list[IRCClient], list[Channel]]:
+        """Unhook the chat connections of a session that is about to end, so they
+        don't get its PART lines; returns them with the channels to rejoin."""
+        clients = self.clients_of(player)
+        channels = [c for c in player.channels if not c.instance]
+        for client in clients:
+            client.player = None
+        return clients, channels
+
+    async def attach(
+        self,
+        clients: list[IRCClient],
+        channels: list[Channel],
+        player: Player,
+        owns: bool,
+    ) -> None:
+        """Hook chat connections to a new session and rejoin their channels."""
+        if not clients:
+            return
+        player.irc_client = True
+        for i, client in enumerate(clients):
+            client.player = player
+            client.owns_player = owns and i == 0
+        for chan in channels:
+            if player in chan.players or player.join_channel(chan):
+                for client in clients:
+                    await client.add_queue(f":{player.name} JOIN {chan.real_name}")
+
+    async def keep_chat_after_game_logout(self, player: Player) -> None:
+        """The game client logged out but the player still has IRC or the website
+        chat open: give those connections a chat-only session of their own."""
+        clients, channels = self.detach(player)
+        player.logout()
+        if not clients:
+            return
+        new = await app.state.sessions.players.get_sql(id=player.id)
+        if new is None or new.restricted:
+            for client in clients:
+                client.player = None
+                client.socket.close()
+            return
+        await new.stats_from_sql_full()
+        new.geoloc = player.geoloc
+        app.state.sessions.players.append(new)
+        app.state.sessions.players.enqueue(app.packets.user_presence(new))
+        await self.attach(clients, channels, new, owns=True)
+        log(f"{new} closed the game, chat stays connected", Ansi.LCYAN)
+
     @property
     async def authorized_clients(self) -> set[IRCClient]:
         return {client for client in self.clients if hasattr(client, "player") and client.player is not None}  # 👈 Sicherer Check
@@ -791,10 +882,7 @@ class IRCServer:
  
                 if client.player:
                     log_msg = f"{client.player.name} ({client_ip})"
-                    if client.owns_player:
-                        client.player.logout()
-                    else:
-                        client.player.irc_client = False
+                    self.release(client)
                 else:
                     log_msg = f"Anonymous ({client_ip})"
  
