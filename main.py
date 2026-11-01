@@ -23,6 +23,7 @@ def main() -> int:
         headers=[("bancho-version", app.settings.VERSION)],
         host=app.settings.APP_HOST,
         port=app.settings.APP_PORT,
+        ws_max_size=65536,  # website chat: no message is bigger than this
     )
     return 0
 

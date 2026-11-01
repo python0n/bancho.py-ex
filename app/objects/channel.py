@@ -93,7 +93,8 @@ class Channel:
 
     def _save_history(self, sender: Player, msg: str) -> None:
         """Keep the last messages of public channels for the website chat."""
-        if self.instance:
+        # only channels every player can read (never #staff, #admin, #supporter...)
+        if self.instance or int(self.read_priv) not in (0, int(Privileges.UNRESTRICTED)):
             return
         try:
             app.state.loop.create_task(

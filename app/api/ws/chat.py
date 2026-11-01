@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from fastapi import APIRouter
 from fastapi import WebSocket
@@ -28,6 +29,9 @@ router = APIRouter()
 TICKET_PREFIX = "chat:ticket:"
 _TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 MAX_LINE = 4096
+# flood protection: at most this many lines per window, otherwise they are dropped
+FLOOD_LINES = 20
+FLOOD_WINDOW = 10.0
 
 
 class WebSocketWriter:
@@ -78,10 +82,14 @@ async def _take_ticket(ticket: str) -> int | None:
         return None
     redis = app.state.services.redis
     key = TICKET_PREFIX + ticket
-    pipe = redis.pipeline()
-    pipe.get(key)
-    pipe.delete(key)
-    value, _ = await pipe.execute()
+    # GETDEL: a ticket can be used only once, even by two connections at the same moment
+    try:
+        value = await redis.execute_command("GETDEL", key)
+    except Exception:
+        pipe = redis.pipeline(transaction=True)
+        pipe.get(key)
+        pipe.delete(key)
+        value, _ = await pipe.execute()
     if value is None:
         return None
     try:
@@ -141,14 +149,24 @@ async def ws_chat(ws: WebSocket) -> None:
             await ws.send_text(line)
 
     pump_task = asyncio.create_task(pump())
+    recent: list[float] = []
+    warned = 0.0
     try:
         while not writer.is_closing():
             text = await ws.receive_text()
             if len(text) > MAX_LINE:
                 text = text[:MAX_LINE]
-            for line in text.replace("\r", "").split("\n"):
+            for line in text.replace("\r", "").split("\n")[:5]:
                 if not line.strip():
                     continue
+                now = time.monotonic()
+                recent = [t for t in recent if now - t < FLOOD_WINDOW]
+                if len(recent) >= FLOOD_LINES and not line.upper().startswith("PING"):
+                    if now - warned > FLOOD_WINDOW:
+                        warned = now
+                        await ws.send_text(f":{NAME} NOTICE {client.player.name if client.player else '*'} :You are sending messages too fast, slow down.")
+                    continue
+                recent.append(now)
                 if line.split(" ", 1)[0].upper() in ("PASS", "USER", "NICK", "CAP"):
                     continue  # already logged in with the ticket
                 await client.data_received((line + "\r\n").encode())
