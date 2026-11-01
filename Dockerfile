@@ -14,7 +14,7 @@ RUN poetry config virtualenvs.create false
 # which poetry itself uses to build py3rijndael, and the build fails on newer python:3.11 images
 RUN poetry install --no-root --only main
 # WebSocket support for the website chat (/ws/chat); uvicorn picks it up by itself
-RUN pip install --no-cache-dir websockets==12.0
+RUN pip install --no-cache-dir websockets==12.0 pyyaml==6.0.3
 
 RUN apt update && \
     apt install -y default-mysql-client redis-tools
