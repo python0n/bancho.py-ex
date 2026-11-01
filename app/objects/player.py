@@ -669,6 +669,14 @@ class Player:
         self.enqueue(app.packets.match_join_success(match))
         match.enqueue_state()
 
+        # tourney clients already watching the match need the new player's presence,
+        # otherwise they show an empty slot until they rejoin the channel
+        if match.tourney_clients:
+            data = app.packets.user_presence(self) + app.packets.user_stats(self)
+            for p in app.state.sessions.players:
+                if p.is_tourney_client and p.id in match.tourney_clients:
+                    p.enqueue(data)
+
         return True
 
     def leave_match(self) -> None:

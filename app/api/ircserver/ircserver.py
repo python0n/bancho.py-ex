@@ -176,6 +176,13 @@ class IRCClient:
  
                 if command == "CAP":
                     continue
+
+                if command == "PROXY":
+                    # PROXY protocol v1 from our own TLS proxy (nginx stream, proxy_protocol on):
+                    # "PROXY TCP4 <client ip> <proxy ip> <client port> <proxy port>".
+                    # Only before login and only from a local/private address.
+                    self.apply_proxy_header(args)
+                    continue
  
                 if command == "GET":
                     log(f"[WARN]: IRC SERVER GOT GET METHODE FROM ANONYMOUS", Ansi.LYELLOW)
@@ -223,6 +230,22 @@ class IRCClient:
         except Exception as e:
             self.socket.write(f":{NAME} ERROR {repr(e)}".encode())
             traceback.print_exc()
+
+    def apply_proxy_header(self, args: str) -> None:
+        if self.player is not None or getattr(self, "_proxy_seen", False):
+            return
+        self._proxy_seen = True
+        peer = self.ip_obj
+        if peer is None or not (peer.is_loopback or peer.is_private):
+            log(f"[IRC] ignored PROXY header from {self.ip}", Ansi.LYELLOW)
+            return
+        parts = args.split()
+        if len(parts) >= 2 and parts[0] in ("TCP4", "TCP6"):
+            try:
+                ipaddress.ip_address(parts[1])
+            except ValueError:
+                return
+            self.ip = parts[1]
 
     async def handler_nick(self, args: str) -> None:
         pass
