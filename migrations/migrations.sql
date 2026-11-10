@@ -492,3 +492,7 @@ create index mail_to_read_index on mail (to_id, `read`);
 # v5.18.0
 create table notifications ( id int auto_increment primary key, user_id int not null, type varchar(32) not null, data text not null, link varchar(255) null, created_at datetime default CURRENT_TIMESTAMP not null, `read` tinyint(1) default 0 not null );
 create index notifications_user_index on notifications (user_id, `read`, id);
+
+# v5.21.0
+create table mp_match_chat ( id int auto_increment primary key, match_id int not null, user_id int not null, msg text not null, hidden tinyint(1) default 0 not null, created_at datetime default CURRENT_TIMESTAMP not null );
+create index mp_match_chat_match_index on mp_match_chat (match_id, id);

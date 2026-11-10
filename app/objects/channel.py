@@ -34,6 +34,18 @@ async def save_channel_message(channel: str, sender: str, sender_id: int, msg: s
         pass
 
 
+async def save_match_message(match_id: int, user_id: int, msg: str, hidden: bool) -> None:
+    """Match chat for the staff (mp_match_chat), shown on the match page."""
+    try:
+        await app.state.services.database.execute(
+            "INSERT INTO mp_match_chat (match_id, user_id, msg, hidden) "
+            "VALUES (:mid, :uid, :msg, :hidden)",
+            {"mid": match_id, "uid": user_id, "msg": msg[:2000], "hidden": int(hidden)},
+        )
+    except Exception:
+        pass
+
+
 class Channel:
     """An osu! chat channel.
 
@@ -103,6 +115,24 @@ class Channel:
         except (RuntimeError, AttributeError):
             pass
 
+    def _save_match_chat(self, sender: Player, msg: str, hidden: bool = False) -> None:
+        """Every message of a #multi_ channel (game, website chat, IRC, BanchoBot)
+        goes to mp_match_chat, readable only by the staff on the match page."""
+        if not self.real_name.startswith("#multi_"):
+            return
+        try:
+            match = next(
+                (m for m in app.state.sessions.matches if m is not None and m.chat is self),
+                None,
+            )
+            if match is None or not match.web_id:
+                return
+            app.state.loop.create_task(
+                save_match_message(match.web_id, sender.id, msg, hidden),
+            )
+        except (RuntimeError, AttributeError):
+            pass
+
     def can_write(self, priv: Privileges) -> bool:
         if not self.write_priv:
             return True
@@ -126,6 +156,7 @@ class Channel:
                 player.enqueue(data)
 
         self._save_history(sender, msg)
+        self._save_match_chat(sender, msg)
 
         _chat_pub = {"#announce": "ex:announce", "#osu": "ex:chat:osu"}
         if self.real_name in _chat_pub:
@@ -155,6 +186,7 @@ class Channel:
             ),
         )
         self._save_history(bot, msg)
+        self._save_match_chat(bot, msg)
 
         # Forward to any IRC clients in this channel
         irc = getattr(app.state.services, "irc", None)
@@ -176,6 +208,8 @@ class Channel:
         for player in recipients:
             if player in self:
                 player.send(msg, sender=sender, chan=self)
+        # hidden command or its answer, seen only by the staff (and the sender)
+        self._save_match_chat(sender, msg, hidden=True)
 
     def append(self, player: Player) -> None:
         """Add `player` to the channel's players."""
