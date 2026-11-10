@@ -29,6 +29,8 @@ from app.objects.player import Player
 from app.utils import make_safe_name
 
 NAME = "banchobot"
+FLOOD_MSGS = 10
+FLOOD_WINDOW = 5.0
 
 
 def main_session(user_id: int) -> Player | None:
@@ -84,6 +86,8 @@ class IRCClient:
         self._ip = None
         self.ip_obj = None
         self.owns_player = False  # True only when IRC login created a new player session
+        self._msg_times: list[float] = []  # PRIVMSG flood limit
+        self._flood_warned = 0.0
  
     def __repr__(self) -> str:
         if self.player is not None:
@@ -329,6 +333,16 @@ class IRCClient:
         if self.player.silenced:
             await self.add_queue(f":{NAME} 404 {self.player.name} {recipient} :You are silenced")
             return
+
+        # flood limit like the game chat: at most FLOOD_MSGS messages per FLOOD_WINDOW
+        now = time.monotonic()
+        self._msg_times = [t for t in self._msg_times if now - t < FLOOD_WINDOW]
+        if len(self._msg_times) >= FLOOD_MSGS:
+            if now - self._flood_warned > FLOOD_WINDOW:
+                self._flood_warned = now
+                await self.add_queue(f":{NAME} NOTICE {self.player.name} :You are sending messages too fast, slow down.")
+            return
+        self._msg_times.append(now)
 
         msg = msg.strip()
         if not msg:
@@ -900,7 +914,10 @@ class IRCServer:
             client = IRCClient(self, writer)
             client.ip = client_ip
  
-            log(f"[IRC] New connection from {client_ip}", Ansi.LGREEN)
+            # health checks (status page, nginx stream) open and close a connection
+            # every few seconds; log only real logins (and everything with DEBUG)
+            if app.settings.DEBUG:
+                log(f"[IRC] New connection from {client_ip}", Ansi.LGREEN)
  
             self.clients.add(client)
  
@@ -941,12 +958,10 @@ class IRCServer:
                     await writer.wait_closed()
  
                 if client.player:
-                    log_msg = f"{client.player.name} ({client_ip})"
+                    log(f"[IRC] Client disconnected: {client.player.name} ({client_ip})", Ansi.LYELLOW)
                     self.release(client)
-                else:
-                    log_msg = f"Anonymous ({client_ip})"
- 
-                log(f"[IRC] Client disconnected: {log_msg}", Ansi.LYELLOW)
+                elif app.settings.DEBUG:
+                    log(f"[IRC] Client disconnected: Anonymous ({client_ip})", Ansi.LYELLOW)
  
             except Exception as e:
                 log(f"[IRC] Cleanup error: {e}", Ansi.LRED)

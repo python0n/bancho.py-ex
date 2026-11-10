@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import app.packets
+import app.settings
 import app.state
 from app.constants.privileges import Privileges
 
@@ -34,16 +36,30 @@ async def save_channel_message(channel: str, sender: str, sender_id: int, msg: s
         pass
 
 
+_MP_PASSWORD = re.compile(
+    r"^(\s*(?:" + re.escape(app.settings.COMMAND_PREFIX) + r"|/)mp\s+(?:password|passwd|pass|pw)\b).*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_match_chat_error_logged = False
+
+
 async def save_match_message(match_id: int, user_id: int, msg: str, hidden: bool) -> None:
     """Match chat for the staff (mp_match_chat), shown on the match page."""
+    # never keep a room password in the history
+    msg = _MP_PASSWORD.sub(r"\1 ***", msg)
     try:
         await app.state.services.database.execute(
             "INSERT INTO mp_match_chat (match_id, user_id, msg, hidden) "
             "VALUES (:mid, :uid, :msg, :hidden)",
             {"mid": match_id, "uid": user_id, "msg": msg[:2000], "hidden": int(hidden)},
         )
-    except Exception:
-        pass
+    except Exception as e:
+        # log the first failure, so a broken table does not go unnoticed
+        global _match_chat_error_logged
+        if not _match_chat_error_logged:
+            _match_chat_error_logged = True
+            from app.logging import Ansi, log
+            log(f"[mp_match_chat] could not save a match chat message: {e!r}", Ansi.LRED)
 
 
 class Channel:
