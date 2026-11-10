@@ -119,7 +119,10 @@ class Channel:
         )
 
         for player in self.players:
-            if sender.id not in player.blocks and (to_self or player.id != sender.id):
+            # skip only the sender's own session (the game shows its own messages);
+            # a tourney client logged in on the same account is a different session
+            # and has to get them
+            if sender.id not in player.blocks and (to_self or player is not sender):
                 player.enqueue(data)
 
         self._save_history(sender, msg)

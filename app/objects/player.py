@@ -606,9 +606,12 @@ class Player:
     def join_match(self, match: Match, passwd: str) -> bool:
         """Attempt to add `self` to `match`."""
         if self.match:
-            log(f"{self} tried to join multiple matches?")
-            self.enqueue(app.packets.match_join_fail())
-            return False
+            # a referee of this match without a slot (e.g. made it with !mp make
+            # on the website while the game is open) may take a slot in it
+            if not (self.match is match and match.get_slot(self) is None):
+                log(f"{self} tried to join multiple matches?")
+                self.enqueue(app.packets.match_join_fail())
+                return False
 
         if self.id in match.tourney_clients:
             # the user is already in the match with a tourney client.
@@ -638,7 +641,7 @@ class Player:
                 self.enqueue(app.packets.match_join_fail())
                 return False
 
-        if not self.join_channel(match.chat):
+        if self not in match.chat and not self.join_channel(match.chat):
             log(f"{self} failed to join {match.chat}.", Ansi.LYELLOW)
             return False
 

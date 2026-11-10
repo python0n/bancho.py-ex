@@ -16,6 +16,7 @@ import app.state
 from app.constants import regexes
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
+from app.constants.privileges import Privileges
 from app.objects.beatmap import Beatmap
 from app.repositories.tourney_pools import TourneyPool
 from app.utils import escape_enum
@@ -260,6 +261,20 @@ class Match:
 
     def __repr__(self) -> str:
         return f"<{self.name} ({self.id})>"
+
+    def is_ref(self, player: Player) -> bool:
+        """Host or referee, checked by user id (a reconnect makes a new session)."""
+        return self.host_id == player.id or any(r.id == player.id for r in self.referees)
+
+    def may_enter_chat(self, player: Player) -> bool:
+        """Who may be in the match channel: host and referees, players in a slot,
+        tourney clients watching it and tournament managers. Like on bancho,
+        a match channel is not open to everyone."""
+        if self.is_ref(player) or player.id in self.tourney_clients:
+            return True
+        if any(s.player is not None and s.player.id == player.id for s in self.slots):
+            return True
+        return bool(player.priv & Privileges.TOURNEY_MANAGER)
 
     def get_slot(self, player: Player) -> Slot | None:
         """Return the slot containing a given player."""

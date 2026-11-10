@@ -39,6 +39,26 @@ def main_session(user_id: int) -> Player | None:
     return None
 WHITE_SPACE = re.compile(r"\r?\n")
 
+
+def match_of_channel(name: str):
+    """The live match behind a #multi_<seq> channel name, or None."""
+    name = name.lower()
+    if not name.startswith("#multi_"):
+        return None
+    # by the channel itself, not the seq -> slot map (safe even if that map is off)
+    for m in app.state.sessions.matches:
+        if m is not None and m.chat.real_name.lower() == name:
+            return m
+    return None
+
+
+def is_match_ref(player: Player, match) -> bool:
+    return match.is_ref(player)
+
+
+def may_enter_match(player: Player, match) -> bool:
+    return match.may_enter_chat(player)
+
 class BanchoIRCException(Exception):
     """IRC exception."""
  
@@ -202,6 +222,7 @@ class IRCClient:
                     if player:
                         self.player = player
                         await self.send_welcome_msg()
+                        await self.server.restore_matches(self)
                         continue
  
                     raise BanchoIRCException(464, f"{command} :Incorrect password")
@@ -333,6 +354,13 @@ class IRCClient:
  
             if channel not in self.player.channels:
                 # Try to auto-rejoin the channel if it still exists
+                # (a match channel only for people who may be in it)
+                m = match_of_channel(channel.real_name)
+                if m is not None and not may_enter_match(self.player, m):
+                    raise BanchoIRCException(
+                        404,
+                        f"{recipient} :Cannot send message to the channel",
+                    )
                 if self.player.join_channel(channel):
                     log(f"[IRC] Auto-rejoined {self.player.name} to {recipient}", Ansi.LYELLOW)
                 else:
@@ -464,15 +492,11 @@ class IRCClient:
             # If player.match is None (e.g. after reconnect or auto-close), try to
             # recover the match from the channel name the command was sent to.
             if match is None and recipient.startswith("#multi_"):
-                try:
-                    seq = int(recipient.split("_", 1)[1])
-                    candidate = app.state.sessions.matches.get_by_seq(seq)
-                    if candidate is not None:
-                        match = candidate
-                        self.player.match = match
-                        self.player.join_channel(match.chat)
-                except (ValueError, IndexError):
-                    pass
+                candidate = match_of_channel(recipient)
+                if candidate is not None and is_match_ref(self.player, candidate):
+                    match = candidate
+                    self.player.match = match
+                    self.player.join_channel(match.chat)
 
             if match is None:
                 await self.add_queue(
@@ -514,21 +538,23 @@ class IRCClient:
                 403,
                 f"{channel} :No channel named {channel} has been found",
             )
+        m = match_of_channel(chan.real_name)
+        if m is not None and not may_enter_match(self.player, m):
+            # joining a match channel used to make anyone a referee of that match
+            raise BanchoIRCException(
+                473,
+                f"{chan.real_name} :You are not a referee or player of this match",
+            )
         try:
             log(f"Joining channel {channel}", Ansi.LYELLOW)
             already_member = self.player in chan.players
             joined = self.player.join_channel(chan)
             if joined or already_member:
                 # If joining a match channel, restore player.match reference
-                if chan.real_name.startswith("#multi_") and self.player.match is None:
-                    try:
-                        seq = int(chan.real_name.split("_", 1)[1])
-                        m = app.state.sessions.matches.get_by_seq(seq)
-                        if m is not None:
-                            self.player.match = m
-                            m.referees.add(self.player)
-                    except (ValueError, IndexError):
-                        pass
+                # (referees only get back what they had, nobody becomes one here)
+                if m is not None and self.player.match is None and is_match_ref(self.player, m):
+                    self.player.match = m
+                    self.server.refresh_referee(m, self.player)
 
                 for client in await self.server.authorized_clients:
                     assert client.player is not None
@@ -592,40 +618,9 @@ class IRCClient:
         await self.socket.wait_closed()
  
     async def handler_mp(self, channel: str) -> None:
-        if self.player is None:
-            raise BanchoIRCException(451, "You have not registered") 
+        # same as JOIN, with the same checks for match channels
+        await self.handler_join(channel)
 
-        chan = app.state.sessions.channels.get_by_name(channel)
- 
-        if not chan:
-            raise BanchoIRCException(
-                403,
-                f"{channel} :No channel named {channel} has been found",
-            )
- 
-        if self.player.join_channel(chan):
-            for client in await self.server.authorized_clients:
-                assert client.player is not None
- 
-                if chan in client.player.channels:
-                    await client.add_queue(f":{self.player.name} JOIN :{chan.real_name}")
- 
-            if chan.topic:
-                await self.add_queue(f"332 {chan.real_name} :{chan.topic}")
-            else:
-                await self.add_queue(f"331 {chan.real_name} :No topic is set")
- 
-            nicks = " ".join([x.name for x in chan.players])
-            await self.add_queue(f":{NAME} 353 {self.player.name} = {chan.real_name} :{nicks}")
-            await self.add_queue(
-                f":{NAME} 366 {self.player.name} {chan.real_name} :End of NAMES list",
-            )
-        else:
-            raise BanchoIRCException(
-                403,
-                f"{channel} :No channel named {channel} has been found",
-            )
- 
     async def send_message(self, fro: Player, to: str, message: str) -> int:
         if not self.player: 
             return 451
@@ -642,10 +637,14 @@ class IRCClient:
  
             bot_name = app.state.sessions.bot.name
 
+            # typed on the website or IRC while the game is open: the game did not
+            # see it being typed, so it gets the message too
+            echo = fro.client_details is not None
+
             if cmd:
                 # a command was triggered.
                 if not cmd["hidden"]:
-                    channel.send(message, sender=fro)
+                    channel.send(message, sender=fro, to_self=echo)
                     if cmd["resp"] is not None:
                         channel.send_bot(cmd["resp"])
                 else:
@@ -662,7 +661,7 @@ class IRCClient:
                             recipients=staff | {fro},
                         )
             else:
-                channel.send(message, fro)
+                channel.send(message, fro, to_self=echo)
                 log(
                     f"{fro} @ {channel}: {message}",
                     Ansi.LCYAN,
@@ -728,6 +727,44 @@ class IRCServer:
         self.socket_server: asyncio.Server
         self.clients: set[IRCClient] = set()
  
+    @staticmethod
+    def refresh_referee(match, player: Player) -> None:
+        """Point a referee entry at the player's current session."""
+        old = {r for r in match.referees if r.id == player.id}
+        if old:
+            match.referees -= old
+            match.referees.add(player)
+
+    async def restore_matches(self, client: IRCClient) -> None:
+        """After logging in from IRC or the website chat, put the player back into
+        the matches they host or referee. A closed tab or a lost connection does not
+        take the match away; it ends only with !mp close or the 30 minute timeout
+        of an empty room."""
+        player = client.player
+        if player is None:
+            return
+        for match in app.state.sessions.matches:
+            if match is None or not is_match_ref(player, match):
+                continue
+            if match.get_slot(player) is not None:
+                continue  # playing in it from the game, the game handles that
+            chan = match.chat
+            # the last member leaving removes an instance channel from the list,
+            # JOIN #multi_<n> could not find it any more
+            if chan not in app.state.sessions.channels:
+                app.state.sessions.channels.append(chan)
+            self.refresh_referee(match, player)
+            if player.match is None:
+                player.match = match
+            if player in chan.players or player.join_channel(chan):
+                await client.add_queue(f":{player.name} JOIN :{chan.real_name}")
+                if chan.topic:
+                    await client.add_queue(f":{NAME} 332 {player.name} {chan.real_name} :{chan.topic}")
+                nicks = " ".join(p.name for p in chan.players)
+                await client.add_queue(f":{NAME} 353 {player.name} = {chan.real_name} :{nicks}")
+                await client.add_queue(f":{NAME} 366 {player.name} {chan.real_name} :End of NAMES list")
+                log(f"[IRC] {player} is back in {chan.real_name}", Ansi.LCYAN)
+
     def clients_of(self, player: Player) -> list[IRCClient]:
         """IRC and website chat connections attached to this exact session."""
         return [c for c in self.clients if getattr(c, "player", None) is player]

@@ -151,9 +151,9 @@ async def bancho_view_online_users() -> Response:
 <!DOCTYPE html>
 <body style="font-family: monospace;  white-space: pre-wrap;"><a href="/">back</a>
 users:
-{new_line.join([f"({p.id:>{id_max_length}}): {p.safe_name}" for p in players])}
+{new_line.join([f"({p.id:>{id_max_length}}): {html.escape(p.safe_name)}" for p in players])}
 bots:
-{new_line.join(f"({p.id:>{id_max_length}}): {p.safe_name}" for p in bots)}
+{new_line.join(f"({p.id:>{id_max_length}}): {html.escape(p.safe_name)}" for p in bots)}
 </body>
 </html>""",
     )
@@ -184,11 +184,11 @@ async def bancho_view_matches() -> Response:
 <body style="font-family: monospace;  white-space: pre-wrap;"><a href="/">back</a>
 matches:
 {new_line.join(
-    f'''{(ON_GOING if m.in_progress else IDLE):<{max_status_length}} ({m.id:>{match_id_max_length}}): {m.name}
+    f'''{(ON_GOING if m.in_progress else IDLE):<{max_status_length}} ({m.id:>{match_id_max_length}}): {html.escape(m.name)}
 -- '''
     + f"{new_line}-- ".join([
-        f'{BEATMAP:<{max_properties_length}}: {m.map_name}',
-        f'{HOST:<{max_properties_length}}: ' + (f'<{m.host.id}> {m.host.safe_name}' if m.host else '-')
+        f'{BEATMAP:<{max_properties_length}}: {html.escape(m.map_name)}',
+        f'{HOST:<{max_properties_length}}: ' + (f'&lt;{m.host.id}&gt; {html.escape(m.host.safe_name)}' if m.host else '-')
     ]) for m in matches
 )}
 </body>
@@ -1290,6 +1290,10 @@ class SendPrivateMessage(BasePacket):
                 irc = getattr(app.state.services, "irc", None)
                 if irc and target.irc_client:
                     await irc.bancho_message(player.name, target.name, msg)
+                # the sender's own website chat / IRC shows what they wrote in the game
+                if irc:
+                    for own in irc.clients_of(player):
+                        await own.add_queue(f":{player.name} PRIVMSG {target.name} :{msg}")
             else:
                 # inform user they're offline, but
                 # will receive the mail @ next login.
@@ -2071,6 +2075,16 @@ class ChannelJoin(BasePacket):
             return
 
         channel = app.state.sessions.channels.get_by_name(self.name)
+
+        if channel is not None and channel.real_name.startswith("#multi_"):
+            # a match channel only for people of that match, not anyone typing /join
+            match = next(
+                (m for m in app.state.sessions.matches if m is not None and m.chat is channel),
+                None,
+            )
+            if match is None or not (player.match is match or match.may_enter_chat(player)):
+                log(f"{player} tried to join {channel.real_name} without being in the match.", Ansi.LYELLOW)
+                return
 
         if not channel or not player.join_channel(channel):
             log(f"{player} failed to join {self.name}.", Ansi.LYELLOW)

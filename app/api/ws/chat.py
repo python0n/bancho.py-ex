@@ -140,6 +140,7 @@ async def ws_chat(ws: WebSocket) -> None:
     irc.clients.add(client)
     log(f"[chat] {client.player} connected from the website ({ip})", Ansi.LCYAN)
     await client.send_welcome_msg()
+    await irc.restore_matches(client)
 
     async def pump() -> None:
         while True:
