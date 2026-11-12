@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 import struct
 from pathlib import Path as SystemPath
 from typing import Literal
@@ -707,6 +708,17 @@ async def api_get_map_info(
     )
 
 
+def _json_row(row: object) -> dict[str, object]:
+    """Row from a raw SQL query as a dict ready for ORJSONResponse.
+
+    DECIMAL columns (e.g. pp) come back as decimal.Decimal, which orjson can't
+    serialize - the endpoint then fails with 500. Convert them to float."""
+    return {
+        key: float(value) if isinstance(value, Decimal) else value
+        for key, value in dict(row).items()  # type: ignore[call-overload]
+    }
+
+
 @router.get("/get_map_scores")
 async def api_get_map_scores(
     scope: Literal["recent", "best"],
@@ -805,7 +817,7 @@ async def api_get_map_scores(
     return ORJSONResponse(
         {
             "status": "success",
-            "scores": [dict(row) for row in rows],
+            "scores": [_json_row(row) for row in rows],
         },
     )
 
@@ -1061,7 +1073,7 @@ async def api_get_global_leaderboard(
     )
 
     return ORJSONResponse(
-        {"status": "success", "leaderboard": [dict(row) for row in rows]},
+        {"status": "success", "leaderboard": [_json_row(row) for row in rows]},
     )
 
 
