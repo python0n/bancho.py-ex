@@ -5,6 +5,9 @@ from __future__ import annotations
 import html
 import asyncio
 import hashlib
+import logging
+import logging.handlers
+import os
 import re
 import struct
 import time
@@ -76,6 +79,49 @@ OSU_API_V2_CHANGELOG_URL = "https://osu.ppy.sh/api/v2/changelog"
 
 BEATMAPS_PATH = Path.cwd() / ".data/osu"
 DISK_CHAT_LOG_FILE = ".data/logs/chat.log"
+# channel chat is kept on disk for this many days, one file per day
+# (chat.log, chat.log.2026-11-13, ...). private messages are never written
+# to it: the staff reads those in the admin panel, from the database.
+CHAT_LOG_KEEP_DAYS = 30
+
+
+class _ChatLogHandler(logging.handlers.TimedRotatingFileHandler):
+    """Daily chat log readable only by the account running the server."""
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass
+        return stream
+
+
+_chat_logger: logging.Logger | None = None
+
+
+def log_chat_to_disk(line: str) -> None:
+    """Append one line of channel chat to the daily chat log."""
+    global _chat_logger
+    try:
+        if _chat_logger is None:
+            handler = _ChatLogHandler(
+                DISK_CHAT_LOG_FILE,
+                when="midnight",
+                backupCount=CHAT_LOG_KEEP_DAYS,
+                encoding="utf-8",
+                utc=True,
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            chat_logger = logging.getLogger("bancho.chat_file")
+            chat_logger.setLevel(logging.INFO)
+            chat_logger.propagate = False
+            chat_logger.addHandler(handler)
+            _chat_logger = chat_logger
+
+        _chat_logger.info(line)
+    except OSError as exc:
+        log(f"Could not write the chat log: {exc!r}", Ansi.LRED)
 
 BASE_DOMAIN = app.settings.DOMAIN
 
@@ -503,10 +549,9 @@ class SendMessage(BasePacket):
 
         log(f"{player} @ {t_chan}: {msg}", Ansi.LCYAN)
 
-        with open(DISK_CHAT_LOG_FILE, "a+") as f:
-            f.write(
-                f"[{get_timestamp(full=True, tz=ZoneInfo('GMT'))}] {player} @ {t_chan}: {msg}\n",
-            )
+        log_chat_to_disk(
+            f"[{get_timestamp(full=True, tz=ZoneInfo('GMT'))}] {player} @ {t_chan}: {msg}",
+        )
 
 
 @register(ClientPackets.LOGOUT, restricted=True)
@@ -1445,11 +1490,12 @@ class SendPrivateMessage(BasePacket):
 
         player.update_latest_activity_soon()
 
-        log(f"{player} @ {target}: {msg}", Ansi.LCYAN)
-        with open(DISK_CHAT_LOG_FILE, "a+") as f:
-            f.write(
-                f"[{get_timestamp(full=True, tz=ZoneInfo('GMT'))}] {player} @ {target}: {msg}\n",
-            )
+        # private messages: who wrote to whom, never the text. commands sent
+        # to the bot are still logged in full, as a record of who ran what.
+        if target is app.state.sessions.bot:
+            log(f"{player} @ {target}: {msg}", Ansi.LCYAN)
+        else:
+            log(f"{player} @ {target}: [private message, {len(msg)} chars]", Ansi.LCYAN)
 
 
 @register(ClientPackets.PART_LOBBY)

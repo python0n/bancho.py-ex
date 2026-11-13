@@ -411,7 +411,8 @@ class IRCClient:
                         f":{self.player.safe_name} PRIVMSG {recipient} :{msg}",
                     )
         else:
-            log(f"[IRC] Private message from {self.player.name} to {recipient}: {msg}", Ansi.LMAGENTA)
+            # who wrote to whom, never the text (same rule as the game client)
+            log(f"[IRC] Private message from {self.player.name} to {recipient}: [{len(msg)} chars]", Ansi.LMAGENTA)
             target = await app.state.sessions.players.from_cache_or_sql(name=make_safe_name(recipient))
             if target is not None and not target.is_bot_client:
                 if self.player.id in target.blocks or (

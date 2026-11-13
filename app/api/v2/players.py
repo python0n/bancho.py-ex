@@ -13,10 +13,17 @@ from app.api.v2.common.responses import Success
 from app.api.v2.models.players import Player
 from app.api.v2.models.players import PlayerStats
 from app.api.v2.models.players import PlayerStatus
+from app.constants.privileges import Privileges
 from app.repositories import stats as stats_repo
 from app.repositories import users as users_repo
 
 router = APIRouter()
+
+
+async def _is_hidden(player_id: int) -> bool:
+    """Restricted accounts do not exist for this public api."""
+    user = await users_repo.fetch_one(id=player_id)
+    return user is None or not user["priv"] & Privileges.UNRESTRICTED
 
 
 @router.get("/players")
@@ -39,6 +46,7 @@ async def get_players(
         play_style=play_style,
         page=page,
         page_size=page_size,
+        unrestricted_only=True,
     )
     total_players = await users_repo.fetch_count(
         priv=priv,
@@ -47,6 +55,7 @@ async def get_players(
         clan_priv=clan_priv,
         preferred_mode=preferred_mode,
         play_style=play_style,
+        unrestricted_only=True,
     )
 
     response = [Player.from_mapping(rec) for rec in players]
@@ -64,7 +73,7 @@ async def get_players(
 @router.get("/players/{player_id}")
 async def get_player(player_id: int) -> Success[Player] | Failure:
     data = await users_repo.fetch_one(id=player_id)
-    if data is None:
+    if data is None or not data["priv"] & Privileges.UNRESTRICTED:
         return responses.failure(
             message="Player not found.",
             status_code=status.HTTP_404_NOT_FOUND,
@@ -78,7 +87,7 @@ async def get_player(player_id: int) -> Success[Player] | Failure:
 async def get_player_status(player_id: int) -> Success[PlayerStatus] | Failure:
     player = app.state.sessions.players.get(id=player_id)
 
-    if not player:
+    if not player or player.restricted:
         return responses.failure(
             message="Player status not found.",
             status_code=status.HTTP_404_NOT_FOUND,
@@ -101,7 +110,7 @@ async def get_player_mode_stats(
     mode: int,
 ) -> Success[PlayerStats] | Failure:
     data = await stats_repo.fetch_one(player_id, mode)
-    if data is None:
+    if data is None or await _is_hidden(player_id):
         return responses.failure(
             message="Player stats not found.",
             status_code=status.HTTP_404_NOT_FOUND,
@@ -117,6 +126,12 @@ async def get_player_stats(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
 ) -> Success[list[PlayerStats]] | Failure:
+    if await _is_hidden(player_id):
+        return responses.failure(
+            message="Player stats not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
     data = await stats_repo.fetch_many(
         player_id=player_id,
         page=page,

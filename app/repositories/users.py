@@ -150,6 +150,10 @@ async def fetch_one(
     return cast(User | None, user)
 
 
+# sql condition: the account is not restricted (Privileges.UNRESTRICTED bit)
+IS_UNRESTRICTED = UsersTable.priv.op("&")(1) != 0
+
+
 async def fetch_count(
     priv: int | None = None,
     country: str | None = None,
@@ -157,9 +161,12 @@ async def fetch_count(
     clan_priv: int | None = None,
     preferred_mode: int | None = None,
     play_style: int | None = None,
+    unrestricted_only: bool = False,
 ) -> int:
     """Fetch the number of users in the database."""
     select_stmt = select(func.count().label("count")).select_from(UsersTable)
+    if unrestricted_only:
+        select_stmt = select_stmt.where(IS_UNRESTRICTED)
     if priv is not None:
         select_stmt = select_stmt.where(UsersTable.priv == priv)
     if country is not None:
@@ -187,9 +194,12 @@ async def fetch_many(
     play_style: int | None = None,
     page: int | None = None,
     page_size: int | None = None,
+    unrestricted_only: bool = False,
 ) -> list[User]:
     """Fetch multiple users from the database."""
     select_stmt = select(*READ_PARAMS)
+    if unrestricted_only:
+        select_stmt = select_stmt.where(IS_UNRESTRICTED)
     if priv is not None:
         select_stmt = select_stmt.where(UsersTable.priv == priv)
     if country is not None:

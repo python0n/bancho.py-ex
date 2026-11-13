@@ -10,7 +10,9 @@ from app.api.v2.common import responses
 from app.api.v2.common.responses import Failure
 from app.api.v2.common.responses import Success
 from app.api.v2.models.scores import Score
+from app.constants.privileges import Privileges
 from app.repositories import scores as scores_repo
+from app.repositories import users as users_repo
 
 router = APIRouter()
 
@@ -33,6 +35,7 @@ async def get_all_scores(
         user_id=user_id,
         page=page,
         page_size=page_size,
+        hide_restricted=True,
     )
     total_scores = await scores_repo.fetch_count(
         map_md5=map_md5,
@@ -40,6 +43,7 @@ async def get_all_scores(
         status=status,
         mode=mode,
         user_id=user_id,
+        hide_restricted=True,
     )
 
     response = [Score.from_mapping(rec) for rec in scores]
@@ -57,6 +61,12 @@ async def get_all_scores(
 @router.get("/scores/{score_id}")
 async def get_score(score_id: int) -> Success[Score] | Failure:
     data = await scores_repo.fetch_one(id=score_id)
+    if data is not None:
+        # scores of restricted accounts do not exist for this public api
+        owner = await users_repo.fetch_one(id=data["userid"])
+        if owner is None or not owner["priv"] & Privileges.UNRESTRICTED:
+            data = None
+
     if data is None:
         return responses.failure(
             message="Score not found.",

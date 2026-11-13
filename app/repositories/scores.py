@@ -20,6 +20,8 @@ import app.state.services
 from app._typing import UNSET
 from app._typing import _UnsetSentinel
 from app.repositories import Base
+from app.repositories.users import IS_UNRESTRICTED
+from app.repositories.users import UsersTable
 
 
 class ScoresTable(Base):
@@ -172,14 +174,22 @@ async def fetch_one(id: int) -> Score | None:
     return cast(Score | None, _score)
 
 
+def _unrestricted_ids():  # type: ignore[no-untyped-def]
+    """Subquery: ids of accounts that are not restricted."""
+    return select(UsersTable.id).where(IS_UNRESTRICTED)
+
+
 async def fetch_count(
     map_md5: str | None = None,
     mods: int | None = None,
     status: int | None = None,
     mode: int | None = None,
     user_id: int | None = None,
+    hide_restricted: bool = False,
 ) -> int:
     select_stmt = select(func.count().label("count")).select_from(ScoresTable)
+    if hide_restricted:
+        select_stmt = select_stmt.where(ScoresTable.userid.in_(_unrestricted_ids()))
     if map_md5 is not None:
         select_stmt = select_stmt.where(ScoresTable.map_md5 == map_md5)
     if mods is not None:
@@ -204,8 +214,11 @@ async def fetch_many(
     user_id: int | None = None,
     page: int | None = None,
     page_size: int | None = None,
+    hide_restricted: bool = False,
 ) -> list[Score]:
     select_stmt = select(*READ_PARAMS)
+    if hide_restricted:
+        select_stmt = select_stmt.where(ScoresTable.userid.in_(_unrestricted_ids()))
     if map_md5 is not None:
         select_stmt = select_stmt.where(ScoresTable.map_md5 == map_md5)
     if mods is not None:
