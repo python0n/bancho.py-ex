@@ -284,7 +284,10 @@ class ChangeAction(BasePacket):
         self.info_text = reader.read_string()
         self.map_md5 = reader.read_string()
 
-        self.mods = reader.read_u32()
+        # the stats packet carries mods as a signed 32-bit value; a value with
+        # the top bit set cannot be written and would break every packet that
+        # includes this player's stats (including other players' logins)
+        self.mods = reader.read_u32() & 0x7FFFFFFF
         self.mode = reader.read_u8()
         if self.mods & Mods.RELAX:
             if self.mode == 3:  # rx!mania doesn't exist
@@ -301,11 +304,19 @@ class ChangeAction(BasePacket):
 
     async def handle(self, player: Player) -> None:
         # update the user's status.
-        player.status.action = Action(self.action)
+        try:
+            action = Action(self.action)
+            mods = Mods(self.mods)
+            mode = GameMode(self.mode)
+        except ValueError:
+            log(f"{player} sent an invalid status update.", Ansi.LYELLOW)
+            return
+
+        player.status.action = action
         player.status.info_text = self.info_text
         player.status.map_md5 = self.map_md5
-        player.status.mods = Mods(self.mods)
-        player.status.mode = GameMode(self.mode)
+        player.status.mods = mods
+        player.status.mode = mode
         player.status.map_id = self.map_id
 
         # broadcast it to all online players.
@@ -1010,8 +1021,7 @@ async def handle_osu_login_request(
                     data += app.packets.bot_presence(o)
                     data += app.packets.bot_stats(o)
                 else:
-                    data += app.packets.user_presence(o)
-                    data += app.packets.user_stats(o)
+                    data += presence_and_stats(o)
 
         # the player may have been sent mail while offline,
         # enqueue any messages from their respective authors.
@@ -1077,8 +1087,7 @@ async def handle_osu_login_request(
                 data += app.packets.bot_presence(o)
                 data += app.packets.bot_stats(o)
             else:
-                data += app.packets.user_presence(o)
-                data += app.packets.user_stats(o)
+                data += presence_and_stats(o)
 
         data += app.packets.account_restricted()
         data += app.packets.send_message(
@@ -1429,7 +1438,7 @@ class LobbyJoin(BasePacket):
             if match is not None:
                 try:
                     player.enqueue(app.packets.new_match(match))
-                except ValueError:
+                except (ValueError, struct.error, OverflowError):
                     log(
                         f"Failed to send match {match.id} to player joining lobby; likely due to missing host",
                         Ansi.LYELLOW,
@@ -1437,6 +1446,19 @@ class LobbyJoin(BasePacket):
                     stacktrace = app.utils.get_appropriate_stacktrace()
                     await app.state.services.log_strange_occurrence(stacktrace)
                     continue
+
+
+def presence_and_stats(o: Player) -> bytes:
+    """Presence + stats of another player; empty if they cannot be written.
+
+    One player with unwritable state must not make the request of whoever
+    asks for it (a login, most of all) fail.
+    """
+    try:
+        return app.packets.user_presence(o) + app.packets.user_stats(o)
+    except (struct.error, OverflowError, ValueError):
+        log(f"Could not write presence/stats of {o}.", Ansi.LRED)
+        return b""
 
 
 def validate_match_data(
@@ -1447,6 +1469,9 @@ def validate_match_data(
         (
             untrusted_match_data.host_id == expected_host_id,
             len(untrusted_match_data.name) <= MAX_MATCH_NAME_LENGTH,
+            0 <= untrusted_match_data.mode <= 3,
+            0 <= untrusted_match_data.win_condition <= 3,
+            0 <= untrusted_match_data.team_type <= 3,
         ),
     )
 
@@ -2321,7 +2346,11 @@ class StatsRequest(BasePacket):
                     # the most frequently requested user
                     packet = app.packets.bot_stats(target)
                 else:
-                    packet = app.packets.user_stats(target)
+                    try:
+                        packet = app.packets.user_stats(target)
+                    except (struct.error, OverflowError, ValueError):
+                        log(f"Could not write stats of {target}.", Ansi.LRED)
+                        continue
 
                 player.enqueue(packet)
 

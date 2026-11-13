@@ -672,7 +672,8 @@ def write_match(m: Match, send_pw: bool = True) -> bytearray:
         for s in m.slots:
             ret += s.mods.to_bytes(4, "little")
 
-    ret += m.seed.to_bytes(4, "little")
+    # the client sends the seed as a signed int32 and reads it back the same way
+    ret += m.seed.to_bytes(4, "little", signed=True)
     return ret
 
 
