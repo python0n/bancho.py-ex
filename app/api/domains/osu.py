@@ -84,6 +84,7 @@ from app.repositories import stats as stats_repo
 from app.repositories import users as users_repo
 from app.repositories.achievements import Achievement
 from app.usecases import achievements as achievements_usecases
+from app.usecases import passwords
 from app.usecases import user_achievements as user_achievements_usecases
 from app.utils import escape_enum
 from app.utils import pymysql_encode
@@ -4060,9 +4061,8 @@ async def register_account(
         # they want to register the account now.
         # make the md5 & bcrypt the md5 for sql.
         pw_md5 = hashlib.md5(pw_plaintext.encode()).hexdigest().encode()
-        pw_bcrypt = bcrypt.hashpw(pw_md5, bcrypt.gensalt())
-        _ck = hashlib.sha256(pw_bcrypt + b":" + pw_md5).digest()
-        app.state.cache.bcrypt[_ck] = True  # cache result for login
+        pw_bcrypt = await passwords.hash_new(pw_md5)
+        passwords.remember_verified(pw_bcrypt, pw_md5)  # cache result for login
 
         ip = app.state.services.ip_resolver.get_ip(request.headers)
 

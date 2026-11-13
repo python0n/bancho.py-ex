@@ -22,6 +22,7 @@ from app.objects.player import Player
 from app.repositories import channels as channels_repo
 from app.repositories import clans as clans_repo
 from app.repositories import users as users_repo
+from app.usecases import passwords
 from app.utils import make_safe_name
 
 
@@ -292,11 +293,8 @@ class Players(list[Player]):
         assert player.pw_bcrypt is not None
 
         trusted_hashword = player.pw_bcrypt if isinstance(player.pw_bcrypt, bytes) else player.pw_bcrypt.encode()
-        cache_key = hashlib.sha256(trusted_hashword + b":" + pw_md5.encode()).digest()
-        if cache_key not in app.state.cache.bcrypt:
-            if not bcrypt.checkpw(pw_md5.encode(), trusted_hashword):
-                return None
-            app.state.cache.bcrypt[cache_key] = True
+        if not await passwords.verify(trusted_hashword, pw_md5.encode()):
+            return None
         return player
 
     def append(self, player: Player) -> None:

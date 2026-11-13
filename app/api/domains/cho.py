@@ -69,6 +69,7 @@ from app.repositories import ingame_logins as logins_repo
 from app.repositories import mail as mail_repo
 from app.repositories import users as users_repo
 from app.state import services
+from app.usecases import passwords
 from app.usecases.performance import ScoreParams
 
 OSU_API_V2_CHANGELOG_URL = "https://osu.ppy.sh/api/v2/changelog"
@@ -646,17 +647,6 @@ def parse_adapters_string(adapters_string: str) -> tuple[list[str], bool]:
     return adapters, running_under_wine
 
 
-def _bcrypt_cache_key(trusted_hashword: bytes, untrusted_password: bytes) -> bytes:
-    """Compute a SHA-256 cache key from the bcrypt hash and password.
-
-    This avoids storing the plaintext (or MD5) password in memory.
-    A correct password + correct hash produces a unique, consistent key.
-    When the bcrypt hash changes (password reset), all old entries become
-    unreachable automatically.
-    """
-    return hashlib.sha256(trusted_hashword + b":" + untrusted_password).digest()
-
-
 async def authenticate(
     username: str,
     untrusted_password: bytes,
@@ -669,20 +659,14 @@ async def authenticate(
         return None
 
     trusted_hashword = user_info["pw_bcrypt"].encode()
-    cache_key = _bcrypt_cache_key(trusted_hashword, untrusted_password)
 
-    # in-memory bcrypt lookup cache for performance
-    # Key = SHA-256(hash:password) – never stores plaintext in memory
-    if cache_key in app.state.cache.bcrypt:  # ~0.01 ms – already verified pair
-        pass  # verified
-    else:  # ~200ms
-        import hashlib as _hl
-        pw_double = _hl.md5(untrusted_password).hexdigest().encode()
-        if not bcrypt.checkpw(untrusted_password, trusted_hashword):
-            if not bcrypt.checkpw(pw_double, trusted_hashword):
-                return None
-
-        app.state.cache.bcrypt[cache_key] = True  # mark pair as verified
+    # cached, attempt-limited and off the event loop (see usecases/passwords.py)
+    if not await passwords.verify(
+        trusted_hashword,
+        untrusted_password,
+        also_double_md5=True,
+    ):
+        return None
 
     return user_info
 
