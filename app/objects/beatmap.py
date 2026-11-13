@@ -547,6 +547,21 @@ class Beatmap:
 
         self.diff = float(osuapi_resp["difficultyrating"])
 
+    def _mark_unavailable(self) -> None:
+        """The osu!api no longer lists this map: take away its leaderboard.
+
+        A status set by hand (frozen) is kept. Scores are never touched.
+        """
+        if self.frozen or self.status == RankedStatus.NotSubmitted:
+            return
+
+        log(
+            f"Map {self.id} ({self.full_name}) is gone from the osu!api; "
+            f"status {self.status!s} -> Unsubmitted, scores kept.",
+            Ansi.LYELLOW,
+        )
+        self.status = RankedStatus.NotSubmitted
+
     @staticmethod
     async def _from_md5_cache(md5: str) -> Beatmap | None:
         """Fetch a map from the cache by md5."""
@@ -678,7 +693,6 @@ class BeatmapSet:
             # add maps to old_maps where new.id not in old_maps
 
             updated_maps: list[Beatmap] = []
-            map_md5s_to_delete: set[str] = set()
 
             # temp value for building the new beatmap
             bmap: Beatmap
@@ -686,8 +700,12 @@ class BeatmapSet:
             # find maps in our current state that've been deleted, or need updates
             for old_id, old_map in old_maps.items():
                 if old_id not in new_maps:
-                    # delete map from old_maps
-                    map_md5s_to_delete.add(old_map.md5)
+                    # the map is gone from the osu!api. keep it and its
+                    # scores (this used to delete both for good, also on
+                    # an incomplete api answer); it only loses its
+                    # leaderboard until the api lists it again
+                    old_map._mark_unavailable()
+                    updated_maps.append(old_map)
                 else:
                     new_map = new_maps[old_id]
                     new_ranked_status = RankedStatus.from_osuapi(
@@ -727,19 +745,6 @@ class BeatmapSet:
 
             # save changes to sql
 
-            if map_md5s_to_delete:
-                # delete maps
-                await app.state.services.database.execute(
-                    "DELETE FROM maps WHERE md5 IN :map_md5s",
-                    {"map_md5s": map_md5s_to_delete},
-                )
-
-                # delete scores on the maps
-                await app.state.services.database.execute(
-                    "DELETE FROM scores WHERE map_md5 IN :map_md5s",
-                    {"map_md5s": map_md5s_to_delete},
-                )
-
             # update last_osuapi_check
             await app.state.services.database.execute(
                 "REPLACE INTO mapsets "
@@ -758,29 +763,26 @@ class BeatmapSet:
             # NOTE: 200 can return an empty array of beatmaps,
             #       so we still delete in this case if the beatmap data is None
 
-            # TODO: a couple of open questions here:
-            # - should we delete the beatmap from the database if it's not in the osu!api?
-            # - are 404 and 200 the only cases where we should delete the beatmap?
-            if self.maps:
-                map_md5s_to_delete = {bmap.md5 for bmap in self.maps}
+            # the whole set is gone from the osu!api (or the api answered
+            # with an empty list). nothing is deleted: the maps lose their
+            # leaderboards and get them back when the api lists them again.
+            # maps with a manually set status (frozen) are left alone.
+            self.last_osuapi_check = datetime.now()
+            for bmap in self.maps:
+                bmap._mark_unavailable()
 
-                # delete maps
-                await app.state.services.database.execute(
-                    "DELETE FROM maps WHERE md5 IN :map_md5s",
-                    {"map_md5s": map_md5s_to_delete},
-                )
-
-                # delete scores on the maps
-                await app.state.services.database.execute(
-                    "DELETE FROM scores WHERE map_md5 IN :map_md5s",
-                    {"map_md5s": map_md5s_to_delete},
-                )
-
-            # delete set
             await app.state.services.database.execute(
-                "DELETE FROM mapsets WHERE id = :set_id",
-                {"set_id": self.id},
+                "REPLACE INTO mapsets "
+                "(id, server, last_osuapi_check) "
+                "VALUES (:id, :server, :last_osuapi_check)",
+                {
+                    "id": self.id,
+                    "server": "osu!",
+                    "last_osuapi_check": self.last_osuapi_check,
+                },
             )
+            if self.maps:
+                await self._save_to_sql()
 
     async def _save_to_sql(self) -> None:
         """Save the object's attributes into the database."""

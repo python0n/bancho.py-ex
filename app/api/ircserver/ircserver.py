@@ -61,6 +61,12 @@ def is_match_ref(player: Player, match) -> bool:
 def may_enter_match(player: Player, match) -> bool:
     return match.may_enter_chat(player)
 
+# a connection that has not logged in is closed after this many seconds
+# or this many wrong PASS commands
+PRE_AUTH_TIMEOUT = 30
+MAX_FAILED_LOGINS = 5
+
+
 class BanchoIRCException(Exception):
     """IRC exception."""
  
@@ -87,6 +93,7 @@ class IRCClient:
         self.ip_obj = None
         self.owns_player = False  # True only when IRC login created a new player session
         self._msg_times: list[float] = []  # PRIVMSG flood limit
+        self.failed_logins = 0  # wrong PASS on this connection
         self._flood_warned = 0.0
  
     def __repr__(self) -> str:
@@ -221,7 +228,11 @@ class IRCClient:
                     continue
  
                 if command == "PASS":
-                    player = await self.login(args)
+                    try:
+                        player = await self.login(args)
+                    except BanchoIRCException:
+                        self.failed_logins += 1
+                        raise
  
                     if player:
                         self.player = player
@@ -920,12 +931,26 @@ class IRCServer:
                 log(f"[IRC] New connection from {client_ip}", Ansi.LGREEN)
  
             self.clients.add(client)
+            connected_at = time.monotonic()
  
             while True:
                 if data_to_send := client.dequeue():
                     writer.write(data_to_send)
 
-                data = await reader.read(4096)
+                if client.player is None:
+                    # not logged in yet: the connection gets a fixed time and
+                    # a few PASS attempts, then it is closed. without this
+                    # anyone could hold connections open forever
+                    remaining = PRE_AUTH_TIMEOUT - (time.monotonic() - connected_at)
+                    if remaining <= 0 or client.failed_logins >= MAX_FAILED_LOGINS:
+                        break
+                    try:
+                        data = await asyncio.wait_for(reader.read(4096), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                else:
+                    data = await reader.read(4096)
+
                 if not data:
                     break
  

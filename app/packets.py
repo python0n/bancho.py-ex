@@ -436,21 +436,26 @@ class BanchoPacketReader:
 
     # XXX: some osu! packets use i16 for
     # array length, while others use i32
+    def _read_i32_list(self, length: int) -> tuple[int, ...]:
+        # the length comes from the client: never build anything from it
+        # before checking that the packet really holds that many numbers
+        size = length * 4
+        if size > len(self.body_view):
+            raise ValueError("i32 list is longer than the packet")
+
+        val = struct.unpack(f"<{length}I", self.body_view[:size])
+        self.body_view = self.body_view[size:]
+        return val
+
     def read_i32_list_i16l(self) -> tuple[int, ...]:
         length = int.from_bytes(self.body_view[:2], "little")
         self.body_view = self.body_view[2:]
-
-        val = struct.unpack(f'<{"I" * length}', self.body_view[: length * 4])
-        self.body_view = self.body_view[length * 4 :]
-        return val
+        return self._read_i32_list(length)
 
     def read_i32_list_i32l(self) -> tuple[int, ...]:
         length = int.from_bytes(self.body_view[:4], "little")
         self.body_view = self.body_view[4:]
-
-        val = struct.unpack(f'<{"I" * length}', self.body_view[: length * 4])
-        self.body_view = self.body_view[length * 4 :]
-        return val
+        return self._read_i32_list(length)
 
     def read_string(self) -> str:
         exists = self.body_view[0] == 0x0B
@@ -461,17 +466,22 @@ class BanchoPacketReader:
             return ""
 
         # non-empty string, decode str length (uleb128)
-        length = shift = 0
-
-        while True:
+        # at most 5 bytes (enough for 4 GB); without the cap a long run of
+        # continuation bytes makes the number, and the time to build it,
+        # grow without limit and stalls the whole server
+        length = 0
+        for shift in range(0, 35, 7):
             byte = self.body_view[0]
             self.body_view = self.body_view[1:]
 
             length |= (byte & 0x7F) << shift
             if (byte & 0x80) == 0:
                 break
+        else:
+            raise ValueError("string length is not a valid uleb128")
 
-            shift += 7
+        if length > len(self.body_view):
+            raise ValueError("string is longer than the packet")
 
         val = self.body_view[:length].tobytes().decode()  # copy
         self.body_view = self.body_view[length:]
