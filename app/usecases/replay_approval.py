@@ -9,6 +9,7 @@ the transactional insert that keeps one best score per map, the player's stats
 
 from __future__ import annotations
 
+import asyncio
 import lzma
 import shutil
 import struct
@@ -48,15 +49,20 @@ class ApprovalError(Exception):
         self.http_status = http_status
 
 
+# decompressed replay frames: a 30 minute play is a few MB
+MAX_REPLAY_FRAMES_SIZE = 16 * 1024 * 1024  # bytes
+
+
 def _read_uleb128(data: bytes, pos: int) -> tuple[int, int]:
-    result = shift = 0
-    while True:
+    # at most 5 bytes, as in the packet reader; the file comes from a user
+    result = 0
+    for shift in range(0, 35, 7):
         byte = data[pos]
         pos += 1
         result |= (byte & 0x7F) << shift
         if not byte & 0x80:
             return result, pos
-        shift += 7
+    raise IndexError("string length is not a valid uleb128")
 
 
 def _read_string(data: bytes, pos: int) -> int:
@@ -96,7 +102,15 @@ def parse_osr_times(data: bytes) -> tuple[datetime | None, int]:
     length_ms = 0
     if replay_len > 0:
         try:
-            frames = lzma.decompress(data[pos : pos + replay_len], format=lzma.FORMAT_ALONE)
+            # never decompress more than a real replay can hold (a small
+            # file can otherwise unpack to gigabytes)
+            decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
+            frames = decompressor.decompress(
+                data[pos : pos + replay_len],
+                max_length=MAX_REPLAY_FRAMES_SIZE,
+            )
+            if not decompressor.eof:
+                raise ValueError("replay frames are over the size limit")
             for frame in frames.decode(errors="ignore").split(","):
                 parts = frame.split("|")
                 if len(parts) == 4 and parts[0] != "-12345":
@@ -141,7 +155,8 @@ async def approve_pending_replay(pending_id: int) -> dict[str, Any]:
     if not osr_file.is_file():
         raise ApprovalError("no_replay", f"Replay file {osr_file.name} not found.", 404)
     osr_bytes = osr_file.read_bytes()
-    played_at, length_ms = parse_osr_times(osr_bytes)
+    # parsing can take a moment on a long replay: keep the server responsive
+    played_at, length_ms = await asyncio.to_thread(parse_osr_times, osr_bytes)
 
     mods = Mods(int(row["mods"]))
     mode_vn = int(row["mode"])

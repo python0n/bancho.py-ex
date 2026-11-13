@@ -25,6 +25,10 @@ from app.logging import Ansi
 from app.logging import log
 
 STRANGE_LOG_DIR = Path.cwd() / ".data/logs"
+# these files can be triggered by clients, so both their number and size
+# are limited; older files have to be removed by hand to log new ones
+STRANGE_LOG_MAX_FILES = 200
+STRANGE_LOG_MAX_BYTES = 256 * 1024
 
 VERSION_RGX = re.compile(r"^# v(?P<ver>\d+\.\d+\.\d+)$")
 SQL_UPDATES_FILE = Path.cwd() / "migrations/migrations.sql"
@@ -255,6 +259,22 @@ async def log_strange_occurrence(obj: object) -> None:
             )
 
     if not uploaded:
+        if len(pickled_obj) > STRANGE_LOG_MAX_BYTES:
+            log(
+                f"Strange occurrence not saved: {len(pickled_obj)} bytes is over the limit.",
+                Ansi.LYELLOW,
+            )
+            return
+
+        saved = sum(1 for _ in STRANGE_LOG_DIR.glob("strange_*.db"))
+        if saved >= STRANGE_LOG_MAX_FILES:
+            log(
+                f"Strange occurrence not saved: {saved} files already in "
+                f"{STRANGE_LOG_DIR.name}/ (limit {STRANGE_LOG_MAX_FILES}).",
+                Ansi.LYELLOW,
+            )
+            return
+
         # log to a file locally, and prompt the user
         while True:
             log_file = STRANGE_LOG_DIR / f"strange_{secrets.token_hex(4)}.db"

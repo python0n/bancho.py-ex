@@ -172,6 +172,10 @@ class ClientDetails:
     # TODO: __str__ to pack like osu! hashes?
 
 
+# unread packet data kept per player before the backlog is dropped
+MAX_PACKET_QUEUE_SIZE = 4 * 1024 * 1024  # bytes
+
+
 class Player:
     """\
     Server side representation of a player; not necessarily online.
@@ -1088,6 +1092,12 @@ class Player:
 
     def enqueue(self, data: bytes) -> None:
         """Add data to be sent to the client."""
+        # a session that only chats over IRC or the website never reads this
+        # queue, so it would grow for as long as the session lasts. a game
+        # client empties it every few seconds and never gets near the limit.
+        if len(self._packet_queue) + len(data) > MAX_PACKET_QUEUE_SIZE:
+            self._packet_queue.clear()
+
         self._packet_queue += data
 
     def dequeue(self) -> bytes | None:

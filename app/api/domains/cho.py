@@ -328,6 +328,37 @@ class ChangeAction(BasePacket):
 IGNORED_CHANNELS: list[str] = ["#highlight", "#userlog"]
 
 
+# chat flood limit for the game client, same numbers as IRC:
+# at most CHAT_FLOOD_MSGS messages (channel + private) per CHAT_FLOOD_WINDOW
+CHAT_FLOOD_MSGS = 10
+CHAT_FLOOD_WINDOW = 5.0  # seconds
+
+
+def chat_flood_limited(player: Player) -> bool:
+    """Count one chat message; True if the player is sending too fast."""
+    now = time.monotonic()
+    times = [
+        t
+        for t in getattr(player, "_chat_times", ())
+        if now - t < CHAT_FLOOD_WINDOW
+    ]
+    if len(times) >= CHAT_FLOOD_MSGS:
+        player._chat_times = times  # type: ignore[attr-defined]
+        if now - getattr(player, "_chat_flood_warned", 0.0) > CHAT_FLOOD_WINDOW:
+            player._chat_flood_warned = now  # type: ignore[attr-defined]
+            player.enqueue(
+                app.packets.notification(
+                    "You are sending messages too fast, slow down.",
+                ),
+            )
+            log(f"{player} hit the chat flood limit.", Ansi.LYELLOW)
+        return True
+
+    times.append(now)
+    player._chat_times = times  # type: ignore[attr-defined]
+    return False
+
+
 @register(ClientPackets.SEND_PUBLIC_MESSAGE)
 class SendMessage(BasePacket):
     def __init__(self, reader: BanchoPacketReader) -> None:
@@ -342,6 +373,9 @@ class SendMessage(BasePacket):
         msg = self.msg.text.strip()
 
         if not msg:
+            return
+
+        if chat_flood_limited(player):
             return
 
         recipient = self.msg.recipient
@@ -1231,6 +1265,9 @@ class SendPrivateMessage(BasePacket):
         msg = self.msg.text.strip()
 
         if not msg:
+            return
+
+        if chat_flood_limited(player):
             return
 
         target_name = self.msg.recipient
