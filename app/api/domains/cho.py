@@ -50,6 +50,7 @@ from app.logging import magnitude_fmt_time
 from app.objects.beatmap import Beatmap
 from app.objects.beatmap import ensure_osu_file_is_available
 from app.objects.channel import Channel
+from app.objects.channel import mask_mp_password
 from app.objects.match import MAX_MATCH_NAME_LENGTH
 from app.objects.match import Match
 from app.objects.match import MatchTeams
@@ -547,10 +548,12 @@ class SendMessage(BasePacket):
         if app.metrics.enabled:
             app.metrics.increment("ex_chat_messages")
 
-        log(f"{player} @ {t_chan}: {msg}", Ansi.LCYAN)
+        # a room password set with !mp password must not end up in the logs
+        logged_msg = mask_mp_password(msg)
+        log(f"{player} @ {t_chan}: {logged_msg}", Ansi.LCYAN)
 
         log_chat_to_disk(
-            f"[{get_timestamp(full=True, tz=ZoneInfo('GMT'))}] {player} @ {t_chan}: {msg}",
+            f"[{get_timestamp(full=True, tz=ZoneInfo('GMT'))}] {player} @ {t_chan}: {logged_msg}",
         )
 
 
@@ -1493,7 +1496,7 @@ class SendPrivateMessage(BasePacket):
         # private messages: who wrote to whom, never the text. commands sent
         # to the bot are still logged in full, as a record of who ran what.
         if target is app.state.sessions.bot:
-            log(f"{player} @ {target}: {msg}", Ansi.LCYAN)
+            log(f"{player} @ {target}: {mask_mp_password(msg)}", Ansi.LCYAN)
         else:
             log(f"{player} @ {target}: [private message, {len(msg)} chars]", Ansi.LCYAN)
 

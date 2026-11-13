@@ -43,10 +43,15 @@ _MP_PASSWORD = re.compile(
 _match_chat_error_logged = False
 
 
+def mask_mp_password(msg: str) -> str:
+    """`!mp password <x>` with the password replaced; for logs and history."""
+    return _MP_PASSWORD.sub(r"\1 ***", msg)
+
+
 async def save_match_message(match_id: int, user_id: int, msg: str, hidden: bool) -> None:
     """Match chat for the staff (mp_match_chat), shown on the match page."""
     # never keep a room password in the history
-    msg = _MP_PASSWORD.sub(r"\1 ***", msg)
+    msg = mask_mp_password(msg)
     try:
         await app.state.services.database.execute(
             "INSERT INTO mp_match_chat (match_id, user_id, msg, hidden) "
