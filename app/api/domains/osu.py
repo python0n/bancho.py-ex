@@ -274,6 +274,14 @@ router = APIRouter(
 )
 
 
+def client_ip(request: Request) -> str | None:
+    """The client's address for the password attempt counters."""
+    try:
+        return str(app.state.services.ip_resolver.get_ip(request.headers))
+    except ValueError:
+        return None
+
+
 @cache
 def authenticate_player_session(
     param_function: Callable[..., Any],
@@ -282,12 +290,14 @@ def authenticate_player_session(
     err: Any | None = None,
 ) -> Callable[[str, str], Awaitable[Player]]:
     async def wrapper(
+        request: Request,
         username: str = param_function(..., alias=username_alias),
         pw_md5: str = param_function(..., alias=pw_md5_alias),
     ) -> Player:
         player = await app.state.sessions.players.from_login(
             name=unquote(username),
             pw_md5=pw_md5,
+            ip=client_ip(request),
         )
         if player:
             return player
@@ -1799,7 +1809,11 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
         if username[-1] == " ":
             username = username[:-1]
 
-        player = await app.state.sessions.players.from_login(username, pw_md5)
+        player = await app.state.sessions.players.from_login(
+            username,
+            pw_md5,
+            ip=client_ip(request),
+        )
         if not player:
             # Player is not online, return nothing so that their
             # client will retry submission when they log in.
@@ -2532,7 +2546,11 @@ async def osuSubmitModularSelector(
     if username[-1] == " ":
         username = username[:-1]
 
-    player = await app.state.sessions.players.from_login(username, pw_md5)
+    player = await app.state.sessions.players.from_login(
+        username,
+        pw_md5,
+        ip=client_ip(request),
+    )
     if not player:
         # Player is not online, return nothing so that their
         # client will retry submission when they log in.

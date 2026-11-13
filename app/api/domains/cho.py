@@ -650,6 +650,7 @@ def parse_adapters_string(adapters_string: str) -> tuple[list[str], bool]:
 async def authenticate(
     username: str,
     untrusted_password: bytes,
+    ip: str | None = None,
 ) -> users_repo.User | None:
     user_info = await users_repo.fetch_one(
         name=username,
@@ -665,6 +666,9 @@ async def authenticate(
         trusted_hashword,
         untrusted_password,
         also_double_md5=True,
+        scope=passwords.SCOPE_LOGIN,
+        ip=ip,
+        account_name=user_info["name"],
     ):
         return None
 
@@ -744,7 +748,11 @@ async def handle_osu_login_request(
 
     # check the password before touching an existing session, so a wrong
     # password can't log out the real player (upstream bancho.py f10c03a)
-    user_info = await authenticate(login_data["username"], login_data["password_md5"])
+    user_info = await authenticate(
+        login_data["username"],
+        login_data["password_md5"],
+        ip=str(ip),
+    )
     if user_info is None:
         return {
             "osu_token": "incorrect-credentials",

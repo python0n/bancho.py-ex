@@ -279,6 +279,7 @@ class Players(list[Player]):
         name: str,
         pw_md5: str,
         sql: bool = False,
+        ip: str | None = None,
     ) -> Player | None:
         """Return a player with a given name & pw_md5, from cache or sql."""
         player = self.get(name=name)
@@ -293,7 +294,15 @@ class Players(list[Player]):
         assert player.pw_bcrypt is not None
 
         trusted_hashword = player.pw_bcrypt if isinstance(player.pw_bcrypt, bytes) else player.pw_bcrypt.encode()
-        if not await passwords.verify(trusted_hashword, pw_md5.encode()):
+        # the /web/ endpoints have their own failure counters, so wrong
+        # passwords sent here cannot lock the player out of the game login
+        if not await passwords.verify(
+            trusted_hashword,
+            pw_md5.encode(),
+            scope=passwords.SCOPE_WEB,
+            ip=ip,
+            account_name=player.name,
+        ):
             return None
         return player
 
