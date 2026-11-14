@@ -1646,11 +1646,42 @@ async def _mp_make_room(ctx: Context, private: bool) -> str | None:
     return f"Match created: join #multi_{seq_id}"
 
 
+# parameters shown by !mp help next to each command (<> required, [] optional)
+_MP_USAGE = {
+    "make": "<name>",
+    "makeprivate": "<name>",
+    "start": "[<seconds>/force/cancel]",
+    "map": "<mapid> [<playmode>]",
+    "mods": "<mod> [<mod>] ...",
+    "freemods": "<on/off>",
+    "host": "<user>",
+    "invite": "<user>",
+    "addref": "<user> [<user>] ...",
+    "rmref": "<user> [<user>] ...",
+    "teams": "<type>",
+    "condition": "<type>",
+    "scrim": "<bo#>",
+    "force": "<user>",
+    "loadpool": "<name>",
+    "ban": "<user/pick>",
+    "unban": "<user/pick>",
+    "pick": "<pick>",
+    "kick": "<user>",
+    "timer": "[<seconds>]",
+    "size": "<1-16>",
+    "password": "[<password>]",
+    "name": "<title>",
+    "team": "<user> <red/blue>",
+    "move": "<user> <slot>",
+    "set": "<teammode> [<scoremode>] [<size>]",
+}
+
+
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["h"])
 async def mp_help(ctx: Context) -> str | None:
     """Show all documented multiplayer commands the player can access."""
-    # one line per command, as before; works anywhere, also in a private
-    # message to the bot (like on bancho), not only inside a room
+    # one line per command with its parameters; works anywhere, also in a
+    # private message to the bot (like on bancho), not only inside a room
     prefix = app.settings.COMMAND_PREFIX
     cmds = []
 
@@ -1659,8 +1690,20 @@ async def mp_help(ctx: Context) -> str | None:
             # no doc, or insufficient permissions.
             continue
 
-        cmds.append(f"{prefix}mp {cmd.triggers[0]}: {cmd.doc}")
+        trigger = cmd.triggers[0]
+        usage = _MP_USAGE.get(trigger)
+        name = f"{trigger} {usage}" if usage else trigger
+        cmds.append(f"{prefix}mp {name}: {cmd.doc}")
 
+    cmds.append(
+        "<user>: name with _ instead of spaces, or #<user id>. "
+        "playmode: 0 osu!, 1 taiko, 2 catch, 3 mania. "
+        "mods: HD, HR, DT, NC, FL, EZ, HT, NF, Freemod, None.",
+    )
+    cmds.append(
+        f"Examples: {prefix}mp make My Cup | {prefix}mp invite Python- | "
+        f"{prefix}mp map 75 3 | {prefix}mp mods HD DT | {prefix}mp start 10",
+    )
     return "\n".join(cmds)
 
 
@@ -3134,8 +3177,10 @@ async def process_commands(
 
     # check if any command sets match.
     commands: list[Command] = []
+    matched_set: CommandSet | None = None
     for cmd_set in command_sets:
         if trigger == cmd_set.trigger:
+            matched_set = cmd_set
             if not args:
                 args = ["help"]
 
@@ -3158,6 +3203,19 @@ async def process_commands(
         args=args,
         cmd_or_sets=[*commands],
     )
+    if res is None and cmd is None and matched_set is not None and trigger:
+        known = any(
+            trigger in c.triggers
+            for c in [*matched_set.subcommands, *matched_set.commands]
+            if isinstance(c, Command)
+        )
+        if not known:
+            p = app.settings.COMMAND_PREFIX
+            res = (
+                f"Unknown command: {p}{matched_set.trigger} {trigger}. "
+                f"Type {p}{matched_set.trigger} help for the list."
+            )
+
     if res is not None:
         # we have a message to return, include elapsed time
         elapsed = app.logging.magnitude_fmt_time(clock_ns() - start_time)
