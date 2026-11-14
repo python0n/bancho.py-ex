@@ -1539,6 +1539,12 @@ def presence_and_stats(o: Player) -> bytes:
         return b""
 
 
+# the game allows short passwords; "//private" (history off) is added to it
+MAX_MATCH_PASSWORD_LENGTH = 64
+# "artist - title [difficulty]"; real map names stay far below this
+MAX_MATCH_MAP_NAME_LENGTH = 512
+
+
 def validate_match_data(
     untrusted_match_data: app.packets.MultiplayerMatch,
     expected_host_id: int,
@@ -1547,6 +1553,11 @@ def validate_match_data(
         (
             untrusted_match_data.host_id == expected_host_id,
             len(untrusted_match_data.name) <= MAX_MATCH_NAME_LENGTH,
+            # strings from the client are sent on to the room and the whole
+            # lobby on every change, so their length is bounded
+            len(untrusted_match_data.passwd) <= MAX_MATCH_PASSWORD_LENGTH,
+            len(untrusted_match_data.map_name) <= MAX_MATCH_MAP_NAME_LENGTH,
+            len(untrusted_match_data.map_md5) <= 32,
             0 <= untrusted_match_data.mode <= 3,
             0 <= untrusted_match_data.win_condition <= 3,
             0 <= untrusted_match_data.team_type <= 3,
@@ -1695,6 +1706,12 @@ class MatchJoin(BasePacket):
         self.match_passwd = reader.read_string()
 
     async def handle(self, player: Player) -> None:
+        # the id comes from the client: a negative one would pick a room from
+        # the end of the list, a too large one would end the request with an error
+        if not 0 <= self.match_id < len(app.state.sessions.matches):
+            player.enqueue(app.packets.match_join_fail())
+            return
+
         match = app.state.sessions.matches[self.match_id]
         if not match:
             log(f"{player} tried to join a non-existant mp lobby?")
@@ -2001,6 +2018,11 @@ class MatchScoreUpdate(BasePacket):
         if slot_id is None:
             return
         slot = player.match.slots[slot_id]
+
+        # only a player who is playing sends frames, and a frame has a fixed
+        # size: anything else would be sent on to the whole room as it is
+        if slot.status != SlotStatus.playing or len(self.play_data) < SCOREFRAME_FMT.size:
+            return
 
         # the last score frame is what official bancho stores as the
         # player's result (osu-web game_scores keeps the frame)
@@ -2449,6 +2471,14 @@ class MatchInvite(BasePacket):
 
         if target is app.state.sessions.bot:
             player.send_bot("I'm too busy!")
+            return
+
+        # an invite is a private message: blocks and "private messages from
+        # friends only" apply to it, as in the game
+        if player.id in target.blocks or (
+            target.pm_private and player.id not in target.friends
+        ):
+            player.send_bot(f"{target.name} does not accept invites from you.")
             return
 
         target.enqueue(app.packets.match_invite(player, target.name))
