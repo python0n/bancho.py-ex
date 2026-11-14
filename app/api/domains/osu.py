@@ -333,7 +333,12 @@ BSS_ALLOWED_EXTENSIONS = frozenset({
     ".jpg", ".jpeg", ".png",
 })
 BSS_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".flv", ".m4v", ".mkv", ".wmv", ".webm"})
-BSS_MAX_UPLOAD_BYTES = 100 * 1024 * 1024    # one uploaded file (same limit as osz2-service)
+# one uploaded file. the web server in front accepts 64 MB per request, so
+# anything above that never arrived here anyway
+BSS_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+# sets one player may own (staff is not limited); each can hold up to
+# BSS_MAX_UNPACKED_BYTES on disk
+BSS_MAX_SETS_PER_PLAYER = 50
 BSS_MAX_UNPACKED_BYTES = 300 * 1024 * 1024  # everything unpacked from one upload
 BSS_MAX_FILES = 500
 
@@ -370,16 +375,28 @@ def _bss_clear_dir(directory: SystemPath) -> None:
             entry.unlink(missing_ok=True)
 
 
-def _bss_calc_difficulty(osu_path: SystemPath) -> tuple[float, int] | None:
-    """Star rating and max combo of a .osu file, the same way the server calculates pp."""
+def _bss_calc_difficulty_sync(osu_path: SystemPath) -> tuple[float, int] | None:
     try:
         import akatsuki_pp_py as rosu
 
         perf = rosu.Calculator().performance(rosu.Beatmap(path=str(osu_path)))
         return round(perf.difficulty.stars, 2), int(perf.difficulty.max_combo)
-    except Exception as e:
-        log(f"[BSS] difficulty calc failed for {osu_path.name}: {e}", Ansi.LYELLOW)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:
+        # BaseException on purpose: a panic inside the calculator (rust)
+        # is not an Exception and would otherwise escape this function
+        log(f"[BSS] difficulty calc failed for {osu_path.name}: {e!r}", Ansi.LYELLOW)
         return None
+
+
+async def _bss_calc_difficulty(osu_path: SystemPath) -> tuple[float, int] | None:
+    """Star rating and max combo of a .osu file, the same way the server calculates pp.
+
+    Runs in a worker thread: an uploaded map can take a while to calculate
+    and must not stall the server for everyone else.
+    """
+    return await asyncio.to_thread(_bss_calc_difficulty_sync, osu_path)
 
 
 def _bss_evict_set_cache(set_id: int) -> None:
@@ -427,8 +444,17 @@ async def _bss_get_set_owner(set_id: int) -> int | None:
     return None if owner is None else int(owner)
 
 
+# held from "pick the next map id" until the row with that id is inserted,
+# so two uploads at the same moment cannot pick the same id
+_bss_map_id_lock = asyncio.Lock()
+
+
 async def _bss_get_next_beatmap_ids(count: int) -> list[int]:
-    """Get the next N available beatmap IDs for BSS."""
+    """Get the next N available beatmap IDs for BSS.
+
+    The ids are only taken once a row is inserted: callers that insert must
+    hold _bss_map_id_lock around this call and the insert.
+    """
     stmt = sa_select(sa_func.max(MapsTable.id)).where(
         MapsTable.id >= BSS_ID_OFFSET,
     )
@@ -955,59 +981,63 @@ async def _bss_process_osu_files(
             if md5 in app.state.cache.unsubmitted:
                 app.state.cache.unsubmitted.discard(md5)
             # Przelicz SR i max combo po update
-            calc_result = _bss_calc_difficulty(osu_file_path)
+            calc_result = await _bss_calc_difficulty(osu_file_path)
             if calc_result is not None:
                 sr, max_combo = calc_result
                 await maps_repo.partial_update(id=existing["id"], diff=sr, max_combo=max_combo)
                 log(f"[BSS] SR updated for {existing['id']}: {sr:.2f} ({max_combo}x)", Ansi.LGREEN)
             continue
 
-        assigned_ids = await _bss_get_next_beatmap_ids(1)
-        beatmap_id = assigned_ids[0]
+        created = True
+        async with _bss_map_id_lock:
+            assigned_ids = await _bss_get_next_beatmap_ids(1)
+            beatmap_id = assigned_ids[0]
 
-        osu_filename = (
-            f"{meta['artist'] or 'Unknown'} - {meta['title'] or 'Unknown'} "
-            f"({meta['creator'] or player.name}) "
-            f"[{meta['version'] or 'Normal'}].osu"
-        ).replace("/", "_").replace("\\", "_")
+            osu_filename = (
+                f"{meta['artist'] or 'Unknown'} - {meta['title'] or 'Unknown'} "
+                f"({meta['creator'] or player.name}) "
+                f"[{meta['version'] or 'Normal'}].osu"
+            ).replace("/", "_").replace("\\", "_")
 
-        log(
-            f"[BSS] creating map: id={beatmap_id} set={set_id} "
-            f"'{meta['artist']} - {meta['title']} [{meta['version']}]'",
-            Ansi.LCYAN,
-        )
-
-        try:
-            await maps_repo.create(
-                id=beatmap_id,
-                server="osu!",
-                set_id=set_id,
-                status=0,  # Pending
-                md5=md5,
-                artist=meta["artist"] or "Unknown Artist",
-                title=meta["title"] or "Unknown Title",
-                version=meta["version"] or "Normal",
-                creator=meta["creator"] or player.name,
-                filename=osu_filename,
-                last_update=datetime.now(tz=timezone.utc),
-                total_length=meta["total_length"],
-                max_combo=0,
-                frozen=True,
-                plays=0,
-                passes=0,
-                mode=meta["mode"],
-                bpm=meta["bpm"],
-                cs=meta["cs"],
-                ar=meta["ar"],
-                od=meta["od"],
-                hp=meta["hp"],
-                diff=0.0,
+            log(
+                f"[BSS] creating map: id={beatmap_id} set={set_id} "
+                f"'{meta['artist']} - {meta['title']} [{meta['version']}]'",
+                Ansi.LCYAN,
             )
-        except Exception as e:
-            log(f"[BSS] failed to create map entry: {e!r}", Ansi.LRED)
-            # Still save .osu file even if DB insert failed
-            osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
-            osu_file_path.write_bytes(file_data)
+
+            try:
+                await maps_repo.create(
+                    id=beatmap_id,
+                    server="osu!",
+                    set_id=set_id,
+                    status=0,  # Pending
+                    md5=md5,
+                    artist=meta["artist"] or "Unknown Artist",
+                    title=meta["title"] or "Unknown Title",
+                    version=meta["version"] or "Normal",
+                    creator=meta["creator"] or player.name,
+                    filename=osu_filename,
+                    last_update=datetime.now(tz=timezone.utc),
+                    total_length=meta["total_length"],
+                    max_combo=0,
+                    frozen=True,
+                    plays=0,
+                    passes=0,
+                    mode=meta["mode"],
+                    bpm=meta["bpm"],
+                    cs=meta["cs"],
+                    ar=meta["ar"],
+                    od=meta["od"],
+                    hp=meta["hp"],
+                    diff=0.0,
+                )
+            except Exception as e:
+                # no row, no file: writing <id>.osu here could replace the
+                # file of a map that got this id a moment earlier
+                log(f"[BSS] failed to create map entry: {e!r}", Ansi.LRED)
+                created = False
+
+        if not created:
             continue
 
         # Store .osu file for gameplay
@@ -1015,7 +1045,7 @@ async def _bss_process_osu_files(
         osu_file_path.write_bytes(file_data)
 
         # Calculate star rating and max combo
-        calc_result = _bss_calc_difficulty(osu_file_path)
+        calc_result = await _bss_calc_difficulty(osu_file_path)
         if calc_result is not None:
             sr, max_combo = calc_result
             await maps_repo.partial_update(id=beatmap_id, diff=sr, max_combo=max_combo)
@@ -1053,6 +1083,19 @@ async def bmsubmitGetID(
 
     if set_id <= 0:
         # New submission
+        if not player.priv & Privileges.STAFF:
+            owned_sets = await app.state.services.database.fetch_val(
+                "SELECT COUNT(*) FROM bss_sets WHERE owner_id = :owner_id",
+                {"owner_id": player.id},
+            )
+            if (owned_sets or 0) >= BSS_MAX_SETS_PER_PLAYER:
+                log(
+                    f"[BSS] {player} already owns {owned_sets} sets, "
+                    "new submission denied",
+                    Ansi.LYELLOW,
+                )
+                return Response(content="1")
+
         new_set_id = await _bss_reserve_set(player.id)
         new_bmap_ids = await _bss_get_next_beatmap_ids(num_diffs)
         full_submit = 1
@@ -1196,17 +1239,19 @@ async def bmsubmitUpload(
                 log(f"[BSS] osz2-service returned files but no .osu — falling back", Ansi.LYELLOW)
                 existing_maps = await maps_repo.fetch_many(set_id=set_id)
                 if not existing_maps:
-                    assigned_ids = await _bss_get_next_beatmap_ids(1)
-                    beatmap_id = assigned_ids[0]
-                    await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
+                    async with _bss_map_id_lock:
+                        assigned_ids = await _bss_get_next_beatmap_ids(1)
+                        beatmap_id = assigned_ids[0]
+                        await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
         else:
             # osz2-service unavailable or failed — fall back to header parsing
             log(f"[BSS] osz2-service unavailable, falling back to header parsing", Ansi.LYELLOW)
             existing_maps = await maps_repo.fetch_many(set_id=set_id)
             if not existing_maps:
-                assigned_ids = await _bss_get_next_beatmap_ids(1)
-                beatmap_id = assigned_ids[0]
-                await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
+                async with _bss_map_id_lock:
+                    assigned_ids = await _bss_get_next_beatmap_ids(1)
+                    beatmap_id = assigned_ids[0]
+                    await _bss_create_entry_from_osz2(osz2_data, set_id, beatmap_id, player)
     else:
         log(f"[BSS] no files found in upload for set {set_id}", Ansi.LYELLOW)
 
@@ -1915,7 +1960,7 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
 
         # hold a lock around (check if submitted, submission) to ensure no duplicates
         # are submitted to the database, and potentially award duplicate score/pp/etc.
-        async with app.state.score_submission_locks[score.client_checksum]:
+        async with app.state.score_submission_lock(score.client_checksum):
             # stop here if this is a duplicate score
             if await app.state.services.database.fetch_one(
                 "SELECT 1 FROM scores WHERE online_checksum = :checksum",
@@ -2658,7 +2703,7 @@ async def osuSubmitModularSelector(
 
     # hold a lock around (check if submitted, submission) to ensure no duplicates
     # are submitted to the database, and potentially award duplicate score/pp/etc.
-    async with app.state.score_submission_locks[score.client_checksum]:
+    async with app.state.score_submission_lock(score.client_checksum):
         # stop here if this is a duplicate score
         if await app.state.services.database.fetch_one(
             "SELECT 1 FROM scores WHERE online_checksum = :checksum",
@@ -3218,7 +3263,7 @@ async def osuSubmitModularSelector(
 async def getReplay(
     player: Player = Depends(authenticate_player_session(Query, "u", "h")),
     mode: int = Query(..., alias="m", ge=0, le=3),
-    score_id: int = Query(..., alias="c", min=0, max=9_223_372_036_854_775_807),
+    score_id: int = Query(..., alias="c", ge=0, le=9_223_372_036_854_775_807),
 ) -> Response:
     score = await Score.from_sql(score_id)
     if not score:
@@ -3475,7 +3520,19 @@ async def getScores(
                             )
                     if target is None and len(bss_maps) == 1:
                         target = bss_maps[0]
-                if target is None:
+                # a map that already has a leaderboard keeps its md5: changing
+                # it here would swap the map players are scored on without
+                # the file on the server or the status changing. such a map
+                # is updated by uploading it again, which sends it back to
+                # pending (see _bss_process_osu_files)
+                if target is not None and target["status"] in (2, 3, 4, 5):
+                    log(
+                        f"[BSS] md5 of map {target['id']} (status {target['status']}) "
+                        f"not changed on request of {player}",
+                        Ansi.LYELLOW,
+                    )
+                    target = None
+                elif target is None:
                     log(
                         f"[BSS] md5 mismatch for set {map_set_id} ({map_filename}) "
                         f"from {player}, left unchanged",
@@ -3928,7 +3985,7 @@ async def get_osz(
             content=buf.getvalue(),
             media_type="application/x-osu-beatmap-archive",
             headers={
-                "Content-Disposition": f'attachment; filename="{osz_filename}"',
+                "Content-Disposition": app.utils.content_disposition(osz_filename),
             },
         )
 

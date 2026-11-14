@@ -193,7 +193,7 @@ async def approve_pending_replay(pending_id: int) -> dict[str, Any]:
     if mode not in player.stats:
         await player.stats_from_sql_full()
 
-    async with app.state.score_submission_locks[score.client_checksum]:
+    async with app.state.score_submission_lock(score.client_checksum):
         if await db.fetch_one(
             "SELECT 1 FROM scores WHERE online_checksum = :checksum",
             {"checksum": score.client_checksum},

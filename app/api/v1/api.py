@@ -23,6 +23,7 @@ import app.packets
 import app.settings
 import app.state
 import app.usecases.performance
+import app.utils
 from app.constants import regexes
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
@@ -118,16 +119,16 @@ async def api_approve_replay(
 @router.get("/calculate_pp")
 async def api_calculate_pp(
     token: HTTPCredentials | None = Depends(http_bearer_scheme),
-    beatmap_id: int = Query(None, alias="id", min=0, max=2_147_483_647),
-    nkatu: int = Query(None, max=2_147_483_647),
-    ngeki: int = Query(None, max=2_147_483_647),
-    n100: int = Query(None, max=2_147_483_647),
-    n50: int = Query(None, max=2_147_483_647),
-    n300: int = Query(None, max=2_147_483_647),
-    misses: int = Query(0, max=2_147_483_647),
-    mods: int = Query(0, min=0, max=2_147_483_647),
-    mode: int = Query(0, min=0, max=11),
-    combo: int = Query(None, max=2_147_483_647),
+    beatmap_id: int = Query(None, alias="id", ge=0, le=2_147_483_647),
+    nkatu: int = Query(None, le=2_147_483_647),
+    ngeki: int = Query(None, le=2_147_483_647),
+    n100: int = Query(None, le=2_147_483_647),
+    n50: int = Query(None, le=2_147_483_647),
+    n300: int = Query(None, le=2_147_483_647),
+    misses: int = Query(0, le=2_147_483_647),
+    mods: int = Query(0, ge=0, le=2_147_483_647),
+    mode: int = Query(0, ge=0, le=11),
+    combo: int = Query(None, le=2_147_483_647),
     acclist: list[float] = Query([100, 99, 98, 95], alias="acc"),
 ) -> Response:
     """Calculates the PP of a specified map with specified score parameters."""
@@ -224,7 +225,7 @@ async def api_online() -> Response:
 
 @router.get("/search_players")
 async def api_search_players(
-    search: str | None = Query(None, alias="q", min=2, max=32),
+    search: str | None = Query(None, alias="q", min_length=2, max_length=32),
 ) -> Response:
     """Search for users on the server by name."""
     rows = await app.state.services.database.fetch_all(
@@ -964,14 +965,10 @@ async def api_get_replay(
     def format_filename_rfc5987(params):
         """Format filename according to RFC 5987 for proper Unicode support."""
         filename = "{username} - {artist} - {title} [{version}] ({play_time:%Y-%m-%d}).osr".format(**params)
-        
-        # ASCII fallback for older clients
-        ascii_filename = filename.encode('ascii', 'ignore').decode('ascii')
-        
-        # UTF-8 encoded filename for modern clients
-        utf8_filename = "UTF-8''" + quote(filename.encode('utf-8'))
-        
-        return f"attachment; filename=\"{ascii_filename}\"; filename*={utf8_filename}"
+
+        # shared helper: the old ascii fallback kept quotes and control
+        # characters from the map metadata inside the quoted file name
+        return app.utils.content_disposition(filename)
 
     # stream data back to the client
     return Response(
@@ -1036,7 +1033,7 @@ async def api_get_global_leaderboard(
     sort: Literal["tscore", "rscore", "pp", "acc", "plays", "playtime"] = "pp",
     mode_arg: int = Query(0, alias="mode", ge=0, le=11),
     limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, min=0, max=2_147_483_647),
+    offset: int = Query(0, ge=0, le=2_147_483_647),
     country: str | None = Query(None, min_length=2, max_length=2),
 ) -> Response:
     if mode_arg in (

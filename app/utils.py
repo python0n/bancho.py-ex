@@ -256,3 +256,19 @@ def has_png_headers_and_trailers(data_view: memoryview) -> bool:
         data_view[:8] == b"\x89PNG\r\n\x1a\n"
         and data_view[-8:] == b"\x49END\xae\x42\x60\x82"
     )
+
+
+def content_disposition(filename: str) -> str:
+    """`Content-Disposition: attachment` value for any file name.
+
+    Headers are latin-1 only and the quoted form cannot hold a quote, a
+    backslash or a control character, so a name taken from user data (map
+    artist, title, ...) is sent twice: a plain ascii fallback and the full
+    name in the RFC 5987 form (filename*), which every current client reads.
+    """
+    from urllib.parse import quote
+
+    fallback = "".join(
+        c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in filename
+    )
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"

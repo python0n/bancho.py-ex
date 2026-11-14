@@ -2511,8 +2511,10 @@ class UserPresenceRequestAll(BasePacket):
 
         buffer = bytearray()
 
-        for player in app.state.sessions.players.unrestricted:
-            buffer += app.packets.user_presence(player)
+        # the loop variable must not be called `player`: it used to replace
+        # the requesting player, so the answer went to the last one listed
+        for other in app.state.sessions.players.unrestricted:
+            buffer += app.packets.user_presence(other)
 
         player.enqueue(bytes(buffer))
 
