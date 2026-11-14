@@ -40,6 +40,20 @@ def main_session(user_id: int) -> Player | None:
             return p
     return None
 WHITE_SPACE = re.compile(r"\r?\n")
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+_MSG_PREFIX = re.compile(r"^(:\S+ (?:PRIVMSG|NOTICE) \S+ :)")
+
+
+def _irc_lines(message: str) -> list[str]:
+    """Split an outgoing IRC line that contains line breaks into proper lines."""
+    parts = _LINE_BREAK.split(message)
+    if len(parts) == 1:
+        return parts
+    head = _MSG_PREFIX.match(parts[0])
+    if head is None:
+        # not a message: never let a line break start a new command
+        return [" ".join(p for p in parts if p)]
+    return [parts[0]] + [head.group(1) + p for p in parts[1:] if p]
 
 
 def match_of_channel(name: str):
@@ -120,8 +134,14 @@ class IRCClient:
         return buffer
  
     async def add_queue(self, message: str) -> None:
-            self.socket.write((message + "\r\n").encode())
-            await self.socket.drain()
+        # one IRC line per write. Text with line breaks (multi-line bot answers
+        # like !help, or a chat message from a modified game client) used to go
+        # out raw: clients showed only the first line and the rest was read as
+        # new IRC lines, so a message could pose as another user or the bot.
+        # Every further line now repeats the sender and target of the first one.
+        for line in _irc_lines(message):
+            self.socket.write((line + "\r\n").encode())
+        await self.socket.drain()
  
     async def send_welcome_msg(self) -> None:
         if self.player is None:
