@@ -176,7 +176,12 @@ class Match:
         self.has_public_history = has_public_history
 
         self.host_id = host_id
+        # whoever made the room manages it for good, also after giving the
+        # host away or leaving and coming back (as on bancho)
+        self.creator_id = host_id
         self.referees: set[Player] = set()
+        # players banned with !mp ban; they cannot join the room again
+        self.banned_ids: set[int] = set()
 
         self.map_id = map_id
         self.map_md5 = map_md5
@@ -255,16 +260,25 @@ class Match:
 
     @property
     def refs(self) -> set[Player]:
-        """Return all players with referee permissions."""
-        host = self.host
-        return self.referees | ({host} if host is not None else set())
+        """Online players with referee permissions: the creator and the referees."""
+        creator = app.state.sessions.players.get(id=self.creator_id)
+        return self.referees | ({creator} if creator is not None else set())
+
+    def ref_names(self) -> set[str]:
+        """Names of the creator and the referees, also when they are offline."""
+        names = {r.name for r in self.referees}
+        creator = app.state.sessions.players.get(id=self.creator_id)
+        if creator is not None:
+            names.add(creator.name)
+        return names
 
     def __repr__(self) -> str:
         return f"<{self.name} ({self.id})>"
 
     def is_ref(self, player: Player) -> bool:
-        """Host or referee, checked by user id (a reconnect makes a new session)."""
-        return self.host_id == player.id or any(r.id == player.id for r in self.referees)
+        """Creator or referee, checked by user id (a reconnect makes a new session).
+        Like on bancho, a player who only got the host does not manage the room."""
+        return self.creator_id == player.id or any(r.id == player.id for r in self.referees)
 
     def may_enter_chat(self, player: Player) -> bool:
         """Who may be in the match channel: host and referees, players in a slot,

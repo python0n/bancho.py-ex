@@ -623,8 +623,14 @@ class Player:
             self.enqueue(app.packets.match_join_fail())
             return False
 
+        if self.id in match.banned_ids and self not in app.state.sessions.players.staff:
+            log(f"{self} tried to join {match}, banned from it.", Ansi.LYELLOW)
+            self.enqueue(app.packets.match_join_fail())
+            return False
+
         is_host = match.host is self
-        if not is_host:
+        # the creator gets back into their own room without the password
+        if not is_host and self.id != match.creator_id:
             # match already exists, we're simply joining.
             # NOTE: staff members have override to pw and can
             # simply use any to join a pw protected match.
@@ -764,9 +770,7 @@ class Player:
                         s.player.enqueue(app.packets.match_transfer_host())
                         break
 
-            if self in self.match.referees:
-                self.match.referees.remove(self)
-                self.match.chat.send_bot(f"{self.name} removed from match referees.")
+            # a referee stays a referee after leaving the room, as on bancho
 
             # notify others of our deprature
             self.match.enqueue_state()

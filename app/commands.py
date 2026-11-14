@@ -1500,19 +1500,11 @@ def ensure_match(
             # message not in match channel
             return None
 
-        try:
-            in_refs = ctx.player in match.refs
-        except ValueError:
-            # host not found in sessions; fall back to id comparison
-            in_refs = (
-                ctx.player.id == match.host_id
-                or ctx.player in match.referees
-            )
-
+        # like on bancho: the creator of the room and its referees manage it.
+        # a player who only got the host (passed on, or with !mp host) does not
         if not (
-            in_refs
+            match.is_ref(ctx.player)
             or ctx.player.priv & Privileges.TOURNEY_MANAGER
-            or f is mp_help.__wrapped__  # type: ignore[attr-defined]
         ):
             return None
 
@@ -1521,18 +1513,71 @@ def ensure_match(
     return wrapper
 
 
+# !mp make and !mp makeprivate rooms one player may have open at once
+MP_MAX_ROOMS_PER_CREATOR = 4
+# referees added with !mp addref, the creator not counted
+MP_MAX_REFEREES = 8
+
+
+def _mp_find_player(arg: str) -> Player | None:
+    """An online player by name or by #<user id>, like on bancho. Spaces in a
+    name are written as underscores, which the name lookup already accepts."""
+    if arg.startswith("#") and arg[1:].isdecimal():
+        return app.state.sessions.players.get(id=int(arg[1:]))
+    return app.state.sessions.players.get(name=arg)
+
+
+def _countdown_alerts(duration: int) -> list[int]:
+    """Seconds before the end at which a countdown is announced: every full
+    minute, then 30, 10, 5, 4, 3, 2 and 1 seconds (as on bancho)."""
+    points = set(range(60, duration, 60)) | {30, 10, 5, 4, 3, 2, 1}
+    return sorted((t for t in points if t < duration), reverse=True)
+
+
+def _countdown_text(t: int) -> str:
+    if t >= 60 and t % 60 == 0:
+        minutes = t // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{t} second{'s' if t != 1 else ''}"
+
+
 @mp_commands.add(Privileges.UNRESTRICTED)
 async def mp_make(ctx: Context) -> str | None:
-    """Create a new multiplayer match (usable from IRC)."""
+    """Create a tournament room (usable from IRC)."""
+    return await _mp_make_room(ctx, private=False)
+
+
+@mp_commands.add(Privileges.UNRESTRICTED)
+async def mp_makeprivate(ctx: Context) -> str | None:
+    """Create a tournament room with private match history."""
+    return await _mp_make_room(ctx, private=True)
+
+
+async def _mp_make_room(ctx: Context, private: bool) -> str | None:
+    """!mp make and !mp makeprivate. Like on bancho, the room has a random
+    password, so players get in through !mp invite and cannot join it on
+    their own; !mp password without a value removes it."""
+    command = "makeprivate" if private else "make"
     if ctx.player.match:
         return "You are already in a match. Use !mp close first."
 
     if not ctx.args:
-        return "Invalid syntax: !mp make <title>"
+        return f"Invalid syntax: !mp {command} <name>"
 
     title = " ".join(ctx.args)
     if len(title) > 50:
         return "Match title must be 50 characters or less."
+
+    own_rooms = sum(
+        1
+        for m in app.state.sessions.matches
+        if m is not None and m.ref_made and m.creator_id == ctx.player.id
+    )
+    if own_rooms >= MP_MAX_ROOMS_PER_CREATOR:
+        return (
+            f"You can have at most {MP_MAX_ROOMS_PER_CREATOR} tournament rooms "
+            "open. Close one with !mp close first."
+        )
 
     match_id = app.state.sessions.matches.get_free()
     if match_id is None:
@@ -1550,8 +1595,8 @@ async def mp_make(ctx: Context) -> str | None:
     match = Match(
         id=match_id,
         name=title,
-        password="",
-        has_public_history=True,
+        password=secrets.token_hex(8),
+        has_public_history=not private,
         map_name="",
         map_id=0,
         map_md5="",
@@ -1573,13 +1618,15 @@ async def mp_make(ctx: Context) -> str | None:
     match.ref_made = True
 
     try:
+        # private history: the match page is shown to the staff only (hidden)
         match.web_id = await app.state.services.database.execute(
-            "INSERT INTO mp_matches (bancho_slot, name, creator_id, created_at, ended_at) "
-            "VALUES (:bancho_slot, :name, :creator_id, NOW(), NULL)",
+            "INSERT INTO mp_matches (bancho_slot, name, creator_id, created_at, ended_at, hidden) "
+            "VALUES (:bancho_slot, :name, :creator_id, NOW(), NULL, :hidden)",
             {
                 "bancho_slot": match_id + 1,
                 "name": match.name,
                 "creator_id": ctx.player.id,
+                "hidden": 1 if private else 0,
             },
         )
     except Exception as exc:
@@ -1600,20 +1647,22 @@ async def mp_make(ctx: Context) -> str | None:
 
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["h"])
-@ensure_match
-async def mp_help(ctx: Context, match: Match) -> str | None:
-    """Show all documented multiplayer commands the player can access."""
-    prefix = app.settings.COMMAND_PREFIX
-    cmds = []
-
-    for cmd in mp_commands.commands:
-        if not cmd.doc or ctx.player.priv & cmd.priv != cmd.priv:
-            # no doc, or insufficient permissions.
-            continue
-
-        cmds.append(f"{prefix}mp {cmd.triggers[0]}: {cmd.doc}")
-
-    return "\n".join(cmds)
+async def mp_help(ctx: Context) -> str | None:
+    """List the multiplayer commands."""
+    # works anywhere, also in a private message to the bot, like on bancho.
+    # one short list instead of a line per command
+    p = f"{app.settings.COMMAND_PREFIX}mp"
+    return "\n".join(
+        (
+            f"{p} make <name> | makeprivate <name> | name <title> | close",
+            f"{p} invite <user> | lock | unlock | size <1-16> | set <teammode> [<scoremode>] [<size>]",
+            f"{p} move <user> <slot> | host <user> | clearhost | team <user> <red/blue> | kick <user> | ban <user> | unban <user>",
+            f"{p} map <id> [<playmode>] | mods <mod> [<mod>] ... (Freemod, None) | settings",
+            f"{p} start [<seconds>] | abort | timer [<seconds>] | aborttimer | password [<password>]",
+            f"{p} addref <user> ... | removeref <user> ... | listrefs",
+            f"Users: name with _ instead of spaces, or #<user id>. Tournament tools: {p} loadpool, pick, scrim, rematch.",
+        )
+    )
 
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["cfg", "info"])
@@ -1695,13 +1744,11 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
     # !mp start cancel: cancel the current match start timer
 
     if not ctx.args:
-        # !mp start
+        # !mp start: like on bancho, the referee starts the match at once,
+        # whether everyone is ready or not
         if match.starting is not None:
             time_remaining = int(match.starting["time"] - time.time())
             return f"Match starting in {time_remaining} seconds."
-
-        if any([s.status == SlotStatus.not_ready for s in match.slots]):
-            return "Not all players are ready (`!mp start force` to override)."
     else:
         if ctx.args[0].isdecimal():
             # !mp start N
@@ -1734,7 +1781,7 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
 
             def _alert_start(t: int) -> None:
                 """Alert the match of the impending start."""
-                msg = f"Match starting in {t} seconds."
+                msg = f"Match starts in {_countdown_text(t)}."
                 match.chat.send_bot(msg)
 
             # add timers to our match object,
@@ -1743,8 +1790,7 @@ async def mp_start(ctx: Context, match: Match) -> str | None:
                 "start": app.state.loop.call_later(duration, _start),
                 "alerts": [
                     app.state.loop.call_later(duration - t, lambda t=t: _alert_start(t))
-                    for t in (60, 30, 10, 5, 4, 3, 2, 1)
-                    if t < duration
+                    for t in _countdown_alerts(duration)
                 ],
                 "time": time.time() + duration,
             }
@@ -1784,24 +1830,35 @@ async def mp_abort(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_map(ctx: Context, match: Match) -> str | None:
-    """Set the current match's current map by id."""
-    if len(ctx.args) != 1 or not ctx.args[0].isdecimal():
-        return "Invalid syntax: !mp map <beatmapid>"
+    """Change the beatmap and playmode of the room."""
+    if (
+        not 1 <= len(ctx.args) <= 2
+        or not ctx.args[0].isdecimal()
+        or (len(ctx.args) == 2 and ctx.args[1] not in ("0", "1", "2", "3"))
+    ):
+        return "Invalid syntax: !mp map <mapid> [<playmode>] (0 osu!, 1 taiko, 2 catch, 3 mania)"
 
     map_id = int(ctx.args[0])
-
-    if map_id == match.map_id:
-        return "Map already selected."
 
     bmap = await Beatmap.from_bid(map_id)
     if not bmap:
         return "Beatmap not found."
 
+    mode = bmap.mode
+    if len(ctx.args) == 2:
+        mode = GameMode(int(ctx.args[1]))
+        # only osu! maps convert to the other modes, as in the game
+        if mode != bmap.mode and bmap.mode != GameMode.VANILLA_OSU:
+            return "This map can only be played in its own mode."
+
+    if map_id == match.map_id and mode == match.mode:
+        return "Map already selected."
+
     match.map_id = bmap.id
     match.map_md5 = bmap.md5
     match.map_name = bmap.full_name
 
-    match.mode = bmap.mode
+    match.mode = mode
 
     match.enqueue_state()
     return f"Selected: {bmap.embed}."
@@ -1810,29 +1867,39 @@ async def mp_map(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_mods(ctx: Context, match: Match) -> str | None:
-    """Set the current match's mods, from string form."""
-    if len(ctx.args) != 1 or len(ctx.args[0]) % 2 != 0:
-        return "Invalid syntax: !mp mods <mods>"
+    """Remove all room mods and apply the given ones (Freemod, None allowed)."""
+    # as on bancho: "!mp mods HD DT", "!mp mods DT Freemod", "!mp mods None".
+    # a joined form like "HDDT" is still accepted
+    if not ctx.args:
+        return "Invalid syntax: !mp mods <mod> [<mod>] ... (e.g. HD DT, DT Freemod, None)"
 
-    mods = Mods.from_modstr(ctx.args[0])
+    freemod = False
+    mods = Mods.NOMOD
+    for arg in ctx.args:
+        word = arg.lower()
+        if word in ("freemod", "freemods", "fm"):
+            freemod = True
+        elif word in ("none", "nm", "nomod"):
+            continue
+        elif len(arg) % 2 == 0 and arg.isalpha():
+            parsed = Mods.from_modstr(arg)
+            if parsed == Mods.NOMOD:
+                return f"Unknown mod: {arg}"
+            mods |= parsed
+        else:
+            return f"Unknown mod: {arg}"
+
     mods = mods.filter_invalid_combos(match.mode.as_vanilla)
 
-    if match.freemods:
-        if ctx.player is match.host:
-            # allow host to set speed-changing mods.
-            match.mods = mods & SPEED_CHANGING_MODS
-
-        # set slot mods
-        slot = match.get_slot(ctx.player)
-        assert slot is not None
-
-        slot.mods = mods & ~SPEED_CHANGING_MODS
-    else:
-        # not freemods, set match mods.
-        match.mods = mods
+    # with FreeMod the room keeps only speed changing mods, players pick the rest
+    match.freemods = freemod
+    match.mods = mods & SPEED_CHANGING_MODS if freemod else mods
+    for s in match.slots:
+        if s.player is not None:
+            s.mods = Mods.NOMOD
 
     match.enqueue_state()
-    return "Match mods updated."
+    return f"Enabled {mods!r}, {'enabled' if freemod else 'disabled'} FreeMod."
 
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["fm", "fmods"])
@@ -1880,7 +1947,7 @@ async def mp_host(ctx: Context, match: Match) -> str | None:
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp host <name>"
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
+    target = _mp_find_player(ctx.args[0])
     if not target:
         return "Could not find a user by that name."
 
@@ -1912,7 +1979,7 @@ async def mp_invite(ctx: Context, match: Match) -> str | None:
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp invite <name>"
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
+    target = _mp_find_player(ctx.args[0])
     if not target:
         return "Could not find a user by that name."
 
@@ -1929,50 +1996,63 @@ async def mp_invite(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_addref(ctx: Context, match: Match) -> str | None:
-    """Add a referee to the current match by name."""
-    if len(ctx.args) != 1:
-        return "Invalid syntax: !mp addref <name>"
+    """Add referees to the room (creator only)."""
+    if not ctx.args:
+        return "Invalid syntax: !mp addref <user> [<user>] ..."
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
-    if not target:
-        return "Could not find a user by that name."
+    # like on bancho, only the creator of the room adds or removes referees
+    if ctx.player.id != match.creator_id and not ctx.player.priv & Privileges.TOURNEY_MANAGER:
+        return "Only the creator of the room can add referees."
 
-    if target not in {slot.player for slot in match.slots}:
-        return "User must be in the current match!"
+    added = []
+    for arg in ctx.args:
+        target = _mp_find_player(arg)
+        if not target:
+            return f"Could not find a user called {arg}."
+        if target is app.state.sessions.bot or match.is_ref(target):
+            continue
+        if len(match.referees) >= MP_MAX_REFEREES:
+            return f"A room can have at most {MP_MAX_REFEREES} referees."
+        match.referees.add(target)
+        added.append(target.name)
 
-    if target in match.refs:
-        return f"{target} is already a match referee!"
-
-    match.referees.add(target)
-    return f"{target.name} added to match referees."
+    if not added:
+        return "No new referees."
+    return f"Added {', '.join(added)} to the match referees."
 
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["removeref"])
 @ensure_match
 async def mp_rmref(ctx: Context, match: Match) -> str | None:
-    """Remove a referee from the current match by name."""
-    if len(ctx.args) != 1:
-        return "Invalid syntax: !mp addref <name>"
+    """Remove referees from the room (creator only)."""
+    if not ctx.args:
+        return "Invalid syntax: !mp removeref <user> [<user>] ..."
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
-    if not target:
-        return "Could not find a user by that name."
+    if ctx.player.id != match.creator_id and not ctx.player.priv & Privileges.TOURNEY_MANAGER:
+        return "Only the creator of the room can remove referees."
 
-    if target not in match.refs:
-        return f"{target} is not a match referee!"
+    removed = []
+    for arg in ctx.args:
+        target = _mp_find_player(arg)
+        if not target:
+            return f"Could not find a user called {arg}."
+        if target.id == match.creator_id:
+            return "The creator of the room is always a referee."
+        before = len(match.referees)
+        match.referees = {r for r in match.referees if r.id != target.id}
+        if len(match.referees) != before:
+            removed.append(target.name)
 
-    if target is match.host:
-        return "The host is always a referee!"
-
-    match.referees.remove(target)
-    return f"{target.name} removed from match referees."
+    if not removed:
+        return "None of them is a referee."
+    return f"Removed {', '.join(removed)} from the match referees."
 
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["listrefs"])
 @ensure_match
 async def mp_listref(ctx: Context, match: Match) -> str | None:
-    """List all referees from the current match."""
-    return ", ".join(map(str, match.refs)) + "."
+    """List the referees of the room."""
+    return "Match referees: " + ", ".join(sorted(match.ref_names())) + "."
 
 
 @mp_commands.add(Privileges.UNRESTRICTED)
@@ -2178,7 +2258,7 @@ async def mp_force(ctx: Context, match: Match) -> str | None:
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp force <name>"
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
+    target = _mp_find_player(ctx.args[0])
     if not target:
         return "Could not find a user by that name."
 
@@ -2235,12 +2315,22 @@ async def mp_unloadpool(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_ban(ctx: Context, match: Match) -> str | None:
-    """Ban a pick in the currently loaded mappool."""
+    """Ban a player from the room, or a pick of the loaded mappool (e.g. HD2)."""
     if len(ctx.args) != 1:
-        return "Invalid syntax: !mp ban <pick>"
+        return "Invalid syntax: !mp ban <user> (or <pick> with a mappool loaded)"
 
-    if not match.tourney_pool:
-        return "No pool currently selected!"
+    if not (match.tourney_pool and regexes.MAPPOOL_PICK.fullmatch(ctx.args[0])):
+        # as on bancho: the player is kicked and cannot join the room again
+        target = _mp_find_player(ctx.args[0])
+        if not target:
+            return "Could not find a user by that name."
+        if match.is_ref(target):
+            return "You can't ban a referee of the room."
+        match.banned_ids.add(target.id)
+        if target.match is match and match.get_slot(target) is not None:
+            target.leave_match()
+            target.enqueue(app.packets.dispose_match(match.id))
+        return f"Banned {target.name} from the match."
 
     mods_slot = ctx.args[0]
 
@@ -2271,12 +2361,18 @@ async def mp_ban(ctx: Context, match: Match) -> str | None:
 @mp_commands.add(Privileges.UNRESTRICTED)
 @ensure_match
 async def mp_unban(ctx: Context, match: Match) -> str | None:
-    """Unban a pick in the currently loaded mappool."""
+    """Unban a player from the room, or a pick of the loaded mappool."""
     if len(ctx.args) != 1:
-        return "Invalid syntax: !mp unban <pick>"
+        return "Invalid syntax: !mp unban <user> (or <pick> with a mappool loaded)"
 
-    if not match.tourney_pool:
-        return "No pool currently selected!"
+    if not (match.tourney_pool and regexes.MAPPOOL_PICK.fullmatch(ctx.args[0])):
+        target = _mp_find_player(ctx.args[0])
+        if not target:
+            return "Could not find a user by that name."
+        if target.id not in match.banned_ids:
+            return f"{target.name} is not banned from the match."
+        match.banned_ids.discard(target.id)
+        return f"Unbanned {target.name} from the match."
 
     mods_slot = ctx.args[0]
 
@@ -2369,7 +2465,7 @@ async def mp_kick(ctx: Context, match: Match) -> str | None:
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp kick <name>"
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
+    target = _mp_find_player(ctx.args[0])
     if not target:
         return "Could not find a user by that name."
 
@@ -2410,15 +2506,14 @@ async def mp_timer(ctx: Context, match: Match) -> str | None:
         match.chat.send_bot(msg)
 
     def _alert(t: int) -> None:
-        msg = f"Timer ends in {t} seconds."
+        msg = f"Countdown ends in {_countdown_text(t)}."
         match.chat.send_bot(msg)
 
     match.starting = {
         "start": app.state.loop.call_later(duration, _end),
         "alerts": [
             app.state.loop.call_later(duration - t, lambda t=t: _alert(t))
-            for t in (60, 30, 10, 5, 4, 3, 2, 1)
-            if t < duration
+            for t in _countdown_alerts(duration)
         ],
         "time": time.time() + duration,
     }
@@ -2501,7 +2596,7 @@ async def mp_team(ctx: Context, match: Match) -> str | None:
     if len(ctx.args) != 2 or ctx.args[1] not in ("red", "blue"):
         return "Invalid syntax: !mp team <name> <red/blue>"
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
+    target = _mp_find_player(ctx.args[0])
     if not target:
         return "Could not find a user by that name."
 
@@ -2522,7 +2617,7 @@ async def mp_move(ctx: Context, match: Match) -> str | None:
     if len(ctx.args) != 2 or not ctx.args[1].isdecimal():
         return "Invalid syntax: !mp move <name> <slot>"
 
-    target = app.state.sessions.players.get(name=ctx.args[0])
+    target = _mp_find_player(ctx.args[0])
     if not target:
         return "Could not find a user by that name."
 
