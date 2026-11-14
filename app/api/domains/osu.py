@@ -3224,6 +3224,15 @@ async def getReplay(
     if not score:
         return Response(b"", status_code=404)
 
+    # replays of restricted players: only for themselves and the staff
+    if (
+        score.player is not None
+        and score.player.restricted
+        and score.player.id != player.id
+        and not player.priv & Privileges.STAFF
+    ):
+        return Response(b"", status_code=404)
+
     file = REPLAYS_PATH / f"{score_id}.osr"
     if not file.exists():
         return Response(b"", status_code=404)

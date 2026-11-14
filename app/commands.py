@@ -376,6 +376,14 @@ async def recent(ctx: Context) -> str | None:
         target = app.state.sessions.players.get(name=" ".join(ctx.args))
         if not target:
             return "Player not found."
+
+        # restricted players are hidden from everyone but themselves and the staff
+        if (
+            target.restricted
+            and target is not ctx.player
+            and not ctx.player.priv & Privileges.STAFF
+        ):
+            return "Player not found."
     else:
         target = ctx.player
 
@@ -443,6 +451,14 @@ async def top(ctx: Context) -> str | None:
         user = await users_repo.fetch_one(id=ctx.player.id)
 
     if user is None:
+        return "Player not found."
+
+    # restricted players are hidden from everyone but themselves and the staff
+    if (
+        not user["priv"] & Privileges.UNRESTRICTED
+        and user["id"] != ctx.player.id
+        and not ctx.player.priv & Privileges.STAFF
+    ):
         return "Player not found."
 
     # !top rx!std
