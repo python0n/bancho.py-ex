@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import os
+import time
 import random
 import secrets
 import math
@@ -405,6 +406,132 @@ def _bss_evict_set_cache(set_id: int) -> None:
     for key, bmap in list(app.state.cache.beatmap.items()):
         if getattr(bmap, "set_id", None) == set_id:
             app.state.cache.beatmap.pop(key, None)
+    _bss_drop_osz(set_id)
+
+
+# ---- ready-made .osz archives of BSS sets, for /d/<set id> ----
+
+BSS_OSZ_CACHE_PATH = SystemPath.cwd() / ".data/osz-cache"
+# already compressed formats are stored as they are; deflating them again
+# only costs cpu time
+BSS_OSZ_STORED_EXTENSIONS = BSS_VIDEO_EXTENSIONS | frozenset(
+    {".mp3", ".ogg", ".jpg", ".jpeg", ".png"},
+)
+# one archive is built at a time, whatever the number of requests
+_bss_osz_build_lock = asyncio.Lock()
+
+
+def _bss_osz_path(set_id: int, no_video: bool) -> SystemPath:
+    return BSS_OSZ_CACHE_PATH / f"{set_id}{'n' if no_video else ''}.osz"
+
+
+def _bss_drop_osz(set_id: int) -> None:
+    """Remove the cached archives of a set (after an upload, or when it is gone)."""
+    for no_video in (False, True):
+        try:
+            _bss_osz_path(set_id, no_video).unlink(missing_ok=True)
+        except OSError as e:
+            log(f"[BSS] could not remove cached osz of set {set_id}: {e!r}", Ansi.LYELLOW)
+
+
+def _bss_osz_sources(
+    set_id: int,
+    maps: list[tuple[int, str]],
+    no_video: bool,
+) -> tuple[list[tuple[SystemPath, str]], float]:
+    """Files that go into the archive as (path, name inside), and the time of
+    the newest change to any of them (or to the folders they are in)."""
+    sources: list[tuple[SystemPath, str]] = []
+    newest = 0.0
+
+    for map_id, filename in maps:
+        osu_path = BEATMAPS_PATH / f"{map_id}.osu"
+        if osu_path.is_file():
+            sources.append((osu_path, filename))
+            newest = max(newest, osu_path.stat().st_mtime)
+
+    has_osu_files = bool(sources)
+
+    # audio/background/storyboard from the submissions dir, if available
+    sub_dir = SUBMISSIONS_PATH / str(set_id)
+    if sub_dir.is_dir():
+        newest = max(newest, sub_dir.stat().st_mtime)
+        for f in sorted(sub_dir.rglob("*")):
+            if f.is_dir():
+                # a removed file changes only the time of its folder
+                newest = max(newest, f.stat().st_mtime)
+                continue
+            if not f.is_file():
+                continue
+            suffix = f.suffix.lower()
+            if suffix == ".osu":
+                continue  # served from BEATMAPS_PATH above
+            if suffix in BSS_VIDEO_EXTENSIONS:
+                if no_video:
+                    continue
+            elif suffix not in BSS_ALLOWED_EXTENSIONS:
+                continue
+            sources.append((f, f.relative_to(sub_dir).as_posix()))
+            newest = max(newest, f.stat().st_mtime)
+
+    if not has_osu_files:
+        return [], 0.0
+    return sources, newest
+
+
+def _bss_build_osz_sync(
+    set_id: int,
+    maps: list[tuple[int, str]],
+    no_video: bool,
+) -> SystemPath | None:
+    import zipfile
+
+    sources, newest = _bss_osz_sources(set_id, maps, no_video)
+    target = _bss_osz_path(set_id, no_video)
+    if not sources:
+        target.unlink(missing_ok=True)
+        return None
+
+    # still current: nothing in the set changed since the archive was built
+    if target.is_file() and target.stat().st_mtime >= newest:
+        return target
+
+    BSS_OSZ_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        # written straight to disk, file by file: memory use stays small
+        # no matter how big the set is
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path, arcname in sources:
+                stored = path.suffix.lower() in BSS_OSZ_STORED_EXTENSIONS
+                zf.write(
+                    path,
+                    arcname,
+                    compress_type=zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED,
+                )
+        # the archive is dated at the moment the build began, so a file
+        # that changed while it was being built makes it out of date
+        os.utime(tmp, (started, started))
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return target
+
+
+async def _bss_get_osz(
+    set_id: int,
+    maps: list[tuple[int, str]],
+    no_video: bool,
+) -> SystemPath | None:
+    """Path of the set's .osz, built first if it is missing or out of date."""
+    async with _bss_osz_build_lock:
+        try:
+            return await asyncio.to_thread(_bss_build_osz_sync, set_id, maps, no_video)
+        except Exception as e:
+            log(f"[BSS] could not build the osz of set {set_id}: {e!r}", Ansi.LRED)
+            return None
 
 
 async def _bss_get_next_set_id() -> int:
@@ -1084,8 +1211,11 @@ async def bmsubmitGetID(
     if set_id <= 0:
         # New submission
         if not player.priv & Privileges.STAFF:
+            # only sets that hold at least one map count: a submission that
+            # was started and never uploaded must not use up the limit
             owned_sets = await app.state.services.database.fetch_val(
-                "SELECT COUNT(*) FROM bss_sets WHERE owner_id = :owner_id",
+                "SELECT COUNT(*) FROM bss_sets b WHERE b.owner_id = :owner_id "
+                "AND EXISTS (SELECT 1 FROM maps m WHERE m.set_id = b.set_id)",
                 {"owner_id": player.id},
             )
             if (owned_sets or 0) >= BSS_MAX_SETS_PER_PLAYER:
@@ -3938,51 +4068,32 @@ async def get_osz(
     except ValueError:
         set_id_int = 0
 
-    # For BSS maps, build and serve .osz from local files
+    # For BSS maps, serve a .osz built from local files. The archive is
+    # built once and kept on disk (see _bss_get_osz): this address needs no
+    # login, and building it in memory on every request (up to 300 MB)
+    # let anyone exhaust the server's memory.
     if set_id_int >= BSS_ID_OFFSET:
-        import zipfile
-        import io
-
         maps = await maps_repo.fetch_many(set_id=set_id_int)
         if not maps:
+            _bss_drop_osz(set_id_int)
             return Response(status_code=status.HTTP_404_NOT_FOUND)
 
-        buf = io.BytesIO()
-        has_files = False
+        osz_path = await _bss_get_osz(
+            set_id_int,
+            [(m["id"], m["filename"]) for m in maps],
+            no_video,
+        )
+        if osz_path is None:
+            return Response(status_code=status.HTTP_404_NOT_FOUND)
+
         first_map = maps[0]
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for m in maps:
-                osu_path = BEATMAPS_PATH / f"{m['id']}.osu"
-                if osu_path.exists():
-                    zf.writestr(m["filename"], osu_path.read_bytes())
-                    has_files = True
-
-            # Include audio/bg/storyboard from submissions dir if available
-            sub_dir = SUBMISSIONS_PATH / str(set_id_int)
-            if sub_dir.exists():
-                for f in sorted(sub_dir.rglob("*")):
-                    if not f.is_file():
-                        continue
-                    suffix = f.suffix.lower()
-                    if suffix == ".osu":
-                        continue  # served from BEATMAPS_PATH above
-                    if suffix in BSS_VIDEO_EXTENSIONS:
-                        if no_video:
-                            continue
-                    elif suffix not in BSS_ALLOWED_EXTENSIONS:
-                        continue
-                    zf.writestr(f.relative_to(sub_dir).as_posix(), f.read_bytes())
-
-        if not has_files:
-            return Response(status_code=status.HTTP_404_NOT_FOUND)
-
         osz_filename = (
             f"{first_map['artist']} - {first_map['title']} "
             f"({first_map['creator']}).osz"
         )
 
-        return Response(
-            content=buf.getvalue(),
+        return FileResponse(
+            path=osz_path,
             media_type="application/x-osu-beatmap-archive",
             headers={
                 "Content-Disposition": app.utils.content_disposition(osz_filename),
