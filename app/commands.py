@@ -1648,21 +1648,20 @@ async def _mp_make_room(ctx: Context, private: bool) -> str | None:
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["h"])
 async def mp_help(ctx: Context) -> str | None:
-    """List the multiplayer commands."""
-    # works anywhere, also in a private message to the bot, like on bancho.
-    # one short list instead of a line per command
-    p = f"{app.settings.COMMAND_PREFIX}mp"
-    return "\n".join(
-        (
-            f"{p} make <name> | makeprivate <name> | name <title> | close",
-            f"{p} invite <user> | lock | unlock | size <1-16> | set <teammode> [<scoremode>] [<size>]",
-            f"{p} move <user> <slot> | host <user> | clearhost | team <user> <red/blue> | kick <user> | ban <user> | unban <user>",
-            f"{p} map <id> [<playmode>] | mods <mod> [<mod>] ... (Freemod, None) | settings",
-            f"{p} start [<seconds>] | abort | timer [<seconds>] | aborttimer | password [<password>]",
-            f"{p} addref <user> ... | removeref <user> ... | listrefs",
-            f"Users: name with _ instead of spaces, or #<user id>. Tournament tools: {p} loadpool, pick, scrim, rematch.",
-        )
-    )
+    """Show all documented multiplayer commands the player can access."""
+    # one line per command, as before; works anywhere, also in a private
+    # message to the bot (like on bancho), not only inside a room
+    prefix = app.settings.COMMAND_PREFIX
+    cmds = []
+
+    for cmd in mp_commands.commands:
+        if not cmd.doc or ctx.player.priv & cmd.priv != cmd.priv:
+            # no doc, or insufficient permissions.
+            continue
+
+        cmds.append(f"{prefix}mp {cmd.triggers[0]}: {cmd.doc}")
+
+    return "\n".join(cmds)
 
 
 @mp_commands.add(Privileges.UNRESTRICTED, aliases=["cfg", "info"])
