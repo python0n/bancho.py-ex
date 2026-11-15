@@ -2915,9 +2915,16 @@ async def osuSubmitModularSelector(
                 if score.rank == 1 and not score.player.restricted and _is_ranked_for_first_places(score.bmap.status):
                     announce_chan = app.state.sessions.channels.get_by_name("#announce")
 
+                    # vanilla #1 goes by score, so show it next to pp; otherwise a
+                    # play with less pp but a higher score looks like a wrong #1
+                    if score.mode < GameMode.RELAX_OSU and not performance.endswith("score"):
+                        result = f"with {score.score:,} score, {score.acc:.2f}% for {performance}."
+                    else:
+                        result = f"with {score.acc:.2f}% for {performance}."
+
                     ann = [
                         f"\x01ACTION achieved #1 on {score.bmap.embed}",
-                        f"with {score.acc:.2f}% for {performance}.",
+                        result,
                     ]
 
                     if score.mods:
