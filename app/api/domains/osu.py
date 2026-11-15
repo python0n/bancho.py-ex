@@ -3625,7 +3625,7 @@ async def getScores(
         "pp" if mode >= GameMode.RELAX_OSU else "score"
     )
 
-    bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
+    bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id, background_update=True)
     has_set_id = map_set_id > 0
 
     # BSS maps: client updates BeatmapID/SetID in the .osu file after
@@ -3669,7 +3669,7 @@ async def getScores(
                         Ansi.LYELLOW,
                     )
             if already_exists:
-                bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
+                bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id, background_update=True)
             elif target is not None:
                 log(
                     f"[BSS] md5 mismatch fix: {target['md5']} -> {map_md5} "
@@ -3687,7 +3687,7 @@ async def getScores(
                     del app.state.cache.beatmapset[map_set_id]
 
             # Retry lookup with the now-corrected md5
-            bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id)
+            bmap = await Beatmap.from_md5(map_md5, set_id=map_set_id, background_update=True)
 
     if not bmap:
         # DEBUG: log BSS map lookup failures

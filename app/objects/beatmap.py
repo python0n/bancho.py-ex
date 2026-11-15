@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import hashlib
 from collections import defaultdict
@@ -395,8 +396,20 @@ class Beatmap:
     # populating the higher levels of the cache with new maps.
 
     @classmethod
-    async def from_md5(cls, md5: str, set_id: int = -1) -> Beatmap | None:
-        """Fetch a map from the cache, database, or osuapi by md5."""
+    async def from_md5(
+        cls,
+        md5: str,
+        set_id: int = -1,
+        *,
+        background_update: bool = False,
+    ) -> Beatmap | None:
+        """Fetch a map from the cache, database, or osuapi by md5.
+
+        With `background_update`, a set that is due for an osu!api check is
+        returned at once from the data we have and checked afterwards (see
+        refresh_set_in_background). Only for callers that can live with one
+        answer from slightly old data, like the in-game leaderboard.
+        """
         bmap = await cls._from_md5_cache(md5)
 
         if not bmap:
@@ -423,7 +436,10 @@ class Beatmap:
                     set_id = int(api_response[0]["beatmapset_id"])
 
             # fetch (and cache) beatmap set
-            beatmap_set = await BeatmapSet.from_bsid(set_id)
+            beatmap_set = await BeatmapSet.from_bsid(
+                set_id,
+                background_update=background_update,
+            )
 
             if beatmap_set is not None:
                 # the beatmap set has been cached - fetch beatmap from cache
@@ -435,7 +451,10 @@ class Beatmap:
 
         if bmap is not None:
             if bmap.set._cache_expired():
-                await bmap.set._update_if_available()
+                if background_update:
+                    refresh_set_in_background(bmap.set)
+                else:
+                    await bmap.set._update_if_available()
 
         return bmap
 
@@ -954,7 +973,12 @@ class BeatmapSet:
         return None
 
     @classmethod
-    async def from_bsid(cls, bsid: int) -> BeatmapSet | None:
+    async def from_bsid(
+        cls,
+        bsid: int,
+        *,
+        background_update: bool = False,
+    ) -> BeatmapSet | None:
         """Cache all maps in a set from the osuapi, optionally
         returning beatmaps by their md5 or id."""
         bmap_set = await cls._from_bsid_cache(bsid)
@@ -975,13 +999,50 @@ class BeatmapSet:
         # such as ones that're ranked on bancho and won't be updated,
         # and perhaps ones that haven't been updated in a long time.
         if not did_api_request and bmap_set._cache_expired():
-            await bmap_set._update_if_available()
+            if background_update:
+                refresh_set_in_background(bmap_set)
+            else:
+                await bmap_set._update_if_available()
 
         # cache the beatmap set, and beatmaps
         # to be efficient in future requests
         cache_beatmap_set(bmap_set)
 
         return bmap_set
+
+
+# sets whose osu!api check is running in the background right now, and the
+# tasks doing it (kept here so they are not garbage collected mid-run)
+_sets_being_refreshed: set[int] = set()
+_refresh_tasks: set[asyncio.Task[None]] = set()
+
+
+def refresh_set_in_background(bmap_set: BeatmapSet) -> None:
+    """Check a set against the osu!api without making the caller wait.
+
+    A set not checked for up to a day was checked while the in-game
+    leaderboard request waited, which made opening a map take 0.2-1 s
+    instead of a few ms. One check per set runs at a time; if it fails
+    (osu!api down) the set stays due and the next request tries again.
+    """
+    if bmap_set.id in _sets_being_refreshed:
+        return
+    _sets_being_refreshed.add(bmap_set.id)
+
+    async def run() -> None:
+        try:
+            await bmap_set._update_if_available()
+        except Exception as e:
+            log(
+                f"Background osu!api check of set {bmap_set.id} failed: {e!r}",
+                Ansi.LYELLOW,
+            )
+        finally:
+            _sets_being_refreshed.discard(bmap_set.id)
+
+    task = asyncio.create_task(run())
+    _refresh_tasks.add(task)
+    task.add_done_callback(_refresh_tasks.discard)
 
 
 def cache_beatmap(beatmap: Beatmap) -> None:
