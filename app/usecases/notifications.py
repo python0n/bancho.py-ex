@@ -28,6 +28,22 @@ STATUS_NAMES = {
     5: "loved",
 }
 
+# status -> "type" in ex:map_status_change (read by the Discord bot)
+RANK_TYPE_NAMES = {
+    -1: "unsubmit",
+    0: "unrank",
+    1: "update",
+    2: "rank",
+    3: "approve",
+    4: "qualify",
+    5: "love",
+}
+
+
+def rank_type_name(status: int) -> str:
+    """Never falls back to "unrank" - an unknown status must not look like Unranked."""
+    return RANK_TYPE_NAMES.get(int(status), "unknown")
+
 
 async def notify(user_id: int, type: str, data: dict[str, Any], link: str | None = None) -> None:
     """Add a notification; never breaks the caller."""

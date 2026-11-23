@@ -692,7 +692,13 @@ async def requests(ctx: Context) -> str | None:
     return "\n".join(l)
 
 
-_status_str_to_int_map = {"unrank": 0, "rank": 2, "love": 5}
+_status_str_to_int_map = {
+    "unrank": 0,
+    "rank": 2,
+    "approve": 3,
+    "qualify": 4,
+    "love": 5,
+}
 
 
 def status_to_id(s: str) -> int:
@@ -704,10 +710,10 @@ async def _map(ctx: Context) -> str | None:
     """Changes the ranked status of the most recently /np'ed map."""
     if (
         len(ctx.args) != 2
-        or ctx.args[0] not in ("rank", "unrank", "love")
+        or ctx.args[0] not in _status_str_to_int_map
         or ctx.args[1] not in ("set", "map")
     ):
-        return "Invalid syntax: !map <rank/unrank/love> <map/set>"
+        return "Invalid syntax: !map <rank/approve/qualify/love/unrank> <map/set>"
 
     if ctx.player.last_np is None or time.time() >= ctx.player.last_np["timeout"]:
         return "Please /np a map first!"
@@ -761,7 +767,14 @@ async def _map(ctx: Context) -> str | None:
 
         # deactivate rank requests for all ids
         await map_requests_repo.mark_batch_as_inactive(map_ids=modified_beatmap_ids)
-    data = json.dumps({"map_ids": modified_beatmap_ids, "ranktype": ranktype, "type": ctx.args[0]})
+    data = json.dumps({
+        "map_ids": modified_beatmap_ids,
+        "ranktype": ranktype,
+        "type": ctx.args[0],
+        "status": int(new_status),
+        "user_id": ctx.player.id,
+        "user_name": ctx.player.name,
+    })
     await app.state.services.redis.publish("ex:map_status_change", data)
     from app.usecases.notifications import notify_map_status_change
     await notify_map_status_change(modified_beatmap_ids, int(new_status), ctx.player.id)

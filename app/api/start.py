@@ -165,14 +165,15 @@ async def channel_rank_receiver():
                 response = await change_bm_status(beatmap_id, status, frozen)
                 log(f"EX | " + response, Ansi.LBLUE)
                 # Notify Discord bot
-                status_map = {2: "rank", 5: "love", 0: "unrank", 1: "unrank"}
-                rank_type = status_map.get(status, "unrank")
+                from app.usecases.notifications import rank_type_name
+                rank_type = rank_type_name(status)
                 await app.state.services.redis.publish(
                     "ex:map_status_change",
                     orjson.dumps({
                         "map_ids": [beatmap_id],
                         "type": rank_type,
                         "ranktype": "map",
+                        "status": int(status),
                         "user_id": data.get("user_id"),
                         "user_name": data.get("user_name"),
                     }).decode()
