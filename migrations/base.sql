@@ -245,8 +245,10 @@ create table scores
 	client_flags int not null,
 	userid int not null,
 	perfect tinyint(1) not null,
-	online_checksum char(32) not null
-);
+	online_checksum char(32) not null,
+        pinned tinyint(1) not null default 0,
+        pin_order int not null default 0
+) ENGINE=InnoDB;
 create index scores_map_md5_index
 	on scores (map_md5);
 create index scores_score_index
@@ -498,3 +500,29 @@ insert into achievements (id, file, name, `desc`, cond) values (80, 'all-intro-n
 insert into achievements (id, file, name, `desc`, cond) values (81, 'all-intro-nightcore', 'Sweet Rave Party', 'Founded in the fine tradition of changing things that were just fine as they were.', 'score.mods & 512');
 insert into achievements (id, file, name, `desc`, cond) values (82, 'all-intro-halftime', 'Slowboat', 'You got there. Eventually.', 'score.mods & 256');
 insert into achievements (id, file, name, `desc`, cond) values (83, 'all-intro-spunout', 'Burned Out', 'One cannot always spin to win.', 'score.mods & 4096');
+
+-- v5.23.0: required on first startup (historical migrations are skipped).
+CREATE TABLE IF NOT EXISTS vanilla_rank_sync (
+    userid INT NOT NULL,
+    mode TINYINT UNSIGNED NOT NULL,
+    generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    applied_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    last_country CHAR(2) NULL DEFAULT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (userid, mode),
+    KEY vanilla_rank_sync_updated_at_index (updated_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS vanilla_replay_links (
+    score_id BIGINT UNSIGNED NOT NULL,
+    pending_name VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    online_checksum CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    state TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (score_id),
+    UNIQUE KEY unique_vanilla_replay_pending (pending_name),
+    KEY idx_vanilla_replay_state_score (state, score_id),
+    CONSTRAINT fk_vanilla_replay_score
+        FOREIGN KEY (score_id) REFERENCES scores (id) ON DELETE CASCADE
+) ENGINE=InnoDB;

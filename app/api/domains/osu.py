@@ -86,6 +86,11 @@ from app.repositories import users as users_repo
 from app.repositories.achievements import Achievement
 from app.usecases import achievements as achievements_usecases
 from app.usecases import passwords
+from app.usecases.vanilla_scoring import commit_vanilla_score, DuplicateVanillaScore
+from app.usecases.vanilla_replay import stage_vanilla_replay
+from app.usecases.vanilla_replay_links_preview import (
+    make_replay_intent, finalize_linked_replay,
+)
 from app.usecases import user_achievements as user_achievements_usecases
 from app.utils import escape_enum
 from app.utils import pymysql_encode
@@ -2101,6 +2106,10 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
 
             # all data read from submission.
             # now we can calculate things based on our data.
+            _vanilla_submission = score.mode < GameMode.RELAX_OSU
+            if _vanilla_submission:
+                score.pp, score.sr = 0.0, 0.0
+                score.status = SubmissionStatus.SUBMITTED if score.passed else SubmissionStatus.FAILED
             score.acc = score.calculate_accuracy()
 
             osu_file_available = await ensure_osu_file_is_available(
@@ -2114,12 +2123,12 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                     log(f"[BSS] PP calc failed for map {bmap.id}: {e}", Ansi.LYELLOW)
                     score.pp, score.sr = 0.0, 0.0
 
-                if score.passed:
+                if score.passed and not _vanilla_submission:
                     await score.calculate_status()
 
                     if score.bmap.status != RankedStatus.Pending:
                         score.rank = await score.calculate_placement()
-                else:
+                elif not score.passed:
                     score.status = SubmissionStatus.FAILED
 
             score.time_elapsed = score_time if score.passed else fail_time
@@ -2142,6 +2151,41 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         score.player.logout()
 
             """ Score submission checks completed; submit the score. """
+            _vanilla_replay_data = b""
+            if _vanilla_submission:
+                _staged_replay = None
+                if score.passed:
+                    _vanilla_replay_data = await replay_file.read()
+                    if len(_vanilla_replay_data) < 24:
+                        # Reject passed vanilla score without a durable replay.
+                        return Response(b"error: no")
+                    _staged_replay = await asyncio.to_thread(stage_vanilla_replay, 
+                        REPLAYS_PATH, score.client_checksum, _vanilla_replay_data
+                    )
+                _replay_intent = (
+                    await asyncio.to_thread(make_replay_intent, _staged_replay, score.client_checksum, _vanilla_replay_data)
+                    if _staged_replay is not None else None
+                )
+                try:
+                    _vanilla_prev_stats = await commit_vanilla_score(
+                        score, replay_intent=_replay_intent, announce_global_rank=True
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, DuplicateVanillaScore):
+                        if _staged_replay is not None:
+                            await asyncio.to_thread(_staged_replay.discard)
+                        return Response(b"error: no")
+                    raise
+                if _staged_replay is not None:
+                    try:
+                        await asyncio.to_thread(finalize_linked_replay, _staged_replay, score.id, _replay_intent)
+                    except OSError as exc:
+                        # SQL already committed; keep the staged .osr for the
+                        # housekeeping recovery worker rather than return HTTP 500.
+                        log(
+                            f"[vanilla-replay] score {score.id} replay pending: "
+                            f"{type(exc).__name__}", Ansi.LRED,
+                        )
 
             if app.state.services.datadog:
                 app.state.services.datadog.increment("bancho.submitted_scores")
@@ -2149,14 +2193,15 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
             if app.metrics.enabled:
                 app.metrics.increment("ex_submitted_scores")
 
-            if score.status == SubmissionStatus.BEST:
-                if app.state.services.datadog:
-                    app.state.services.datadog.increment("bancho.submitted_scores_best")
-                
-                if app.metrics.enabled:
-                    app.metrics.increment("ex_submitted_scores_best")
+            if score.status == SubmissionStatus.BEST or (_vanilla_submission and score.leaderboard_best):
+                # BEST tracks PP; vanilla leaderboard notifications track raw score.
+                if score.status == SubmissionStatus.BEST:
+                    if app.state.services.datadog:
+                        app.state.services.datadog.increment("bancho.submitted_scores_best")
+                    if app.metrics.enabled:
+                        app.metrics.increment("ex_submitted_scores_best")
 
-                if score.bmap.has_leaderboard:
+                if score.bmap.has_leaderboard and (not _vanilla_submission or score.leaderboard_best):
                     if score.bmap.status == RankedStatus.Loved and score.mode in (
                         GameMode.VANILLA_OSU,
                         GameMode.VANILLA_TAIKO,
@@ -2173,29 +2218,34 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         ),
                     )
 
-                    if score.rank == 1 and not score.player.restricted and score.status == 2 and _is_ranked_for_first_places(score.bmap.status):
+                    if score.rank == 1 and not score.player.restricted and _is_ranked_for_first_places(score.bmap.status):
                         announce_chan = app.state.sessions.channels.get_by_name("#announce")
 
                         ann = [
                             f"\x01ACTION achieved #1 on {score.bmap.embed}",
-                            f"with {score.acc:.2f}% for {performance}.",
+                            (
+                                f"with {score.score:,} score, {score.acc:.2f}% for {performance}."
+                                if _vanilla_submission and score.bmap.status != RankedStatus.Loved
+                                else f"with {score.acc:.2f}% for {performance}."
+                            ),
                         ]
 
                         if score.mods:
                             ann.insert(1, f"+{_fmt_mods_for_announce(score.mods)}")
 
-                        scoring_metric = (
-                            "pp"
-                        )
+                        scoring_metric = "score" if _vanilla_submission else "pp"
 
                         # If there was previously a score on the map, add old #1.
                         prev_n1 = await app.state.services.database.fetch_one(
                             "SELECT u.id, name FROM users u "
                             "INNER JOIN scores s ON u.id = s.userid "
                             "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
-                            "AND s.status = 2 AND u.priv & 1 "
-                            f"ORDER BY s.{scoring_metric} DESC LIMIT 1",
-                            {"map_md5": score.bmap.md5, "mode": score.mode},
+                            + ("AND s.status IN (1, 2, 3) AND s.id <> :new_id "
+                               if _vanilla_submission else "AND s.status = 2 ")
+                            + "AND u.priv & 1 "
+                            + f"ORDER BY s.{scoring_metric} DESC LIMIT 1",
+                            {"map_md5": score.bmap.md5, "mode": score.mode,
+                             **({"new_id": score.id} if _vanilla_submission else {})},
                         )
 
                         if prev_n1:
@@ -2208,8 +2258,19 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                                     ),
                                 )
 
-                        assert announce_chan is not None
-                        announce_chan.send(" ".join(ann), sender=score.player, to_self=True)
+                        if _vanilla_submission:
+                            # Optional announcement: the score is already committed.
+                            if announce_chan is not None:
+                                try:
+                                    announce_chan.send(" ".join(ann), sender=score.player, to_self=True)
+                                except Exception as exc:
+                                    log(f"[vanilla-scoring] #announce send failed: {type(exc).__name__}", Ansi.LRED)
+                            else:
+                                log("[vanilla-scoring] #announce channel unavailable", Ansi.LYELLOW)
+                        else:
+                            # Preserve the existing RX/AP path verbatim.
+                            assert announce_chan is not None
+                            announce_chan.send(" ".join(ann), sender=score.player, to_self=True)
 
                         if(app.settings.ENABLE_FIRST_PLACES_WEBHOOK):
                             embed = Embed(
@@ -2247,15 +2308,76 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
 
                 # this score is our best score.
                 # Lock + reset + INSERT atomowo w jednej transakcji.
-                pp_db = pp_to_db(score.pp)
-                async with app.state.services.database.transaction():
-                    await app.state.services.database.fetch_one(
-                        "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
-                        {"user_id": score.player.id},
-                    )
+                if not _vanilla_submission:
+                    pp_db = pp_to_db(score.pp)
+                    async with app.state.services.database.transaction():
+                        await app.state.services.database.fetch_one(
+                            "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
+                            {"user_id": score.player.id},
+                        )
+                        await app.state.services.database.execute(
+                            "UPDATE scores SET status = 1 "
+                            "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                            "AND userid = :user_id AND mode = :mode",
+                            {
+                                "map_md5": score.bmap.md5,
+                                "user_id": score.player.id,
+                                "mode": score.mode,
+                            },
+                        )
+                        old_score_best = await app.state.services.database.fetch_one(
+                            "SELECT id, score FROM scores "
+                            "WHERE map_md5 = :map_md5 AND userid = :user_id "
+                            "AND mode = :mode AND status = 1 "
+                            "ORDER BY score DESC LIMIT 1",
+                            {"map_md5": score.bmap.md5, "user_id": score.player.id, "mode": score.mode},
+                        )
+                        if old_score_best and old_score_best["score"] > score.score:
+                            await app.state.services.database.execute(
+                                "UPDATE scores SET status = 3 WHERE id = :id",
+                                {"id": old_score_best["id"]},
+                            )
+                        score.id = await app.state.services.database.execute(
+                            "INSERT INTO scores "
+                            "VALUES (NULL, "
+                            ":map_md5, :score, :pp, :acc, "
+                            ":max_combo, :mods, :n300, :n100, "
+                            ":n50, :nmiss, :ngeki, :nkatu, "
+                            ":grade, :status, :mode, :play_time, "
+                            ":time_elapsed, :client_flags, :user_id, :perfect, "
+                            ":checksum, 0, 0)",
+                            {
+                                "map_md5": score.bmap.md5,
+                                "score": score.score,
+                                "pp": pp_db,
+                                "acc": score.acc,
+                                "max_combo": score.max_combo,
+                                "mods": score.mods,
+                                "n300": score.n300,
+                                "n100": score.n100,
+                                "n50": score.n50,
+                                "nmiss": score.nmiss,
+                                "ngeki": score.ngeki,
+                                "nkatu": score.nkatu,
+                                "grade": score.grade.name,
+                                "status": score.status,
+                                "mode": score.mode,
+                                "play_time": score.server_time,
+                                "time_elapsed": score.time_elapsed,
+                                "client_flags": score.client_flags,
+                                "user_id": score.player.id,
+                                "perfect": score.perfect,
+                                "checksum": score.client_checksum,
+                            },
+                        )
+
+            if not _vanilla_submission:
+                if score.status == SubmissionStatus.SCORE_BEST:
+                    # Nowy score ma wyzszy score value ale nizsze PP.
+                    # Zdegraduj stary SCORE_BEST do SUBMITTED.
                     await app.state.services.database.execute(
                         "UPDATE scores SET status = 1 "
-                        "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                        "WHERE status = 3 AND map_md5 = :map_md5 "
                         "AND userid = :user_id AND mode = :mode",
                         {
                             "map_md5": score.bmap.md5,
@@ -2263,18 +2385,9 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                             "mode": score.mode,
                         },
                     )
-                    old_score_best = await app.state.services.database.fetch_one(
-                        "SELECT id, score FROM scores "
-                        "WHERE map_md5 = :map_md5 AND userid = :user_id "
-                        "AND mode = :mode AND status = 1 "
-                        "ORDER BY score DESC LIMIT 1",
-                        {"map_md5": score.bmap.md5, "user_id": score.player.id, "mode": score.mode},
-                    )
-                    if old_score_best and old_score_best["score"] > score.score:
-                        await app.state.services.database.execute(
-                            "UPDATE scores SET status = 3 WHERE id = :id",
-                            {"id": old_score_best["id"]},
-                        )
+
+                if not score.id:
+                    pp_db = pp_to_db(score.pp)
                     score.id = await app.state.services.database.execute(
                         "INSERT INTO scores "
                         "VALUES (NULL, "
@@ -2309,67 +2422,24 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
                         },
                     )
 
-            if score.status == SubmissionStatus.SCORE_BEST:
-                # Nowy score ma wyzszy score value ale nizsze PP.
-                # Zdegraduj stary SCORE_BEST do SUBMITTED.
-                await app.state.services.database.execute(
-                    "UPDATE scores SET status = 1 "
-                    "WHERE status = 3 AND map_md5 = :map_md5 "
-                    "AND userid = :user_id AND mode = :mode",
-                    {
-                        "map_md5": score.bmap.md5,
-                        "user_id": score.player.id,
-                        "mode": score.mode,
-                    },
-                )
-
-            if not score.id:
-                pp_db = pp_to_db(score.pp)
-                score.id = await app.state.services.database.execute(
-                    "INSERT INTO scores "
-                    "VALUES (NULL, "
-                    ":map_md5, :score, :pp, :acc, "
-                    ":max_combo, :mods, :n300, :n100, "
-                    ":n50, :nmiss, :ngeki, :nkatu, "
-                    ":grade, :status, :mode, :play_time, "
-                    ":time_elapsed, :client_flags, :user_id, :perfect, "
-                    ":checksum, 0, 0)",
-                    {
-                        "map_md5": score.bmap.md5,
-                        "score": score.score,
-                        "pp": pp_db,
-                        "acc": score.acc,
-                        "max_combo": score.max_combo,
-                        "mods": score.mods,
-                        "n300": score.n300,
-                        "n100": score.n100,
-                        "n50": score.n50,
-                        "nmiss": score.nmiss,
-                        "ngeki": score.ngeki,
-                        "nkatu": score.nkatu,
-                        "grade": score.grade.name,
-                        "status": score.status,
-                        "mode": score.mode,
-                        "play_time": score.server_time,
-                        "time_elapsed": score.time_elapsed,
-                        "client_flags": score.client_flags,
-                        "user_id": score.player.id,
-                        "perfect": score.perfect,
-                        "checksum": score.client_checksum,
-                    },
-                )
-
-            await app.state.services.redis.publish("ex:submit", score.toJSON())
+            if _vanilla_submission:
+                try:
+                    await app.state.services.redis.publish("ex:submit", score.toJSON())
+                except Exception as exc:
+                    log(f"[vanilla-scoring] post-commit Redis publish failed: {exc}", Ansi.LRED)
+            else:
+                await app.state.services.redis.publish("ex:submit", score.toJSON())
             
 
         if score.passed:
-            replay_data = await replay_file.read()
+            replay_data = (_vanilla_replay_data if _vanilla_submission else await replay_file.read())
 
             MIN_REPLAY_SIZE = 24
 
             if len(replay_data) >= MIN_REPLAY_SIZE:
-                replay_disk_file = REPLAYS_PATH / f"{score.id}.osr"
-                replay_disk_file.write_bytes(replay_data)
+                if not _vanilla_submission:
+                    replay_disk_file = REPLAYS_PATH / f"{score.id}.osr"
+                    replay_disk_file.write_bytes(replay_data)
             else:
                 log(f"{score.player} submitted a score without a replay!", Ansi.LRED)
 
@@ -2386,161 +2456,163 @@ if(not app.settings.DISALLOW_OLD_CLIENTS):
         # get the current stats, and take a
         # shallow copy for the response charts.
         stats = score.player.stats[score.mode]
-        prev_stats = copy.copy(stats)
+        prev_stats = _vanilla_prev_stats if _vanilla_submission else copy.copy(stats)
 
-        # stuff update for all submitted scores
-        stats.playtime += score.time_elapsed // 1000
-        stats.plays += 1
-        stats.tscore += score.score
-        stats.total_hits += score.n300 + score.n100 + score.n50
+        if not _vanilla_submission:
+            # stuff update for all submitted scores
+            stats.playtime += score.time_elapsed // 1000
+            stats.plays += 1
+            stats.tscore += score.score
+            stats.total_hits += score.n300 + score.n100 + score.n50
 
-        if score.mode.as_vanilla in (1, 3):
-            # taiko uses geki & katu for hitting big notes with 2 keys
-            # mania uses geki & katu for rainbow 300 & 200
-            stats.total_hits += score.ngeki + score.nkatu
+            if score.mode.as_vanilla in (1, 3):
+                # taiko uses geki & katu for hitting big notes with 2 keys
+                # mania uses geki & katu for rainbow 300 & 200
+                stats.total_hits += score.ngeki + score.nkatu
 
-        stats_updates: dict[str, Any] = {
-            "plays": stats.plays,
-            "playtime": stats.playtime,
-            "tscore": stats.tscore,
-            "total_hits": stats.total_hits,
-        }
+            stats_updates: dict[str, Any] = {
+                "plays": stats.plays,
+                "playtime": stats.playtime,
+                "tscore": stats.tscore,
+                "total_hits": stats.total_hits,
+            }
 
-        if score.passed and score.bmap.has_leaderboard:
-            # player passed & map is ranked, approved, or loved.
+            if score.passed and score.bmap.has_leaderboard:
+                # player passed & map is ranked, approved, or loved.
 
-            if score.max_combo > stats.max_combo:
-                stats.max_combo = score.max_combo
-                stats_updates["max_combo"] = stats.max_combo
+                if score.max_combo > stats.max_combo:
+                    stats.max_combo = score.max_combo
+                    stats_updates["max_combo"] = stats.max_combo
 
-            if score.bmap.awards_ranked_pp and score.status == SubmissionStatus.BEST:
-                # map is ranked or approved, and it's our (new)
-                # best score on the map. update the player's
-                # ranked score, grades, pp, acc and global rank.
+                if score.bmap.awards_ranked_pp and score.status == SubmissionStatus.BEST:
+                    # map is ranked or approved, and it's our (new)
+                    # best score on the map. update the player's
+                    # ranked score, grades, pp, acc and global rank.
 
-                additional_rscore = score.score
-                if score.prev_best:
-                    # we previously had a score, so remove
-                    # it's score from our ranked score.
-                    additional_rscore -= score.prev_best.score
+                    additional_rscore = score.score
+                    if score.prev_best:
+                        # we previously had a score, so remove
+                        # it's score from our ranked score.
+                        additional_rscore -= score.prev_best.score
 
-                    if score.grade != score.prev_best.grade:
+                        if score.grade != score.prev_best.grade:
+                            if score.grade >= Grade.A:
+                                stats.grades[score.grade] += 1
+                                grade_col = format(score.grade, "stats_column")
+                                stats_updates[grade_col] = stats.grades[score.grade]
+
+                            if score.prev_best.grade >= Grade.A:
+                                stats.grades[score.prev_best.grade] -= 1
+                                grade_col = format(score.prev_best.grade, "stats_column")
+                                stats_updates[grade_col] = stats.grades[score.prev_best.grade]
+                    else:
+                        # this is our first submitted score on the map
                         if score.grade >= Grade.A:
                             stats.grades[score.grade] += 1
                             grade_col = format(score.grade, "stats_column")
                             stats_updates[grade_col] = stats.grades[score.grade]
 
-                        if score.prev_best.grade >= Grade.A:
-                            stats.grades[score.prev_best.grade] -= 1
-                            grade_col = format(score.prev_best.grade, "stats_column")
-                            stats_updates[grade_col] = stats.grades[score.prev_best.grade]
-                else:
-                    # this is our first submitted score on the map
-                    if score.grade >= Grade.A:
-                        stats.grades[score.grade] += 1
-                        grade_col = format(score.grade, "stats_column")
-                        stats_updates[grade_col] = stats.grades[score.grade]
+                    stats.rscore += additional_rscore
+                    stats_updates["rscore"] = stats.rscore
 
-                stats.rscore += additional_rscore
-                stats_updates["rscore"] = stats.rscore
+                    # fetch scores sorted by pp for total acc/pp calc
+                    # NOTE: we select all plays (and not just top100)
+                    # because bonus pp counts the total amount of ranked
+                    # scores. I'm aware this scales horribly, and it'll
+                    # likely be split into two queries in the future.
+                    best_scores = await app.state.services.database.fetch_all(
+                        "SELECT s.pp, s.acc FROM scores s "
+                        "INNER JOIN maps m ON s.map_md5 = m.md5 "
+                        "WHERE s.userid = :user_id AND s.mode = :mode "
+                        "AND s.status = 2 AND m.status IN (2, 3) "  # ranked, approved
+                        "ORDER BY s.pp DESC",
+                        {"user_id": score.player.id, "mode": score.mode},
+                    )
 
-                # fetch scores sorted by pp for total acc/pp calc
-                # NOTE: we select all plays (and not just top100)
-                # because bonus pp counts the total amount of ranked
-                # scores. I'm aware this scales horribly, and it'll
-                # likely be split into two queries in the future.
-                best_scores = await app.state.services.database.fetch_all(
-                    "SELECT s.pp, s.acc FROM scores s "
-                    "INNER JOIN maps m ON s.map_md5 = m.md5 "
-                    "WHERE s.userid = :user_id AND s.mode = :mode "
-                    "AND s.status = 2 AND m.status IN (2, 3) "  # ranked, approved
-                    "ORDER BY s.pp DESC",
-                    {"user_id": score.player.id, "mode": score.mode},
-                )
+                    # calculate new total weighted accuracy
+                    weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
+                    bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
+                    stats.acc = (weighted_acc * bonus_acc) / 100
+                    stats_updates["acc"] = stats.acc
 
-                # calculate new total weighted accuracy
-                weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
-                bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
-                stats.acc = (weighted_acc * bonus_acc) / 100
-                stats_updates["acc"] = stats.acc
+                    # calculate new total weighted pp
+                    weighted_pp = sum(pp_to_float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
+                    bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
+                    stats.pp = round(weighted_pp + bonus_pp)
+                    stats_updates["pp"] = stats.pp
 
-                # calculate new total weighted pp
-                weighted_pp = sum(pp_to_float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
-                bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
-                stats.pp = round(weighted_pp + bonus_pp)
-                stats_updates["pp"] = stats.pp
+                    # update global & country ranking
+                    stats.rank = await score.player.update_rank(score.mode)
 
-                # update global & country ranking
-                stats.rank = await score.player.update_rank(score.mode)
+                    # --- global rank announce ---
+                    if (
+                        not score.player.restricted
+                        and stats.rank > 0
+                        and stats.rank <= 50
+                        and (prev_stats.rank == 0 or stats.rank < prev_stats.rank)
+                    ):
+                        _ann_chan = app.state.sessions.channels.get_by_name("#announce")
+                        if _ann_chan:
+                            import json as _json
+                            _displaced_ids = await app.state.services.redis.zrevrange(
+                                f"bancho:leaderboard:{score.mode.value}",
+                                stats.rank,  # 0-indexed = rank+1 po naszym wejściu
+                                stats.rank,
+                            )
+                            _prev_name: str | None = None
+                            if _displaced_ids:
+                                _prev_id = int(_displaced_ids[0])
+                                _prev_player = app.state.sessions.players.get(id=_prev_id)
+                                if _prev_player:
+                                    _prev_name = _prev_player.name
+                                else:
+                                    _row = await app.state.services.database.fetch_one(
+                                        "SELECT name FROM users WHERE id = :id", {"id": _prev_id}
+                                    )
+                                    if _row:
+                                        _prev_name = _row["name"]
+                            _ann_msg = f"\x01ACTION achieved global rank #{stats.rank}"
+                            if _prev_name:
+                                _ann_msg += f" (Previous: {_prev_name})"
+                            _ann_chan.send(_ann_msg, sender=score.player, to_self=True)
+                    # --- end global rank announce ---
 
-                # --- global rank announce ---
-                if (
-                    not score.player.restricted
-                    and stats.rank > 0
-                    and stats.rank <= 50
-                    and (prev_stats.rank == 0 or stats.rank < prev_stats.rank)
-                ):
-                    _ann_chan = app.state.sessions.channels.get_by_name("#announce")
-                    if _ann_chan:
-                        import json as _json
-                        _displaced_ids = await app.state.services.redis.zrevrange(
-                            f"bancho:leaderboard:{score.mode.value}",
-                            stats.rank,  # 0-indexed = rank+1 po naszym wejściu
-                            stats.rank,
-                        )
-                        _prev_name: str | None = None
-                        if _displaced_ids:
-                            _prev_id = int(_displaced_ids[0])
-                            _prev_player = app.state.sessions.players.get(id=_prev_id)
-                            if _prev_player:
-                                _prev_name = _prev_player.name
-                            else:
-                                _row = await app.state.services.database.fetch_one(
-                                    "SELECT name FROM users WHERE id = :id", {"id": _prev_id}
-                                )
-                                if _row:
-                                    _prev_name = _row["name"]
-                        _ann_msg = f"\x01ACTION achieved global rank #{stats.rank}"
-                        if _prev_name:
-                            _ann_msg += f" (Previous: {_prev_name})"
-                        _ann_chan.send(_ann_msg, sender=score.player, to_self=True)
-                # --- end global rank announce ---
-
-        await stats_repo.partial_update(
-            score.player.id,
-            score.mode.value,
-            plays=stats_updates.get("plays", UNSET),
-            playtime=stats_updates.get("playtime", UNSET),
-            tscore=stats_updates.get("tscore", UNSET),
-            total_hits=stats_updates.get("total_hits", UNSET),
-            max_combo=stats_updates.get("max_combo", UNSET),
-            xh_count=stats_updates.get("xh_count", UNSET),
-            x_count=stats_updates.get("x_count", UNSET),
-            sh_count=stats_updates.get("sh_count", UNSET),
-            s_count=stats_updates.get("s_count", UNSET),
-            a_count=stats_updates.get("a_count", UNSET),
-            rscore=stats_updates.get("rscore", UNSET),
-            acc=stats_updates.get("acc", UNSET),
-            pp=stats_updates.get("pp", UNSET),
-        )
+            await stats_repo.partial_update(
+                score.player.id,
+                score.mode.value,
+                plays=stats_updates.get("plays", UNSET),
+                playtime=stats_updates.get("playtime", UNSET),
+                tscore=stats_updates.get("tscore", UNSET),
+                total_hits=stats_updates.get("total_hits", UNSET),
+                max_combo=stats_updates.get("max_combo", UNSET),
+                xh_count=stats_updates.get("xh_count", UNSET),
+                x_count=stats_updates.get("x_count", UNSET),
+                sh_count=stats_updates.get("sh_count", UNSET),
+                s_count=stats_updates.get("s_count", UNSET),
+                a_count=stats_updates.get("a_count", UNSET),
+                rscore=stats_updates.get("rscore", UNSET),
+                acc=stats_updates.get("acc", UNSET),
+                pp=stats_updates.get("pp", UNSET),
+            )
 
         if not score.player.restricted:
             # enqueue new stats info to all other users
             app.state.sessions.players.enqueue(app.packets.user_stats(score.player))
 
-            # update beatmap with new stats
-            score.bmap.plays += 1
-            if score.passed:
-                score.bmap.passes += 1
+            if not _vanilla_submission:
+                # update beatmap with new stats
+                score.bmap.plays += 1
+                if score.passed:
+                    score.bmap.passes += 1
 
-            await app.state.services.database.execute(
-                "UPDATE maps SET plays = :plays, passes = :passes WHERE md5 = :map_md5",
-                {
-                    "plays": score.bmap.plays,
-                    "passes": score.bmap.passes,
-                    "map_md5": score.bmap.md5,
-                },
-            )
+                await app.state.services.database.execute(
+                    "UPDATE maps SET plays = :plays, passes = :passes WHERE md5 = :map_md5",
+                    {
+                        "plays": score.bmap.plays,
+                        "passes": score.bmap.passes,
+                        "map_md5": score.bmap.md5,
+                    },
+                )
 
         # update their recent score
         score.player.recent_scores[score.mode] = score
@@ -2844,6 +2916,10 @@ async def osuSubmitModularSelector(
 
         # all data read from submission.
         # now we can calculate things based on our data.
+        _vanilla_submission = score.mode < GameMode.RELAX_OSU
+        if _vanilla_submission:
+            score.pp, score.sr = 0.0, 0.0
+            score.status = SubmissionStatus.SUBMITTED if score.passed else SubmissionStatus.FAILED
         score.acc = score.calculate_accuracy()
 
         osu_file_available = await ensure_osu_file_is_available(
@@ -2858,12 +2934,12 @@ async def osuSubmitModularSelector(
                 score.pp, score.sr = 0.0, 0.0
             score.pp = pp_to_float(score.pp)  # clamp/normalize for DECIMAL and safety
 
-            if score.passed:
+            if score.passed and not _vanilla_submission:
                 await score.calculate_status()
 
                 if score.bmap.status != RankedStatus.Pending:
                     score.rank = await score.calculate_placement()
-            else:
+            elif not score.passed:
                 score.status = SubmissionStatus.FAILED
 
         score.time_elapsed = score_time if score.passed else fail_time
@@ -2885,6 +2961,41 @@ async def osuSubmitModularSelector(
                     score.player.logout()
 
         """ Score submission checks completed; submit the score. """
+        _vanilla_replay_data = b""
+        if _vanilla_submission:
+            _staged_replay = None
+            if score.passed:
+                _vanilla_replay_data = await replay_file.read()
+                if len(_vanilla_replay_data) < 24:
+                    # Reject passed vanilla score without a durable replay.
+                    return Response(b"error: no")
+                _staged_replay = await asyncio.to_thread(stage_vanilla_replay, 
+                    REPLAYS_PATH, score.client_checksum, _vanilla_replay_data
+                )
+            _replay_intent = (
+                await asyncio.to_thread(make_replay_intent, _staged_replay, score.client_checksum, _vanilla_replay_data)
+                if _staged_replay is not None else None
+            )
+            try:
+                _vanilla_prev_stats = await commit_vanilla_score(
+                    score, replay_intent=_replay_intent, announce_global_rank=True
+                )
+            except BaseException as exc:
+                if isinstance(exc, DuplicateVanillaScore):
+                    if _staged_replay is not None:
+                        await asyncio.to_thread(_staged_replay.discard)
+                    return Response(b"error: no")
+                raise
+            if _staged_replay is not None:
+                try:
+                    await asyncio.to_thread(finalize_linked_replay, _staged_replay, score.id, _replay_intent)
+                except OSError as exc:
+                    # SQL already committed; keep the staged .osr for the
+                    # housekeeping recovery worker rather than return HTTP 500.
+                    log(
+                        f"[vanilla-replay] score {score.id} replay pending: "
+                        f"{type(exc).__name__}", Ansi.LRED,
+                    )
 
         if app.state.services.datadog:
             app.state.services.datadog.increment("bancho.submitted_scores")  # type: ignore[no-untyped-call]
@@ -2939,10 +3050,12 @@ async def osuSubmitModularSelector(
                         "SELECT u.id, name FROM users u "
                         "INNER JOIN scores s ON u.id = s.userid "
                         "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
-                        + ("AND s.status = 2 " if scoring_metric == "pp" else "AND s.status IN (2, 3) ")
+                        + ("AND s.status = 2 " if scoring_metric == "pp"
+                           else "AND s.status IN (1, 2, 3) AND s.id <> :new_id ")
                         + "AND u.priv & 1 "
-                        f"ORDER BY s.{scoring_metric} DESC LIMIT 1",
-                        {"map_md5": score.bmap.md5, "mode": score.mode},
+                        + f"ORDER BY s.{scoring_metric} DESC LIMIT 1",
+                        {"map_md5": score.bmap.md5, "mode": score.mode,
+                         **({"new_id": score.id} if _vanilla_submission else {})},
                     )
 
                     if prev_n1:
@@ -2958,8 +3071,19 @@ async def osuSubmitModularSelector(
                         from app.usecases.notifications import notify_first_place_lost
                         await notify_first_place_lost(dict(prev_n1), score.player.id, score.player.name, score.bmap)
 
-                    assert announce_chan is not None
-                    announce_chan.send(" ".join(ann), sender=score.player, to_self=True)
+                    if _vanilla_submission:
+                        # Optional announcement: the score is already committed.
+                        if announce_chan is not None:
+                            try:
+                                announce_chan.send(" ".join(ann), sender=score.player, to_self=True)
+                            except Exception as exc:
+                                log(f"[vanilla-scoring] #announce send failed: {type(exc).__name__}", Ansi.LRED)
+                        else:
+                            log("[vanilla-scoring] #announce channel unavailable", Ansi.LYELLOW)
+                    else:
+                        # Preserve the existing RX/AP path verbatim.
+                        assert announce_chan is not None
+                        announce_chan.send(" ".join(ann), sender=score.player, to_self=True)
 
                     if(app.settings.ENABLE_FIRST_PLACES_WEBHOOK):
                         embed = Embed(
@@ -3004,92 +3128,45 @@ async def osuSubmitModularSelector(
                 app.metrics.increment("ex_submitted_scores_best")
             # this score is our best score.
             # Lock + reset WSZYSTKICH BEST/SCORE_BEST + INSERT atomowo.
-            pp_db = pp_to_db(score.pp)
-            async with app.state.services.database.transaction():
-                await app.state.services.database.fetch_one(
-                    "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
-                    {"user_id": score.player.id},
-                )
-                await app.state.services.database.execute(
-                    "UPDATE scores SET status = 1 "
-                    "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
-                    "AND userid = :user_id AND mode = :mode",
-                    {
-                        "map_md5": score.bmap.md5,
-                        "user_id": score.player.id,
-                        "mode": score.mode,
-                    },
-                )
-                old_score_best = await app.state.services.database.fetch_one(
-                    "SELECT id, score FROM scores "
-                    "WHERE map_md5 = :map_md5 AND userid = :user_id "
-                    "AND mode = :mode AND status = 1 "
-                    "ORDER BY score DESC LIMIT 1",
-                    {"map_md5": score.bmap.md5, "user_id": score.player.id, "mode": score.mode},
-                )
-                if old_score_best and old_score_best["score"] > score.score:
-                    await app.state.services.database.execute(
-                        "UPDATE scores SET status = 3 WHERE id = :id",
-                        {"id": old_score_best["id"]},
+            if not _vanilla_submission:
+                pp_db = pp_to_db(score.pp)
+                async with app.state.services.database.transaction():
+                    await app.state.services.database.fetch_one(
+                        "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
+                        {"user_id": score.player.id},
                     )
-                score.id = await app.state.services.database.execute(
-                    "INSERT INTO scores "
-                    "VALUES (NULL, "
-                    ":map_md5, :score, :pp, :acc, "
-                    ":max_combo, :mods, :n300, :n100, "
-                    ":n50, :nmiss, :ngeki, :nkatu, "
-                    ":grade, :status, :mode, :play_time, "
-                    ":time_elapsed, :client_flags, :user_id, :perfect, "
-                    ":checksum, 0, 0)",
-                    {
-                "map_md5": score.bmap.md5,
-                "score": score.score,
-                "pp": pp_db,
-                "acc": score.acc,
-                "max_combo": score.max_combo,
-                "mods": score.mods,
-                "n300": score.n300,
-                "n100": score.n100,
-                "n50": score.n50,
-                "nmiss": score.nmiss,
-                "ngeki": score.ngeki,
-                "nkatu": score.nkatu,
-                "grade": score.grade.name,
-                "status": score.status,
-                "mode": score.mode,
-                "play_time": score.server_time,
-                "time_elapsed": score.time_elapsed,
-                "client_flags": score.client_flags,
-                "user_id": score.player.id,
-                "perfect": score.perfect,
-                "checksum": score.client_checksum,
-            },
-        )
-
-        if score.status == SubmissionStatus.SCORE_BEST:
-            # Zdegraduj stary SCORE_BEST do SUBMITTED (przed INSERT nowego).
-            await app.state.services.database.execute(
-                "UPDATE scores SET status = 1 "
-                "WHERE status = 3 AND map_md5 = :map_md5 "
-                "AND userid = :user_id AND mode = :mode",
-                {
-                    "map_md5": score.bmap.md5,
-                    "user_id": score.player.id,
-                    "mode": score.mode,
-                },
-            )
-        if not score.id:
-            pp_db = pp_to_db(score.pp)
-            score.id = await app.state.services.database.execute(
-                "INSERT INTO scores "
-                "VALUES (NULL, "
-                ":map_md5, :score, :pp, :acc, "
-                ":max_combo, :mods, :n300, :n100, "
-                ":n50, :nmiss, :ngeki, :nkatu, "
-                ":grade, :status, :mode, :play_time, "
-                ":time_elapsed, :client_flags, :user_id, :perfect, "
-                ":checksum, 0, 0)",
-                {
+                    await app.state.services.database.execute(
+                        "UPDATE scores SET status = 1 "
+                        "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                        "AND userid = :user_id AND mode = :mode",
+                        {
+                            "map_md5": score.bmap.md5,
+                            "user_id": score.player.id,
+                            "mode": score.mode,
+                        },
+                    )
+                    old_score_best = await app.state.services.database.fetch_one(
+                        "SELECT id, score FROM scores "
+                        "WHERE map_md5 = :map_md5 AND userid = :user_id "
+                        "AND mode = :mode AND status = 1 "
+                        "ORDER BY score DESC LIMIT 1",
+                        {"map_md5": score.bmap.md5, "user_id": score.player.id, "mode": score.mode},
+                    )
+                    if old_score_best and old_score_best["score"] > score.score:
+                        await app.state.services.database.execute(
+                            "UPDATE scores SET status = 3 WHERE id = :id",
+                            {"id": old_score_best["id"]},
+                        )
+                    score.id = await app.state.services.database.execute(
+                        "INSERT INTO scores "
+                        "VALUES (NULL, "
+                        ":map_md5, :score, :pp, :acc, "
+                        ":max_combo, :mods, :n300, :n100, "
+                        ":n50, :nmiss, :ngeki, :nkatu, "
+                        ":grade, :status, :mode, :play_time, "
+                        ":time_elapsed, :client_flags, :user_id, :perfect, "
+                        ":checksum, 0, 0)",
+                        {
                     "map_md5": score.bmap.md5,
                     "score": score.score,
                     "pp": pp_db,
@@ -3114,16 +3191,72 @@ async def osuSubmitModularSelector(
                 },
             )
 
-        await app.state.services.redis.publish("ex:submit", score.toJSON())
+        if not _vanilla_submission:
+            if score.status == SubmissionStatus.SCORE_BEST:
+                # Zdegraduj stary SCORE_BEST do SUBMITTED (przed INSERT nowego).
+                await app.state.services.database.execute(
+                    "UPDATE scores SET status = 1 "
+                    "WHERE status = 3 AND map_md5 = :map_md5 "
+                    "AND userid = :user_id AND mode = :mode",
+                    {
+                        "map_md5": score.bmap.md5,
+                        "user_id": score.player.id,
+                        "mode": score.mode,
+                    },
+                )
+            if not score.id:
+                pp_db = pp_to_db(score.pp)
+                score.id = await app.state.services.database.execute(
+                    "INSERT INTO scores "
+                    "VALUES (NULL, "
+                    ":map_md5, :score, :pp, :acc, "
+                    ":max_combo, :mods, :n300, :n100, "
+                    ":n50, :nmiss, :ngeki, :nkatu, "
+                    ":grade, :status, :mode, :play_time, "
+                    ":time_elapsed, :client_flags, :user_id, :perfect, "
+                    ":checksum, 0, 0)",
+                    {
+                        "map_md5": score.bmap.md5,
+                        "score": score.score,
+                        "pp": pp_db,
+                        "acc": score.acc,
+                        "max_combo": score.max_combo,
+                        "mods": score.mods,
+                        "n300": score.n300,
+                        "n100": score.n100,
+                        "n50": score.n50,
+                        "nmiss": score.nmiss,
+                        "ngeki": score.ngeki,
+                        "nkatu": score.nkatu,
+                        "grade": score.grade.name,
+                        "status": score.status,
+                        "mode": score.mode,
+                        "play_time": score.server_time,
+                        "time_elapsed": score.time_elapsed,
+                        "client_flags": score.client_flags,
+                        "user_id": score.player.id,
+                        "perfect": score.perfect,
+                        "checksum": score.client_checksum,
+                    },
+                )
+
+        if _vanilla_submission:
+            try:
+                await app.state.services.redis.publish("ex:submit", score.toJSON())
+            except Exception as exc:
+                log(f"[vanilla-scoring] post-commit Redis publish failed: {exc}", Ansi.LRED)
+        else:
+            await app.state.services.redis.publish("ex:submit", score.toJSON())
         
     if score.passed:
-        replay_data = await replay_file.read()
+        replay_data = (_vanilla_replay_data if _vanilla_submission else await replay_file.read())
 
         MIN_REPLAY_SIZE = 24
 
         if len(replay_data) >= MIN_REPLAY_SIZE:
-            replay_disk_file = REPLAYS_PATH / f"{score.id}.osr"
-            replay_disk_file.write_bytes(replay_data)
+            if not _vanilla_submission:
+                replay_disk_file = REPLAYS_PATH / f"{score.id}.osr"
+                replay_disk_file.write_bytes(replay_data)
         else:
             log(f"{score.player} submitted a score without a replay!", Ansi.LRED)
 
@@ -3140,161 +3273,163 @@ async def osuSubmitModularSelector(
     # get the current stats, and take a
     # shallow copy for the response charts.
     stats = score.player.stats[score.mode]
-    prev_stats = copy.copy(stats)
+    prev_stats = _vanilla_prev_stats if _vanilla_submission else copy.copy(stats)
 
-    # stuff update for all submitted scores
-    stats.playtime += score.time_elapsed // 1000
-    stats.plays += 1
-    stats.tscore += score.score
-    stats.total_hits += score.n300 + score.n100 + score.n50
+    if not _vanilla_submission:
+        # stuff update for all submitted scores
+        stats.playtime += score.time_elapsed // 1000
+        stats.plays += 1
+        stats.tscore += score.score
+        stats.total_hits += score.n300 + score.n100 + score.n50
 
-    if score.mode.as_vanilla in (1, 3):
-        # taiko uses geki & katu for hitting big notes with 2 keys
-        # mania uses geki & katu for rainbow 300 & 200
-        stats.total_hits += score.ngeki + score.nkatu
+        if score.mode.as_vanilla in (1, 3):
+            # taiko uses geki & katu for hitting big notes with 2 keys
+            # mania uses geki & katu for rainbow 300 & 200
+            stats.total_hits += score.ngeki + score.nkatu
 
-    stats_updates: dict[str, Any] = {
-        "plays": stats.plays,
-        "playtime": stats.playtime,
-        "tscore": stats.tscore,
-        "total_hits": stats.total_hits,
-    }
+        stats_updates: dict[str, Any] = {
+            "plays": stats.plays,
+            "playtime": stats.playtime,
+            "tscore": stats.tscore,
+            "total_hits": stats.total_hits,
+        }
 
-    if score.passed and score.bmap.has_leaderboard:
-        # player passed & map is ranked, approved, or loved.
+        if score.passed and score.bmap.has_leaderboard:
+            # player passed & map is ranked, approved, or loved.
 
-        if score.max_combo > stats.max_combo:
-            stats.max_combo = score.max_combo
-            stats_updates["max_combo"] = stats.max_combo
+            if score.max_combo > stats.max_combo:
+                stats.max_combo = score.max_combo
+                stats_updates["max_combo"] = stats.max_combo
 
-        if score.bmap.awards_ranked_pp and score.status == SubmissionStatus.BEST:
-            # map is ranked or approved, and it's our (new)
-            # best score on the map. update the player's
-            # ranked score, grades, pp, acc and global rank.
+            if score.bmap.awards_ranked_pp and score.status == SubmissionStatus.BEST:
+                # map is ranked or approved, and it's our (new)
+                # best score on the map. update the player's
+                # ranked score, grades, pp, acc and global rank.
 
-            additional_rscore = score.score
-            if score.prev_best:
-                # we previously had a score, so remove
-                # it's score from our ranked score.
-                additional_rscore -= score.prev_best.score
+                additional_rscore = score.score
+                if score.prev_best:
+                    # we previously had a score, so remove
+                    # it's score from our ranked score.
+                    additional_rscore -= score.prev_best.score
 
-                if score.grade != score.prev_best.grade:
+                    if score.grade != score.prev_best.grade:
+                        if score.grade >= Grade.A:
+                            stats.grades[score.grade] += 1
+                            grade_col = format(score.grade, "stats_column")
+                            stats_updates[grade_col] = stats.grades[score.grade]
+
+                        if score.prev_best.grade >= Grade.A:
+                            stats.grades[score.prev_best.grade] -= 1
+                            grade_col = format(score.prev_best.grade, "stats_column")
+                            stats_updates[grade_col] = stats.grades[score.prev_best.grade]
+                else:
+                    # this is our first submitted score on the map
                     if score.grade >= Grade.A:
                         stats.grades[score.grade] += 1
                         grade_col = format(score.grade, "stats_column")
                         stats_updates[grade_col] = stats.grades[score.grade]
 
-                    if score.prev_best.grade >= Grade.A:
-                        stats.grades[score.prev_best.grade] -= 1
-                        grade_col = format(score.prev_best.grade, "stats_column")
-                        stats_updates[grade_col] = stats.grades[score.prev_best.grade]
-            else:
-                # this is our first submitted score on the map
-                if score.grade >= Grade.A:
-                    stats.grades[score.grade] += 1
-                    grade_col = format(score.grade, "stats_column")
-                    stats_updates[grade_col] = stats.grades[score.grade]
+                stats.rscore += additional_rscore
+                stats_updates["rscore"] = stats.rscore
 
-            stats.rscore += additional_rscore
-            stats_updates["rscore"] = stats.rscore
+                # fetch scores sorted by pp for total acc/pp calc
+                # NOTE: we select all plays (and not just top100)
+                # because bonus pp counts the total amount of ranked
+                # scores. I'm aware this scales horribly, and it'll
+                # likely be split into two queries in the future.
+                best_scores = await app.state.services.database.fetch_all(
+                    "SELECT s.pp, s.acc FROM scores s "
+                    "INNER JOIN maps m ON s.map_md5 = m.md5 "
+                    "WHERE s.userid = :user_id AND s.mode = :mode "
+                    "AND s.status = 2 AND m.status IN (2, 3) "  # ranked, approved
+                    "ORDER BY s.pp DESC",
+                    {"user_id": score.player.id, "mode": score.mode},
+                )
 
-            # fetch scores sorted by pp for total acc/pp calc
-            # NOTE: we select all plays (and not just top100)
-            # because bonus pp counts the total amount of ranked
-            # scores. I'm aware this scales horribly, and it'll
-            # likely be split into two queries in the future.
-            best_scores = await app.state.services.database.fetch_all(
-                "SELECT s.pp, s.acc FROM scores s "
-                "INNER JOIN maps m ON s.map_md5 = m.md5 "
-                "WHERE s.userid = :user_id AND s.mode = :mode "
-                "AND s.status = 2 AND m.status IN (2, 3) "  # ranked, approved
-                "ORDER BY s.pp DESC",
-                {"user_id": score.player.id, "mode": score.mode},
-            )
+                # calculate new total weighted accuracy
+                weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
+                bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
+                stats.acc = (weighted_acc * bonus_acc) / 100
+                stats_updates["acc"] = stats.acc
 
-            # calculate new total weighted accuracy
-            weighted_acc = sum(float(row["acc"]) * 0.95**i for i, row in enumerate(best_scores))
-            bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
-            stats.acc = (weighted_acc * bonus_acc) / 100
-            stats_updates["acc"] = stats.acc
+                # calculate new total weighted pp
+                weighted_pp = sum(pp_to_float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
+                bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
+                stats.pp = round(weighted_pp + bonus_pp)
+                stats_updates["pp"] = stats.pp
 
-            # calculate new total weighted pp
-            weighted_pp = sum(pp_to_float(row["pp"]) * 0.95**i for i, row in enumerate(best_scores))
-            bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
-            stats.pp = round(weighted_pp + bonus_pp)
-            stats_updates["pp"] = stats.pp
+                # update global & country ranking
+                stats.rank = await score.player.update_rank(score.mode)
 
-            # update global & country ranking
-            stats.rank = await score.player.update_rank(score.mode)
+                # --- global rank announce ---
+                if (
+                    not score.player.restricted
+                    and stats.rank > 0
+                    and stats.rank <= 50
+                    and (prev_stats.rank == 0 or stats.rank < prev_stats.rank)
+                ):
+                    _ann_chan = app.state.sessions.channels.get_by_name("#announce")
+                    if _ann_chan:
+                        import json as _json
+                        _displaced_ids = await app.state.services.redis.zrevrange(
+                            f"bancho:leaderboard:{score.mode.value}",
+                            stats.rank,  # 0-indexed = rank+1 po naszym wejściu
+                            stats.rank,
+                        )
+                        _prev_name: str | None = None
+                        if _displaced_ids:
+                            _prev_id = int(_displaced_ids[0])
+                            _prev_player = app.state.sessions.players.get(id=_prev_id)
+                            if _prev_player:
+                                _prev_name = _prev_player.name
+                            else:
+                                _row = await app.state.services.database.fetch_one(
+                                    "SELECT name FROM users WHERE id = :id", {"id": _prev_id}
+                                )
+                                if _row:
+                                    _prev_name = _row["name"]
+                        _ann_msg = f"\x01ACTION achieved global rank #{stats.rank}"
+                        if _prev_name:
+                            _ann_msg += f" (Previous: {_prev_name})"
+                        _ann_chan.send(_ann_msg, sender=score.player, to_self=True)
+                # --- end global rank announce ---
 
-            # --- global rank announce ---
-            if (
-                not score.player.restricted
-                and stats.rank > 0
-                and stats.rank <= 50
-                and (prev_stats.rank == 0 or stats.rank < prev_stats.rank)
-            ):
-                _ann_chan = app.state.sessions.channels.get_by_name("#announce")
-                if _ann_chan:
-                    import json as _json
-                    _displaced_ids = await app.state.services.redis.zrevrange(
-                        f"bancho:leaderboard:{score.mode.value}",
-                        stats.rank,  # 0-indexed = rank+1 po naszym wejściu
-                        stats.rank,
-                    )
-                    _prev_name: str | None = None
-                    if _displaced_ids:
-                        _prev_id = int(_displaced_ids[0])
-                        _prev_player = app.state.sessions.players.get(id=_prev_id)
-                        if _prev_player:
-                            _prev_name = _prev_player.name
-                        else:
-                            _row = await app.state.services.database.fetch_one(
-                                "SELECT name FROM users WHERE id = :id", {"id": _prev_id}
-                            )
-                            if _row:
-                                _prev_name = _row["name"]
-                    _ann_msg = f"\x01ACTION achieved global rank #{stats.rank}"
-                    if _prev_name:
-                        _ann_msg += f" (Previous: {_prev_name})"
-                    _ann_chan.send(_ann_msg, sender=score.player, to_self=True)
-            # --- end global rank announce ---
-
-    await stats_repo.partial_update(
-        score.player.id,
-        score.mode.value,
-        plays=stats_updates.get("plays", UNSET),
-        playtime=stats_updates.get("playtime", UNSET),
-        tscore=stats_updates.get("tscore", UNSET),
-        total_hits=stats_updates.get("total_hits", UNSET),
-        max_combo=stats_updates.get("max_combo", UNSET),
-        xh_count=stats_updates.get("xh_count", UNSET),
-        x_count=stats_updates.get("x_count", UNSET),
-        sh_count=stats_updates.get("sh_count", UNSET),
-        s_count=stats_updates.get("s_count", UNSET),
-        a_count=stats_updates.get("a_count", UNSET),
-        rscore=stats_updates.get("rscore", UNSET),
-        acc=stats_updates.get("acc", UNSET),
-        pp=stats_updates.get("pp", UNSET),
-    )
+        await stats_repo.partial_update(
+            score.player.id,
+            score.mode.value,
+            plays=stats_updates.get("plays", UNSET),
+            playtime=stats_updates.get("playtime", UNSET),
+            tscore=stats_updates.get("tscore", UNSET),
+            total_hits=stats_updates.get("total_hits", UNSET),
+            max_combo=stats_updates.get("max_combo", UNSET),
+            xh_count=stats_updates.get("xh_count", UNSET),
+            x_count=stats_updates.get("x_count", UNSET),
+            sh_count=stats_updates.get("sh_count", UNSET),
+            s_count=stats_updates.get("s_count", UNSET),
+            a_count=stats_updates.get("a_count", UNSET),
+            rscore=stats_updates.get("rscore", UNSET),
+            acc=stats_updates.get("acc", UNSET),
+            pp=stats_updates.get("pp", UNSET),
+        )
 
     if not score.player.restricted:
         # enqueue new stats info to all other users
         app.state.sessions.players.enqueue(app.packets.user_stats(score.player))
 
-        # update beatmap with new stats
-        score.bmap.plays += 1
-        if score.passed:
-            score.bmap.passes += 1
+        if not _vanilla_submission:
+            # update beatmap with new stats
+            score.bmap.plays += 1
+            if score.passed:
+                score.bmap.passes += 1
 
-        await app.state.services.database.execute(
-            "UPDATE maps SET plays = :plays, passes = :passes WHERE md5 = :map_md5",
-            {
-                "plays": score.bmap.plays,
-                "passes": score.bmap.passes,
-                "map_md5": score.bmap.md5,
-            },
-        )
+            await app.state.services.database.execute(
+                "UPDATE maps SET plays = :plays, passes = :passes WHERE md5 = :map_md5",
+                {
+                    "plays": score.bmap.plays,
+                    "passes": score.bmap.passes,
+                    "map_md5": score.bmap.md5,
+                },
+            )
 
     # update their recent score
     score.player.recent_scores[score.mode] = score

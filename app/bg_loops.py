@@ -26,6 +26,8 @@ async def initialize_housekeeping_tasks() -> None:
                 _remove_expired_donation_privileges(interval=30 * 60),
                 _update_bot_status(interval=5 * 60),
                 _disconnect_ghosts(interval=OSU_CLIENT_MIN_PING_INTERVAL // 3),
+                _reconcile_vanilla_ranks(interval=15),
+                _recover_staged_vanilla_replays(interval=60),
             )
         },
     )
@@ -102,3 +104,69 @@ async def _update_bot_status(interval: int) -> None:
     while True:
         await asyncio.sleep(interval)
         app.packets.bot_stats.cache_clear()
+
+
+async def _reconcile_vanilla_ranks(interval: int) -> None:
+    """Drain MySQL-backed vanilla rank outbox and periodically audit Redis.
+
+    This task uses only modes 0..3; RX/AP leaderboard logic is untouched.
+    The table must be created manually before enabling REVIEW v4.
+    """
+    from app.usecases.vanilla_rank_sync import (
+        audit_rank_batch,
+        drain_vanilla_rank_sync,
+    )
+
+    cursor_id, cursor_mode = 0, -1
+    audit_due = 0.0  # immediate first scan; a complete pass every 30 min
+    next_error_log = 0.0
+
+    while True:
+        try:
+            await drain_vanilla_rank_sync(
+                app.state.services.database,
+                app.state.services.redis,
+                limit=25,
+            )
+            if time.monotonic() >= audit_due:
+                cursor_id, cursor_mode, queued, finished = await audit_rank_batch(
+                    app.state.services.database,
+                    app.state.services.redis,
+                    after_id=cursor_id,
+                    after_mode=cursor_mode,
+                    limit=50,
+                )
+                if queued and app.settings.DEBUG:
+                    log(f"Vanilla rank audit queued {queued} repair(s).", Ansi.LCYAN)
+                if finished:
+                    cursor_id, cursor_mode = 0, -1
+                    audit_due = time.monotonic() + 30 * 60
+        except Exception as exc:
+            # Avoid log spam during a prolonged Redis outage. The outbox is
+            # durable; a later tick will resume when the service recovers.
+            if time.monotonic() >= next_error_log:
+                log(
+                    f"Vanilla rank reconciliation failed ({type(exc).__name__}); will retry.",
+                    Ansi.LRED,
+                )
+                next_error_log = time.monotonic() + 60
+        await asyncio.sleep(interval)
+
+
+async def _recover_staged_vanilla_replays(interval: int) -> None:
+    """Retry pending post-COMMIT vanilla replay renames from durable spool."""
+    from app.api.domains.osu import REPLAYS_PATH
+    from app.usecases.vanilla_replay_links_preview import (
+        recover_linked_vanilla_replays as recover_staged_vanilla_replays,
+    )
+
+    while True:
+        try:
+            count = await recover_staged_vanilla_replays(
+                app.state.services.database, REPLAYS_PATH, limit=25
+            )
+            if count:
+                log(f"[vanilla-replay] recovered {count} replay(s)", Ansi.LGREEN)
+        except Exception as exc:
+            log(f"[vanilla-replay] recovery error: {type(exc).__name__}", Ansi.LRED)
+        await asyncio.sleep(interval)

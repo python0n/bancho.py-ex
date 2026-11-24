@@ -33,6 +33,7 @@ from app.objects.score import Grade
 from app.objects.score import Score
 from app.objects.score import SubmissionStatus
 from app.repositories import stats as stats_repo
+from app.usecases.vanilla_scoring import commit_vanilla_score, DuplicateVanillaScore
 
 REPLAYS_PATH = Path.cwd() / ".data/osr"
 PENDING_PATH = REPLAYS_PATH / "pending"
@@ -255,135 +256,183 @@ async def approve_pending_replay(pending_id: int) -> dict[str, Any]:
         )
         keys = {"map_md5": bmap.md5, "user_id": player.id, "mode": score.mode}
 
-        # same rules as osuSubmitModularSelector: one BEST and at most one
-        # SCORE_BEST per player, map and mode
-        async with db.transaction():
-            await db.fetch_one(
-                "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
-                {"user_id": player.id},
+        # Vanilla: durable independent snapshot BEFORE SQL COMMIT. The exact
+        # staged filename and SHA-256 are linked in the same InnoDB transaction
+        # as scores, stats and pending_replays approval. RX/AP unchanged.
+        if score.mode < GameMode.RELAX_OSU:
+            from app.usecases.vanilla_replay import stage_vanilla_replay
+            from app.usecases.vanilla_replay_links_preview import (
+                make_replay_intent, finalize_linked_replay,
             )
-            if score.status == SubmissionStatus.BEST:
-                await db.execute(
-                    "UPDATE scores SET status = 1 "
-                    "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
-                    "AND userid = :user_id AND mode = :mode",
-                    keys,
+            if len(osr_bytes) < 24:
+                raise ApprovalError("invalid_replay", "Approved replay is too short.", 422)
+            _manual_staged = await asyncio.to_thread(stage_vanilla_replay, 
+                REPLAYS_PATH, score.client_checksum, osr_bytes,
+            )
+            _manual_intent = await asyncio.to_thread(make_replay_intent, 
+                _manual_staged, score.client_checksum, osr_bytes,
+            )
+            try:
+                _vanilla_prev_stats = await commit_vanilla_score(
+                    score, pending_id=pending_id, replay_intent=_manual_intent,
                 )
-                old_score_best = await db.fetch_one(
-                    "SELECT id, score FROM scores "
-                    "WHERE map_md5 = :map_md5 AND userid = :user_id "
-                    "AND mode = :mode AND status = 1 "
-                    "ORDER BY score DESC LIMIT 1",
-                    keys,
+            except DuplicateVanillaScore as exc:
+                # Known SQL duplicate: neither this score nor link was committed.
+                await asyncio.to_thread(_manual_staged.discard)
+                raise ApprovalError("duplicate", str(exc), 409) from exc
+            # For other exceptions, SQL COMMIT might already have succeeded:
+            # retain the durable stage for linked recovery. Do not discard.
+        else:
+            # RX/AP: preserve the existing approval transaction unchanged.
+            async with db.transaction():
+                await db.fetch_one(
+                    "SELECT id FROM users WHERE id = :user_id FOR UPDATE",
+                    {"user_id": player.id},
                 )
-                if old_score_best and old_score_best["score"] > score.score:
+                if score.status == SubmissionStatus.BEST:
                     await db.execute(
-                        "UPDATE scores SET status = 3 WHERE id = :id",
-                        {"id": old_score_best["id"]},
+                        "UPDATE scores SET status = 1 "
+                        "WHERE status IN (2, 3) AND map_md5 = :map_md5 "
+                        "AND userid = :user_id AND mode = :mode",
+                        keys,
                     )
-            elif score.status == SubmissionStatus.SCORE_BEST:
+                    old_score_best = await db.fetch_one(
+                        "SELECT id, score FROM scores "
+                        "WHERE map_md5 = :map_md5 AND userid = :user_id "
+                        "AND mode = :mode AND status = 1 "
+                        "ORDER BY score DESC LIMIT 1",
+                        keys,
+                    )
+                    if old_score_best and old_score_best["score"] > score.score:
+                        await db.execute(
+                            "UPDATE scores SET status = 3 WHERE id = :id",
+                            {"id": old_score_best["id"]},
+                        )
+                elif score.status == SubmissionStatus.SCORE_BEST:
+                    await db.execute(
+                        "UPDATE scores SET status = 1 "
+                        "WHERE status = 3 AND map_md5 = :map_md5 "
+                        "AND userid = :user_id AND mode = :mode",
+                        keys,
+                    )
+                score.id = await db.execute(insert_sql, params)
                 await db.execute(
-                    "UPDATE scores SET status = 1 "
-                    "WHERE status = 3 AND map_md5 = :map_md5 "
-                    "AND userid = :user_id AND mode = :mode",
-                    keys,
+                    "UPDATE pending_replays SET status = 1, reviewed_at = NOW(), "
+                    "score_id = :score_id WHERE id = :id",
+                    {"score_id": score.id, "id": pending_id},
                 )
-            score.id = await db.execute(insert_sql, params)
-            await db.execute(
-                "UPDATE pending_replays SET status = 1, reviewed_at = NOW(), "
-                "score_id = :score_id WHERE id = :id",
-                {"score_id": score.id, "id": pending_id},
-            )
 
-    # replay file next to the in-game ones
-    try:
-        shutil.move(str(osr_file), str(REPLAYS_PATH / f"{score.id}.osr"))
-    except OSError as e:
-        log(f"[replay-approve] could not move {osr_file}: {e}", Ansi.LRED)
+    if score.mode < GameMode.RELAX_OSU:
+        # COMMIT already succeeded; durable staged copy is recoverable by
+        # vanilla_replay_links even if this process crashes right here.
+        try:
+            await asyncio.to_thread(finalize_linked_replay, _manual_staged, score.id, _manual_intent)
+        except OSError as e:
+            log(f"[replay-approve] linked replay {score.id} pending: {e}", Ansi.LRED)
+        # Do NOT auto-delete the original Shiina file after COMMIT.
+        # Shiina does not share Bancho's advisory flock: an external writer
+        # can replace the pathname after an inode/hash check but before unlink.
+        # The 54.9m read-only audit is the only permitted cleanup assessment.
+    else:
+        # RX/AP: preserve production publication behavior; separate risk remains.
+        try:
+            shutil.move(str(osr_file), str(REPLAYS_PATH / f"{score.id}.osr"))
+        except OSError as e:
+            log(f"[replay-approve] could not move {osr_file}: {e}", Ansi.LRED)
 
-    await app.state.services.redis.publish("ex:submit", score.toJSON())
+    if score.mode < GameMode.RELAX_OSU:
+        try:
+            await app.state.services.redis.publish("ex:submit", score.toJSON())
+        except Exception as exc:
+            log(f"[vanilla-scoring] post-commit Redis publish failed: {exc}", Ansi.LRED)
+    else:
+        await app.state.services.redis.publish("ex:submit", score.toJSON())
 
-    """ Player stats, the same way as after an in-game submission """
+    if score.mode < GameMode.RELAX_OSU:
+        stats = player.stats[score.mode]
+        prev_rank = _vanilla_prev_stats.rank
+    else:
+        """ Player stats, the same way as after an in-game submission """
 
-    stats = player.stats[score.mode]
-    prev_rank = stats.rank
+        stats = player.stats[score.mode]
+        prev_rank = stats.rank
 
-    stats.playtime += score.time_elapsed // 1000
-    stats.plays += 1
-    stats.tscore += score.score
-    stats.total_hits += score.n300 + score.n100 + score.n50
-    if score.mode.as_vanilla in (1, 3):
-        stats.total_hits += score.ngeki + score.nkatu
+        stats.playtime += score.time_elapsed // 1000
+        stats.plays += 1
+        stats.tscore += score.score
+        stats.total_hits += score.n300 + score.n100 + score.n50
+        if score.mode.as_vanilla in (1, 3):
+            stats.total_hits += score.ngeki + score.nkatu
 
-    updates: dict[str, Any] = {
-        "plays": stats.plays,
-        "playtime": stats.playtime,
-        "tscore": stats.tscore,
-        "total_hits": stats.total_hits,
-    }
+        updates: dict[str, Any] = {
+            "plays": stats.plays,
+            "playtime": stats.playtime,
+            "tscore": stats.tscore,
+            "total_hits": stats.total_hits,
+        }
 
-    if bmap.has_leaderboard:
-        if score.max_combo > stats.max_combo:
-            stats.max_combo = score.max_combo
-            updates["max_combo"] = stats.max_combo
+        if bmap.has_leaderboard:
+            if score.max_combo > stats.max_combo:
+                stats.max_combo = score.max_combo
+                updates["max_combo"] = stats.max_combo
 
-        if bmap.awards_ranked_pp and score.status == SubmissionStatus.BEST:
-            additional_rscore = score.score
-            if score.prev_best:
-                additional_rscore -= score.prev_best.score
-                if score.grade != score.prev_best.grade:
-                    if score.grade >= Grade.A:
-                        stats.grades[score.grade] += 1
-                        updates[format(score.grade, "stats_column")] = stats.grades[score.grade]
-                    if score.prev_best.grade >= Grade.A:
-                        stats.grades[score.prev_best.grade] -= 1
-                        updates[format(score.prev_best.grade, "stats_column")] = stats.grades[
-                            score.prev_best.grade
-                        ]
-            elif score.grade >= Grade.A:
-                stats.grades[score.grade] += 1
-                updates[format(score.grade, "stats_column")] = stats.grades[score.grade]
+            if bmap.awards_ranked_pp and score.status == SubmissionStatus.BEST:
+                additional_rscore = score.score
+                if score.prev_best:
+                    additional_rscore -= score.prev_best.score
+                    if score.grade != score.prev_best.grade:
+                        if score.grade >= Grade.A:
+                            stats.grades[score.grade] += 1
+                            updates[format(score.grade, "stats_column")] = stats.grades[score.grade]
+                        if score.prev_best.grade >= Grade.A:
+                            stats.grades[score.prev_best.grade] -= 1
+                            updates[format(score.prev_best.grade, "stats_column")] = stats.grades[
+                                score.prev_best.grade
+                            ]
+                elif score.grade >= Grade.A:
+                    stats.grades[score.grade] += 1
+                    updates[format(score.grade, "stats_column")] = stats.grades[score.grade]
 
-            stats.rscore += additional_rscore
-            updates["rscore"] = stats.rscore
+                stats.rscore += additional_rscore
+                updates["rscore"] = stats.rscore
 
-            best_scores = await db.fetch_all(
-                "SELECT s.pp, s.acc FROM scores s "
-                "INNER JOIN maps m ON s.map_md5 = m.md5 "
-                "WHERE s.userid = :user_id AND s.mode = :mode "
-                "AND s.status = 2 AND m.status IN (2, 3) "
-                "ORDER BY s.pp DESC",
-                {"user_id": player.id, "mode": score.mode},
-            )
-            weighted_acc = sum(float(r["acc"]) * 0.95**i for i, r in enumerate(best_scores))
-            bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
-            stats.acc = (weighted_acc * bonus_acc) / 100
-            updates["acc"] = stats.acc
+                best_scores = await db.fetch_all(
+                    "SELECT s.pp, s.acc FROM scores s "
+                    "INNER JOIN maps m ON s.map_md5 = m.md5 "
+                    "WHERE s.userid = :user_id AND s.mode = :mode "
+                    "AND s.status = 2 AND m.status IN (2, 3) "
+                    "ORDER BY s.pp DESC",
+                    {"user_id": player.id, "mode": score.mode},
+                )
+                weighted_acc = sum(float(r["acc"]) * 0.95**i for i, r in enumerate(best_scores))
+                bonus_acc = 100.0 / (20 * (1 - 0.95 ** len(best_scores)))
+                stats.acc = (weighted_acc * bonus_acc) / 100
+                updates["acc"] = stats.acc
 
-            weighted_pp = sum(pp_to_float(r["pp"]) * 0.95**i for i, r in enumerate(best_scores))
-            bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
-            stats.pp = round(weighted_pp + bonus_pp)
-            updates["pp"] = stats.pp
+                weighted_pp = sum(pp_to_float(r["pp"]) * 0.95**i for i, r in enumerate(best_scores))
+                bonus_pp = 416.6667 * (1 - 0.9994 ** len(best_scores))
+                stats.pp = round(weighted_pp + bonus_pp)
+                updates["pp"] = stats.pp
 
-            stats.rank = await player.update_rank(score.mode)
+                stats.rank = await player.update_rank(score.mode)
 
-    await stats_repo.partial_update(
-        player.id,
-        score.mode.value,
-        plays=updates.get("plays", UNSET),
-        playtime=updates.get("playtime", UNSET),
-        tscore=updates.get("tscore", UNSET),
-        total_hits=updates.get("total_hits", UNSET),
-        max_combo=updates.get("max_combo", UNSET),
-        xh_count=updates.get("xh_count", UNSET),
-        x_count=updates.get("x_count", UNSET),
-        sh_count=updates.get("sh_count", UNSET),
-        s_count=updates.get("s_count", UNSET),
-        a_count=updates.get("a_count", UNSET),
-        rscore=updates.get("rscore", UNSET),
-        acc=updates.get("acc", UNSET),
-        pp=updates.get("pp", UNSET),
-    )
+        await stats_repo.partial_update(
+            player.id,
+            score.mode.value,
+            plays=updates.get("plays", UNSET),
+            playtime=updates.get("playtime", UNSET),
+            tscore=updates.get("tscore", UNSET),
+            total_hits=updates.get("total_hits", UNSET),
+            max_combo=updates.get("max_combo", UNSET),
+            xh_count=updates.get("xh_count", UNSET),
+            x_count=updates.get("x_count", UNSET),
+            sh_count=updates.get("sh_count", UNSET),
+            s_count=updates.get("s_count", UNSET),
+            a_count=updates.get("a_count", UNSET),
+            rscore=updates.get("rscore", UNSET),
+            acc=updates.get("acc", UNSET),
+            pp=updates.get("pp", UNSET),
+        )
 
     """ Messages """
 

@@ -496,3 +496,29 @@ create index notifications_user_index on notifications (user_id, `read`, id);
 # v5.21.0
 create table mp_match_chat ( id int auto_increment primary key, match_id int not null, user_id int not null, msg text not null, hidden tinyint(1) default 0 not null, created_at datetime default CURRENT_TIMESTAMP not null );
 create index mp_match_chat_match_index on mp_match_chat (match_id, id);
+
+# v5.23.0
+CREATE TABLE IF NOT EXISTS vanilla_rank_sync (
+    userid INT NOT NULL,
+    mode TINYINT UNSIGNED NOT NULL,
+    generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    applied_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    last_country CHAR(2) NULL DEFAULT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (userid, mode),
+    KEY vanilla_rank_sync_updated_at_index (updated_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS vanilla_replay_links (
+    score_id BIGINT UNSIGNED NOT NULL,
+    pending_name VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    online_checksum CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    state TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (score_id),
+    UNIQUE KEY unique_vanilla_replay_pending (pending_name),
+    KEY idx_vanilla_replay_state_score (state, score_id),
+    CONSTRAINT fk_vanilla_replay_score
+        FOREIGN KEY (score_id) REFERENCES scores (id) ON DELETE CASCADE
+) ENGINE=InnoDB;
