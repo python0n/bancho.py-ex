@@ -1,333 +1,193 @@
+"""Redis pub/sub receivers for actions sent by Shiina (panel) to bancho.
+
+Every receiver goes through _receiver(): a bad message (wrong JSON, missing key,
+an exception in the action) is logged and skipped, and a dropped Redis
+connection is retried, so one broken message no longer stops the receiver
+until the next bancho restart."""
 import asyncio
-import app.settings
-import app.settings
-import app.settings
-import app.settings
+
 import orjson
 
 import app
-from app.logging import log
 from app.logging import Ansi
-from .utils import *
+from app.logging import log
+
+from .utils import *  # noqa: F403
+
+RETRY_DELAY = 5
+
 
 async def start_pubsub_recievers():
     """Start pubsub recievers."""
     log("Starting pubsub recievers-ex...", Ansi.LGREEN)
-    
-    asyncio.create_task(channel_rank_receiver())
-    asyncio.create_task(channel_restrict_reciever())
-    asyncio.create_task(channel_unrestrict_reciever())
-    asyncio.create_task(channel_alert_all_reciever())
-    asyncio.create_task(channel_givedonator_reciever())
-    asyncio.create_task(channel_addpriv_reciever())
-    asyncio.create_task(channel_removepriv_reciever())
-    asyncio.create_task(channel_wipe_reciever())
-    asyncio.create_task(channel_country_change_reciever())
-    asyncio.create_task(channel_name_change_reciever())
-    asyncio.create_task(channel_clan_change_reciever())
+
+    for channel, handler in RECEIVERS.items():
+        asyncio.create_task(_receiver(channel, handler), name=f"pubsub:{channel}")
 
 
-async def channel_clan_change_reciever():
+async def _receiver(channel: str, handler) -> None:
+    while True:
+        pubsub = app.state.services.redis.pubsub()
+        try:
+            await pubsub.subscribe(channel)
+            log(f"Subscribed to '{channel}' channel.", Ansi.LGREEN)
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                try:
+                    data = orjson.loads(message["data"])
+                    if not isinstance(data, dict):
+                        raise ValueError("payload is not a JSON object")
+                    await handler(data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log(f"EX | {channel} | bad message skipped: {e!r}", Ansi.LRED)
+            log(f"'{channel}' subscription ended - resubscribing in {RETRY_DELAY}s", Ansi.LYELLOW)
+        except asyncio.CancelledError:
+            log(f"Channel {channel} receiver task cancelled.", Ansi.LYELLOW)
+            raise
+        except Exception as e:
+            log(f"EX | {channel} | receiver error: {e!r} - retrying in {RETRY_DELAY}s", Ansi.LRED)
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.aclose() if hasattr(pubsub, "aclose") else await pubsub.close()
+            except Exception:
+                pass
+        await asyncio.sleep(RETRY_DELAY)
+
+
+async def handle_clan_change(data: dict) -> None:
     """Shiina changed someone's clan (join, leave, kick, create, disband):
     refresh the clan of online players so it's right without logging in again.
     Payload: {"ids": [user ids]} and/or {"clan_id": id} for every member of a clan."""
     from app.constants.privileges import ClanPrivileges
 
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("clan_change")
-
-    log("Subscribed to 'clan_change' channel.", Ansi.LGREEN)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] != "message":
-                continue
-            try:
-                data = orjson.loads(message["data"])
-                ids = {int(i) for i in data.get("ids", [])}
-                clan_id = data.get("clan_id")
-                targets = [
-                    p for p in app.state.sessions.players
-                    if p.id in ids or (clan_id is not None and p.clan_id == int(clan_id))
-                ]
-                for p in targets:
-                    row = await app.state.services.database.fetch_one(
-                        "SELECT clan_id, clan_priv FROM users WHERE id = :id",
-                        {"id": p.id},
-                    )
-                    if row is None:
-                        continue
-                    if row["clan_id"]:
-                        p.clan_id = row["clan_id"]
-                        p.clan_priv = ClanPrivileges(row["clan_priv"])
-                    else:
-                        p.clan_id = None
-                        p.clan_priv = None
-                log(f"EX | Clan Change | refreshed {len(targets)} online player(s)", Ansi.LBLUE)
-            except Exception as e:
-                log(f"EX | Clan Change | bad message: {e!r}", Ansi.LRED)
-    except asyncio.CancelledError:
-        log("Channel clan_change receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("clan_change")
-        log("Unsubscribed from 'clan_change'.", Ansi.LRED)
-
-async def channel_name_change_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("name_change")
-
-    log("Subscribed to 'name_change' channel.", Ansi.LGREEN)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
-
-                id = data["id"]
-                name = data["name"]
-
-                log(f"Received message on 'name_change'", Ansi.LBLUE)
-                log(f"EX | Name Change | ID: {id}, Name: {name}", Ansi.LBLUE)
-                response = await change_user_name(id, name)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel name_change receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("name_change")
-        log("Unsubscribed from 'name_change'.", Ansi.LRED)
-
-async def channel_country_change_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("country_change")
-
-    log("Subscribed to 'country_change' channel.", Ansi.LGREEN)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
-
-                id = data["id"]
-                country = data["country"]
-
-                log(f"Received message on 'country_change'", Ansi.LBLUE)
-                log(f"EX | Country Change | ID: {id}, Country: {country}", Ansi.LBLUE)
-                response = await change_user_flag(id, country)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel country_change receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("country_change")
-        log("Unsubscribed from 'country_change'.", Ansi.LRED)
-
-async def channel_wipe_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("wipe")
-
-    log("Subscribed to 'wipe' channel.", Ansi.LGREEN)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
-
-                id = data["id"]
-                mode = data["mode"]
-
-                log(f"Received message on 'wipe'", Ansi.LBLUE)
-                log(f"EX | Wipe | ID: {id}, Mode: {mode}", Ansi.LBLUE)
-                response = await wipe_user(id, mode)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel wipe receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("wipe")
-        log("Unsubscribed from 'wipe'.", Ansi.LRED)
+    ids = {int(i) for i in data.get("ids") or []}
+    clan_id = data.get("clan_id")
+    targets = [
+        p for p in app.state.sessions.players
+        if p.id in ids or (clan_id is not None and p.clan_id == int(clan_id))
+    ]
+    for p in targets:
+        row = await app.state.services.database.fetch_one(
+            "SELECT clan_id, clan_priv FROM users WHERE id = :id",
+            {"id": p.id},
+        )
+        if row is None:
+            continue
+        if row["clan_id"]:
+            p.clan_id = row["clan_id"]
+            p.clan_priv = ClanPrivileges(row["clan_priv"])
+        else:
+            p.clan_id = None
+            p.clan_priv = None
+    log(f"EX | Clan Change | refreshed {len(targets)} online player(s)", Ansi.LBLUE)
 
 
-async def channel_rank_receiver():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("rank")
+async def handle_name_change(data: dict) -> None:
+    id, name = int(data["id"]), str(data["name"])
+    log(f"EX | Name Change | ID: {id}, Name: {name}", Ansi.LBLUE)
+    log("EX | " + await change_user_name(id, name), Ansi.LBLUE)
 
-    log("Subscribed to 'rank' channel.", Ansi.LGREEN)
 
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
+async def handle_country_change(data: dict) -> None:
+    id, country = int(data["id"]), str(data["country"])
+    log(f"EX | Country Change | ID: {id}, Country: {country}", Ansi.LBLUE)
+    log("EX | " + await change_user_flag(id, country), Ansi.LBLUE)
 
-                beatmap_id = data["beatmap_id"]
-                status = data["status"]
-                frozen = data["frozen"]
 
-                log(f"Received message on 'rank'", Ansi.LBLUE)
-                log(f"EX | Rank | Beatmap ID: {beatmap_id}, Status: {status}, Frozen: {frozen}", Ansi.LBLUE)
-                response = await change_bm_status(beatmap_id, status, frozen)
-                log(f"EX | " + response, Ansi.LBLUE)
-                # Notify Discord bot
-                from app.usecases.notifications import rank_type_name
-                rank_type = rank_type_name(status)
-                await app.state.services.redis.publish(
-                    "ex:map_status_change",
-                    orjson.dumps({
-                        "map_ids": [beatmap_id],
-                        "type": rank_type,
-                        "ranktype": "map",
-                        "status": int(status),
-                        "user_id": data.get("user_id"),
-                        "user_name": data.get("user_name"),
-                    }).decode()
-                )
-                from app.usecases.notifications import notify_map_status_change
-                await notify_map_status_change([beatmap_id], int(status), data.get("user_id"))
-    except asyncio.CancelledError:
-        log("Channel rank receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("rank")
-        log("Unsubscribed from 'rank'.", Ansi.LRED)
+async def handle_wipe(data: dict) -> None:
+    id, mode = int(data["id"]), int(data["mode"])
+    log(f"EX | Wipe | ID: {id}, Mode: {mode}", Ansi.LBLUE)
+    log("EX | " + await wipe_user(id, mode), Ansi.LBLUE)
 
-async def channel_restrict_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("restrict")
 
-    log("Subscribed to 'restrict' channel.", Ansi.LGREEN)
+async def handle_rank(data: dict) -> None:
+    beatmap_id = int(data["beatmap_id"])
+    status = int(data["status"])
+    frozen = bool(data["frozen"])
+    log(f"EX | Rank | Beatmap ID: {beatmap_id}, Status: {status}, Frozen: {frozen}", Ansi.LBLUE)
+    response = await change_bm_status(beatmap_id, status, frozen)
+    log("EX | " + response, Ansi.LBLUE)
+    if response != "success":
+        # nothing changed, so nothing to announce (AUD-29)
+        return
 
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
+    # Notify Discord bot
+    from app.usecases.notifications import notify_map_status_change
+    from app.usecases.notifications import rank_type_name
 
-                id = data["id"]
-                userId = data["userId"]
-                reason = data["reason"]
+    await app.state.services.redis.publish(
+        "ex:map_status_change",
+        orjson.dumps({
+            "map_ids": [beatmap_id],
+            "type": rank_type_name(status),
+            "ranktype": "map",
+            "status": status,
+            "user_id": data.get("user_id"),
+            "user_name": data.get("user_name"),
+        }).decode(),
+    )
+    await notify_map_status_change([beatmap_id], status, data.get("user_id"))
 
-                log(f"Received message on 'restrict'", Ansi.LBLUE)
-                log(f"EX | Restrict | ID: {id}, User ID: {userId}, Reason: {reason}", Ansi.LBLUE)
-                response = await restrict(id, userId, reason)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel restrict receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("restrict")
-        log("Unsubscribed from 'restrict'.", Ansi.LRED)
 
-async def channel_unrestrict_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("unrestrict")
+async def handle_restrict(data: dict) -> None:
+    id, admin_id, reason = int(data["id"]), int(data["userId"]), str(data.get("reason") or "")
+    log(f"EX | Restrict | ID: {id}, User ID: {admin_id}, Reason: {reason}", Ansi.LBLUE)
+    log("EX | " + await restrict(id, admin_id, reason), Ansi.LBLUE)
 
-    log("Subscribed to 'unrestrict' channel.", Ansi.LGREEN)
 
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
+async def handle_unrestrict(data: dict) -> None:
+    id, admin_id, reason = int(data["id"]), int(data["userId"]), str(data.get("reason") or "")
+    log(f"EX | Unrestrict | ID: {id}, User ID: {admin_id}", Ansi.LBLUE)
+    log("EX | " + await unrestrict(id, admin_id, reason), Ansi.LBLUE)
 
-                id = data["id"]
-                userId = data["userId"]
-                reason = data["reason"]
 
-                log(f"Received message on 'unrestrict'", Ansi.LBLUE)
-                log(f"EX | Unrestrict | ID: {id}, User ID: {userId}", Ansi.LBLUE)
-                response = await unrestrict(id, userId, reason)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel unrestrict receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("unrestrict")
-        log("Unsubscribed from 'unrestrict'.", Ansi.LRED)
+async def handle_alert_all(data: dict) -> None:
+    message = str(data["message"])
+    log(f"EX | Alert All | Message: {message}", Ansi.LBLUE)
+    log("EX | " + await alert_all(message), Ansi.LBLUE)
 
-async def channel_alert_all_reciever() -> str:
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("alert_all")
 
-    log("Subscribed to 'alert_all' channel.", Ansi.LGREEN)
+async def handle_givedonator(data: dict) -> None:
+    id, duration = int(data["id"]), str(data["duration"])
+    log(f"EX | Give Donator | ID: {id}, Duration: {duration}", Ansi.LBLUE)
+    log("EX | " + await givedonator(id, duration), Ansi.LBLUE)
 
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
 
-                message = data["message"]
+def _privs_list(data: dict) -> list:
+    privs = data.get("privs")
+    if not isinstance(privs, list) or not all(isinstance(p, str) for p in privs):
+        raise ValueError("privs must be a list of names")
+    return privs
 
-                log(f"Received message on 'alert_all'", Ansi.LBLUE)
-                log(f"EX | Alert All | Message: {message}", Ansi.LBLUE)
-                response = await alert_all(message)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel alert_all receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("alert_all")
-        log("Unsubscribed from 'alert_all'.", Ansi.LRED)
 
-async def channel_givedonator_reciever() -> str:
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("givedonator")
+async def handle_addpriv(data: dict) -> None:
+    id, privs = int(data["id"]), _privs_list(data)
+    actor_id = int(data["userId"]) if data.get("userId") else None
+    log(f"EX | Add Priv | ID: {id}, Privs: {privs}, By: {actor_id}", Ansi.LBLUE)
+    log("EX | " + await addpriv(id, privs, actor_id), Ansi.LBLUE)
 
-    log("Subscribed to 'givedonator' channel.", Ansi.LGREEN)
 
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
+async def handle_removepriv(data: dict) -> None:
+    id, privs = int(data["id"]), _privs_list(data)
+    actor_id = int(data["userId"]) if data.get("userId") else None
+    log(f"EX | Remove Priv | ID: {id}, Privs: {privs}, By: {actor_id}", Ansi.LBLUE)
+    log("EX | " + await removepriv(id, privs, actor_id), Ansi.LBLUE)
 
-                id = data["id"]
-                duration = data["duration"]
 
-                log(f"Received message on 'givedonator'", Ansi.LBLUE)
-                log(f"EX | Give Donator | ID: {id}, Duration: {duration}", Ansi.LBLUE)
-                response = await givedonator(id, duration)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel givedonator receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("givedonator")
-        log("Unsubscribed from 'givedonator'.", Ansi.LRED)
-
-async def channel_addpriv_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("addpriv")
-
-    log("Subscribed to 'addpriv' channel.", Ansi.LGREEN)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
-
-                id = data["id"]
-                privs = data["privs"]
-
-                log(f"Received message on 'addpriv'", Ansi.LBLUE)
-                log(f"EX | Add Priv | ID: {id}, Privs: {privs}", Ansi.LBLUE)
-                response = await addpriv(id, privs)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel addpriv receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("addpriv")
-        log("Unsubscribed from 'addpriv'.", Ansi.LRED)
-
-async def channel_removepriv_reciever():
-    pubsub = app.state.services.redis.pubsub()
-    await pubsub.subscribe("removepriv")
-
-    log("Subscribed to 'removepriv' channel.", Ansi.LGREEN)
-
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = orjson.loads(message["data"]) 
-
-                id = data["id"]
-                privs = data["privs"]
-
-                log(f"Received message on 'removepriv'", Ansi.LBLUE)
-                log(f"EX | Remove Priv | ID: {id}, Privs: {privs}", Ansi.LBLUE)
-                response = await removepriv(id, privs)
-                log(f"EX | " + response, Ansi.LBLUE)
-    except asyncio.CancelledError:
-        log("Channel removepriv receiver task cancelled.", Ansi.LYELLOW)
-    finally:
-        await pubsub.unsubscribe("removepriv")
-        log("Unsubscribed from 'removepriv'.", Ansi.LRED)
-
+RECEIVERS = {
+    "rank": handle_rank,
+    "restrict": handle_restrict,
+    "unrestrict": handle_unrestrict,
+    "alert_all": handle_alert_all,
+    "givedonator": handle_givedonator,
+    "addpriv": handle_addpriv,
+    "removepriv": handle_removepriv,
+    "wipe": handle_wipe,
+    "country_change": handle_country_change,
+    "name_change": handle_name_change,
+    "clan_change": handle_clan_change,
+}

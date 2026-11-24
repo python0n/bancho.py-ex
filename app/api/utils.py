@@ -163,6 +163,8 @@ async def restrict(id: int, userId: int, reason: str) -> str:
     user = await app.state.sessions.players.from_cache_or_sql(id=userId)
     if not target:
         return "user not found"
+    if not user:
+        return "admin not found"
     
     if target.priv & Privileges.STAFF and not user.priv & Privileges.DEVELOPER:
         return "Only developers can manage staff members."
@@ -182,6 +184,8 @@ async def unrestrict(id: int, userId: int, reason: str) -> str:
     user = await app.state.sessions.players.from_cache_or_sql(id=userId)
     if not target:
         return "user not found"
+    if not user:
+        return "admin not found"
     
     if target.priv & Privileges.STAFF and not user.priv & Privileges.DEVELOPER:
         return "Only developers can manage staff members."
@@ -225,8 +229,23 @@ async def givedonator(id: int, duration: any) -> str:
     return "success"
 
 from typing import List
+from typing import Optional
 
-async def addpriv(id: int, privs: List[str]) -> str:
+# privileges only a developer may give or take: staff ranks and "normal"
+# (taking "normal" away restricts the player without the restrict log)
+DEVELOPER_ONLY = Privileges.STAFF | Privileges.UNRESTRICTED
+
+
+async def _actor_is_developer(actor_id: Optional[int]) -> bool:
+    if not actor_id:
+        return False
+    row = await app.state.services.database.fetch_one(
+        "SELECT priv FROM users WHERE id = :id", {"id": actor_id},
+    )
+    return row is not None and bool(int(row["priv"]) & Privileges.DEVELOPER)
+
+
+async def _change_privs(id: int, privs: List[str], actor_id: Optional[int], add: bool) -> str:
     bits = Privileges(0)
 
     for priv in privs:
@@ -237,27 +256,25 @@ async def addpriv(id: int, privs: List[str]) -> str:
     target = await app.state.sessions.players.from_cache_or_sql(id=id)
     if not target:
         return "user not found"
-    
+
     if bits & Privileges.DONATOR != 0:
         return "use givedonor."
 
-    await target.add_privs(bits)
+    # TSG-09: the hierarchy is checked here too, not only in Shiina's panel
+    if bits & DEVELOPER_ONLY or target.priv & Privileges.STAFF:
+        if not await _actor_is_developer(actor_id):
+            return "Only developers can change staff privileges or staff members."
+
+    if add:
+        await target.add_privs(bits)
+    else:
+        await target.remove_privs(bits)
     return "success"
 
-async def removepriv(id: int, privs: List[str]) -> str:
-    bits = Privileges(0)
 
-    for priv in privs:
-        if priv not in str_priv_dict:
-            return f"Invalid privilege: {priv}"
-        bits |= str_priv_dict[priv]
+async def addpriv(id: int, privs: List[str], actor_id: Optional[int] = None) -> str:
+    return await _change_privs(id, privs, actor_id, add=True)
 
-    target = await app.state.sessions.players.from_cache_or_sql(id=id)
-    if not target:
-        return "user not found"
-    
-    if bits & Privileges.DONATOR != 0:
-        return "use givedonor."
 
-    await target.remove_privs(bits)
-    return "success"
+async def removepriv(id: int, privs: List[str], actor_id: Optional[int] = None) -> str:
+    return await _change_privs(id, privs, actor_id, add=False)
