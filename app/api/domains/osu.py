@@ -1494,6 +1494,28 @@ def bancho_to_osuapi_status(bancho_status: int) -> int:
         5: 4,
     }[bancho_status]
 
+BEATMAPINFO_MAX_LINES = 2000
+BEATMAPINFO_MAX_API_LOOKUPS = 50
+
+# TSG-33: score submission decrypts the score before it knows who sent it, so the
+# number of submissions per address is limited and the decryption runs off the event loop
+SUBMIT_MAX_PER_MINUTE = 30
+_submit_times: dict[str, list[float]] = {}
+
+
+def _submit_rate_ok(ip: str | None) -> bool:
+    now = time.time()
+    if len(_submit_times) > 10000:
+        _submit_times.clear()
+    times = [t for t in _submit_times.get(ip or "-", []) if now - t < 60]
+    if len(times) >= SUBMIT_MAX_PER_MINUTE:
+        _submit_times[ip or "-"] = times
+        return False
+    times.append(now)
+    _submit_times[ip or "-"] = times
+    return True
+
+
 @router.post("/web/osu-getbeatmapinfo.php")
 async def osuGetBeatmapInfo(
     request: Request,
@@ -1513,6 +1535,12 @@ async def osuGetBeatmapInfo(
             pass
 
     lines = [ln.strip() for ln in f.splitlines() if ln.strip()]
+    # TSG-35: one request can't ask about an unlimited number of maps,
+    # and only a few of them may go out to the osu!api
+    if len(lines) > BEATMAPINFO_MAX_LINES:
+        log(f"{player} sent {len(lines)} maps to getbeatmapinfo, only the first {BEATMAPINFO_MAX_LINES} are checked.", Ansi.LYELLOW)
+        lines = lines[:BEATMAPINFO_MAX_LINES]
+    api_lookups = 0
     log(f"{player} requested info for {len(lines)} maps.", Ansi.LCYAN)
 
     md5_re = re.compile(r"^[0-9a-f]{32}$", re.I)
@@ -1546,7 +1574,8 @@ async def osuGetBeatmapInfo(
 
         if not beatmap:
             bmap_obj = None
-            if candidate_md5:
+            if candidate_md5 and api_lookups < BEATMAPINFO_MAX_API_LOOKUPS:
+                api_lookups += 1
                 bmap_obj = await Beatmap.from_md5(candidate_md5)
             if not bmap_obj and candidate_filename:
                 rec = await maps_repo.fetch_one(filename=candidate_filename)
@@ -2758,6 +2787,10 @@ async def osuSubmitModularSelector(
         else:
             log("[score-submit] cheat screenshot provided (trial mode).", Ansi.LYELLOW)
 
+    if not _submit_rate_ok(client_ip(request)):
+        log(f"[score-submit] too many submissions from one address, dropped.", Ansi.LYELLOW)
+        return Response(b"")
+
     # NOTE: the bancho protocol uses the "score" parameter name for both
     # the base64'ed score data, and the replay file in the multipart
     # starlette/fastapi do not support this, so we've moved it out
@@ -2769,7 +2802,9 @@ async def osuSubmitModularSelector(
     score_data_b64, replay_file = score_parameters
 
     # decrypt the score data (aes)
-    score_data, client_hash_decoded = encryption.decrypt_score_aes_data(
+    # TSG-33: the Rijndael decryption is pure Python, so it runs in a thread
+    score_data, client_hash_decoded = await asyncio.to_thread(
+        encryption.decrypt_score_aes_data,
         score_data_b64,
         client_hash_b64,
         iv_b64,
@@ -2781,16 +2816,11 @@ async def osuSubmitModularSelector(
 
     # fetch map & player
 
-    bmap_md5 = score_data[0]
-    bmap = await Beatmap.from_md5(bmap_md5)
-    if not bmap:
-        # Map does not exist, most likely unsubmitted.
-        return Response(b"error: beatmap")
-
+    # TSG-33: the password is checked before the map lookup (which may ask the osu!api)
     # if the client has supporter, a space is appended
     # but usernames may also end with a space, which must be preserved
     username = score_data[1]
-    if username[-1] == " ":
+    if username[-1:] == " ":
         username = username[:-1]
 
     player = await app.state.sessions.players.from_login(
@@ -2802,6 +2832,12 @@ async def osuSubmitModularSelector(
         # Player is not online, return nothing so that their
         # client will retry submission when they log in.
         return Response(b"")
+
+    bmap_md5 = score_data[0]
+    bmap = await Beatmap.from_md5(bmap_md5)
+    if not bmap:
+        # Map does not exist, most likely unsubmitted.
+        return Response(b"error: beatmap")
 
     # parse the score from the remaining data
     score = Score.from_submission(score_data[2:])
