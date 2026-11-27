@@ -606,6 +606,27 @@ WELCOME_NOTIFICATION = app.packets.notification(
     f"Welcome back to {app.settings.SERVER_NAME}!\nRunning bancho.py v{app.settings.VERSION}.",
 )
 
+# a second popup a few seconds after the welcome one, so it isn't missed
+BUG_REMINDER_DELAY = 6
+BUG_REMINDER_NOTIFICATION = app.packets.notification(
+    "Found a bug? Remember to report it to the dev on Discord!",
+)
+_reminder_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _bug_reminder(player_id: int, token: str) -> None:
+    await asyncio.sleep(BUG_REMINDER_DELAY)
+    player = app.state.sessions.players.get(id=player_id)
+    # only the same session: not after a logout or a new login in the meantime
+    if player is not None and player.token == token:
+        player.enqueue(BUG_REMINDER_NOTIFICATION)
+
+
+def schedule_bug_reminder(player_id: int, token: str) -> None:
+    task = asyncio.create_task(_bug_reminder(player_id, token))
+    _reminder_tasks.add(task)
+    task.add_done_callback(_reminder_tasks.discard)
+
 
 class LoginResponse(TypedDict):
     osu_token: str
@@ -1037,6 +1058,7 @@ async def handle_osu_login_request(
     )
 
     data += WELCOME_NOTIFICATION
+    schedule_bug_reminder(player.id, player.token)
 
     # send all appropriate channel info to our player.
     # the osu! client will attempt to join the channels.
