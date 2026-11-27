@@ -967,17 +967,20 @@ async def handle_osu_login_request(
     geoloc = await app.state.services.fetch_geoloc(ip, headers)
 
     if geoloc is None:
-        return {
-            "osu_token": "login-failed",
-            "response_body": (
-                app.packets.notification(
-                    f"{BASE_DOMAIN}: Login failed. Please contact an admin.",
-                )
-                + app.packets.login_reply(LoginFailureReason.AUTHENTICATION_FAILED)
-            ),
+        # TSG-36: no location (ip-api down or turned off) must not block the login;
+        # the player keeps the country from the database
+        log(f"No geolocation for {login_data['username']}, using the saved country.", Ansi.LYELLOW)
+        fallback = db_country if db_country in app.state.services.country_codes else "xx"
+        geoloc = {
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "country": {
+                "acronym": fallback,
+                "numeric": app.state.services.country_codes[fallback],
+            },
         }
 
-    if db_country == "xx":
+    if db_country == "xx" and geoloc["country"]["acronym"] != "xx":
         # bugfix for old bancho.py versions when
         # country wasn't stored on registration.
         log(f"Fixing {login_data['username']}'s country.", Ansi.LGREEN)

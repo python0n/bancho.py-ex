@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import logging
 import pickle
 import re
@@ -150,6 +151,27 @@ def _fetch_geoloc_from_headers(headers: Mapping[str, str]) -> Geolocation | None
     return geoloc
 
 
+def _geoloc_from(country: str, lat: str, lon: str) -> Geolocation | None:
+    """Build a geolocation from header values; None when they don't make sense
+    (empty, not a number, or a country code osu! doesn't know)."""
+    country_code = country.strip().lower()
+    if country_code not in country_codes or country_code == "xx":
+        return None
+    try:
+        latitude = float(lat)
+        longitude = float(lon)
+    except ValueError:
+        latitude = longitude = 0.0
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "country": {
+            "acronym": country_code,
+            "numeric": country_codes[country_code],
+        },
+    }
+
+
 def __fetch_geoloc_cloudflare(headers: Mapping[str, str]) -> Geolocation | None:
     """Attempt to fetch geolocation data from cloudflare headers."""
     if not all(
@@ -157,54 +179,41 @@ def __fetch_geoloc_cloudflare(headers: Mapping[str, str]) -> Geolocation | None:
     ):
         return None
 
-    country_code = headers["CF-IPCountry"].lower()
-    latitude = float(headers["CF-IPLatitude"])
-    longitude = float(headers["CF-IPLongitude"])
-
-    return {
-        "latitude": latitude,
-        "longitude": longitude,
-        "country": {
-            "acronym": country_code,
-            "numeric": country_codes[country_code],
-        },
-    }
+    return _geoloc_from(headers["CF-IPCountry"], headers["CF-IPLatitude"], headers["CF-IPLongitude"])
 
 
 def __fetch_geoloc_nginx(headers: Mapping[str, str]) -> Geolocation | None:
     """Attempt to fetch geolocation data from nginx headers."""
-    if not all(
-        key in headers for key in ("X-Country-Code", "X-Latitude", "X-Longitude")
-    ):
+    # TSG-30: nginx fills these from a local database (geoip2), so no address leaves the server
+    if "X-Country-Code" not in headers:
         return None
 
-    country_code = headers["X-Country-Code"].lower()
-    latitude = float(headers["X-Latitude"])
-    longitude = float(headers["X-Longitude"])
-
-    return {
-        "latitude": latitude,
-        "longitude": longitude,
-        "country": {
-            "acronym": country_code,
-            "numeric": country_codes[country_code],
-        },
-    }
+    return _geoloc_from(headers["X-Country-Code"], headers.get("X-Latitude", ""), headers.get("X-Longitude", ""))
 
 
 async def _fetch_geoloc_from_ip(ip: IPAddress) -> Geolocation | None:
-    """Fetch geolocation data based on ip (using ip-api)."""
+    """Fetch geolocation data based on ip (using ip-api).
+
+    TSG-30: ip-api works only over plain HTTP, so every player's address goes out
+    unencrypted. GEOLOC_IPAPI=false in .env turns it off once nginx gives the country."""
+    if os.getenv("GEOLOC_IPAPI", "true").strip().lower() in ("false", "0", "no"):
+        return None
     if not ip.is_private:
         url = f"http://ip-api.com/line/{ip}"
     else:
         url = "http://ip-api.com/line/"
 
-    response = await http_client.get(
-        url,
-        params={
-            "fields": ",".join(("status", "message", "countryCode", "lat", "lon")),
-        },
-    )
+    try:
+        response = await http_client.get(
+            url,
+            params={
+                "fields": ",".join(("status", "message", "countryCode", "lat", "lon")),
+            },
+            timeout=3.0,
+        )
+    except httpx.HTTPError as e:
+        log(f"Failed to get geoloc data: {e!r}", Ansi.LRED)
+        return None
     if response.status_code != 200:
         log("Failed to get geoloc data: request failed.", Ansi.LRED)
         return None
@@ -220,6 +229,8 @@ async def _fetch_geoloc_from_ip(ip: IPAddress) -> Geolocation | None:
         return None
 
     country_acronym = lines[0].lower()
+    if country_acronym not in country_codes:
+        return None
 
     return {
         "latitude": float(lines[1]),
