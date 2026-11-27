@@ -25,6 +25,52 @@ from sqlalchemy import select
 from sqlalchemy import update
 
 
+import ast
+
+# TSG-32: achievement conditions come from the database and used to go straight
+# into eval(), so anyone able to write that table could run any Python code in bancho.
+# A condition is now checked first: only `score.<field>`, `mode_vn`, numbers,
+# comparisons, and/or/not and simple arithmetic or bit operations are allowed.
+_ALLOWED_NODES = (
+    ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not, ast.USub, ast.UAdd,
+    ast.BinOp, ast.BitAnd, ast.BitOr, ast.BitXor, ast.Add, ast.Sub, ast.Mult, ast.Div,
+    ast.FloorDiv, ast.Mod, ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.Name, ast.Attribute, ast.Constant, ast.Load,
+)
+
+
+def _check_cond(tree: ast.AST) -> None:
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODES):
+            raise ValueError(f"not allowed: {type(node).__name__}")
+        if isinstance(node, ast.Name) and node.id not in ("score", "mode_vn"):
+            raise ValueError(f"unknown name: {node.id}")
+        if isinstance(node, ast.Attribute):
+            if not isinstance(node.value, ast.Name) or node.value.id != "score" or node.attr.startswith("_"):
+                raise ValueError("only score.<field> is allowed")
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float, bool, type(None))):
+            raise ValueError("only numbers are allowed")
+
+
+def compile_cond(cond: str) -> Callable[[Score, int], bool]:
+    """Turn a condition from the database into a function, or one that is always
+    False (with a log line) when the condition isn't allowed."""
+    try:
+        tree = ast.parse(cond, mode="eval")
+        _check_cond(tree)
+        code = compile(tree, "<achievement>", "eval")
+    except (SyntaxError, ValueError) as e:
+        from app.logging import Ansi
+        from app.logging import log
+        log(f"Achievement condition refused ({e}): {cond!r}", Ansi.LRED)
+        return lambda score, mode_vn: False
+
+    def cond_fn(score: Score, mode_vn: int) -> bool:
+        return bool(eval(code, {"__builtins__": {}}, {"score": score, "mode_vn": mode_vn}))
+
+    return cond_fn
+
+
 class AchievementsTable(Base):
     __tablename__ = "achievements"
 
@@ -77,7 +123,7 @@ async def create(
     achievement = await app.state.services.database.fetch_one(select_stmt)
     assert achievement is not None
 
-    achievement["cond"] = eval(f'lambda score, mode_vn: {achievement["cond"]}')
+    achievement["cond"] = compile_cond(achievement["cond"])
     return cast(Achievement, achievement)
 
 
@@ -100,7 +146,7 @@ async def fetch_one(
     if achievement is None:
         return None
 
-    achievement["cond"] = eval(f'lambda score, mode_vn: {achievement["cond"]}')
+    achievement["cond"] = compile_cond(achievement["cond"])
     return cast(Achievement, achievement)
 
 
@@ -124,7 +170,7 @@ async def fetch_many(
 
     achievements = await app.state.services.database.fetch_all(select_stmt)
     for achievement in achievements:
-        achievement["cond"] = eval(f'lambda score, mode_vn: {achievement["cond"]}')
+        achievement["cond"] = compile_cond(achievement["cond"])
 
     return cast(list[Achievement], achievements)
 
@@ -147,7 +193,7 @@ async def fetch_user_locked(
 
     achievements = await app.state.services.database.fetch_all(select_stmt)
     for achievement in achievements:
-        achievement["cond"] = eval(f'lambda score, mode_vn: {achievement["cond"]}')
+        achievement["cond"] = compile_cond(achievement["cond"])
 
     return cast(list[Achievement], achievements)
 
@@ -177,7 +223,7 @@ async def partial_update(
     if achievement is None:
         return None
 
-    achievement["cond"] = eval(f'lambda score, mode_vn: {achievement["cond"]}')
+    achievement["cond"] = compile_cond(achievement["cond"])
     return cast(Achievement, achievement)
 
 
@@ -193,5 +239,5 @@ async def delete_one(
     delete_stmt = delete(AchievementsTable).where(AchievementsTable.id == id)
     await app.state.services.database.execute(delete_stmt)
 
-    achievement["cond"] = eval(f'lambda score, mode_vn: {achievement["cond"]}')
+    achievement["cond"] = compile_cond(achievement["cond"])
     return cast(Achievement, achievement)
