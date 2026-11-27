@@ -61,6 +61,7 @@ from app.constants.clientflags import LastFMFlags
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
 from app.constants.privileges import Privileges
+import app.ac_trace
 from app.logging import Ansi
 from app.logging import log
 from app.objects import models
@@ -1646,6 +1647,7 @@ async def osuAddFavourite(
 
 @router.get("/web/lastfm.php")
 async def lastFM(
+    request: Request,
     action: Literal["scrobble", "np"],
     beatmap_id_or_hidden_flag: str = Query(
         ...,
@@ -1657,12 +1659,30 @@ async def lastFM(
     ),
     player: Player = Depends(authenticate_player_session(Query, "us", "ha")),
 ) -> Response:
-    if beatmap_id_or_hidden_flag[0] != "a":
+    flags_value: int | None = None
+    if beatmap_id_or_hidden_flag.startswith("a"):
+        try:
+            flags_value = int(beatmap_id_or_hidden_flag[1:])
+        except ValueError:
+            flags_value = None
+    response = await _lastfm_handle(player, beatmap_id_or_hidden_flag, flags_value)
+    # every call is recorded without the password (us/ha) for the anticheat review
+    app.ac_trace.trace_lastfm(player, request.query_params, flags_value, response.body)
+    return response
+
+
+async def _lastfm_handle(player: Player, beatmap_id_or_hidden_flag: str, flags_value: int | None) -> Response:
+    if not beatmap_id_or_hidden_flag.startswith("a"):
         # not anticheat related, tell the
         # client not to send any more for now.
+        # LASTFM_NO_STOP=true answers with an empty body instead (experiment)
+        return Response(b"" if app.ac_trace.LASTFM_NO_STOP else b"-3")
+
+    if flags_value is None:
+        # "a" followed by something that is not a number
         return Response(b"-3")
 
-    flags = LastFMFlags(int(beatmap_id_or_hidden_flag[1:]))
+    flags = LastFMFlags(flags_value)
 
     if flags & (LastFMFlags.HQ_ASSEMBLY | LastFMFlags.HQ_FILE):
         # Player is currently running hq!osu; could possibly
@@ -2761,7 +2781,7 @@ async def osuSubmitModularSelector(
     # TODO: should token be allowed
     # through but ac'd if not found?
     # TODO: validate token format
-    # TODO: save token in the database
+    # recorded (described, not decrypted) in .data/logs/ac_token.log
     token: str = Header(...),
     # TODO: do ft & st contain pauses?
     exited_out: bool = Form(..., alias="x"),
@@ -2845,6 +2865,10 @@ async def osuSubmitModularSelector(
     # attach bmap & player
     score.bmap = bmap
     score.player = player
+
+    # the osu!auth token is kept as a description only; a token already used
+    # with a different score is logged as suspicious
+    await app.ac_trace.trace_token(player, bmap, osu_version, token, score.client_checksum)
 
     ## perform checksum validation
 
