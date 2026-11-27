@@ -35,12 +35,22 @@ changelog.
 - After an update the leaderboard of the right difficulty is used, not always the first one.
 
 ### Scores and pp
+- Ranked score comes from the highest score on every Ranked, Approved and Loved map, like on the
+  official server; grade counts are recalculated the same way.
+- A score, its stats and its replay are saved together, so a crash in the middle leaves neither half
+  a score nor a lost replay. A passed score without a replay is not accepted.
+- The global and country rankings repair themselves if they ever drift from the scores.
 - No duplicated pp: the best score is chosen and saved inside one transaction.
 - Failed scores and best-by-score scores are saved instead of dropped.
 - One leaderboard row per player.
 - In score based modes the #1, placements, personal bests and #1 announcements go by the highest
   score; Relax and Autopilot go by pp. Beating your own #1 is not announced.
 - Pinned scores (`scores.pinned`, `scores.pin_order`).
+- Score submission checks the password before looking the map up, decrypts the score off the event
+  loop and is limited per address. `getbeatmapinfo` checks at most 2000 maps per request and asks
+  the osu!api about at most 50 of them.
+- Achievement conditions from the database are checked against a small allow list (score fields,
+  `mode_vn`, numbers, comparisons) instead of being passed to `eval`.
 - Replays uploaded on the website and accepted by an admin are saved through `POST /v1/approve_replay`
   (website only, `X-Internal-Key`) with the same rules as scores from the game, stats and rank included.
 
@@ -53,12 +63,17 @@ changelog.
   match page on the website.
 - `!mp` commands follow the osu! wiki. Rooms made with `!mp make` close after 30 minutes
   without players. Locking a taken slot and `!mp kick` really remove the player.
-- Match history in `mp_match_games`, `mp_match_scores` and `mp_match_events`.
+- Match history in `mp_match_games`, `mp_match_scores` and `mp_match_events`; the match chat in
+  `mp_match_chat`, with `!mp password` masked, visible only to staff.
+- Matches can be hidden by staff.
 - Tournament client: login, `TOURNAMENT` and `TOURNEY_MANAGER` privileges, scores for spectators.
 
 ### IRC
 - The same rules as in the game: silence, read only channels, blocked private messages,
   2000 character limit; messages to offline players go to their mailbox.
+- Meant to sit behind a TLS proxy (e.g. nginx `stream` with `proxy_protocol`); the PROXY header is
+  trusted only from the container's gateway (the host), not from other containers.
+- Message flood limit, a time limit before logging in, and failed logins counted per connection.
 - Private messages between IRC users and from the game to IRC users work, so do joining and
   leaving channels.
 
@@ -82,12 +97,27 @@ changelog.
 - Restricted players are hidden from other players in the public `/v1` API. The website sends
   `X-Internal-Key` (`INTERNAL_API_KEY` in `.env`) to see them for staff.
 - A wrong password no longer logs out an idle session of the same account.
-- Login rate limit per IP; no plaintext password cache.
+- Wrong password limit per account and address (the game login and `/web/` are counted separately),
+  bcrypt runs off the event loop; no plaintext password cache.
 - Clan changes made on the website reach the game at once (`clan_change` pubsub).
+- A password change on the website ends every session of the account: game client, IRC and website
+  chat (`password_changed` pubsub).
+- Staff accounts and staff privileges can only be changed by a developer; bancho checks it too,
+  using the admin id sent with the pubsub message.
+- Supporter lasts at most a year and the expiry job keeps running after errors.
+- `!server` is for staff only.
+- Map statuses from the panel are limited to Pending, Ranked, Approved, Qualified and Loved;
+  `!map approve` and `!map qualify` added.
+- The player's country comes from proxy headers (`X-Country-Code`, `X-Latitude`, `X-Longitude`, e.g.
+  nginx with a local GeoIP database). The ip-api.com lookup over plain HTTP is only a fallback and
+  can be turned off; without any location the login still works with the saved country.
 
 ### Redis
-- `ex:map_status_change` on rank, love and unrank; `#announce` and `#osu` messages; BSS uploads.
+- `ex:map_status_change` on every map status change; `#announce` and `#osu` messages; BSS uploads.
   Our Discord bot listens to these.
+- Pubsub receivers skip a bad message instead of stopping and reconnect after Redis restarts.
+- When the website sends a `req_id`, bancho puts the result in `ex:ack:<req_id>`, so the admin panel
+  can show what really happened.
 - Connection and pubsub leaks fixed.
 
 ## Settings added in `.env`
@@ -96,6 +126,7 @@ changelog.
 | --- | --- |
 | `INTERNAL_API_KEY` | key the website sends to see restricted players and to save accepted replays; same value in Shiina's `.env` |
 | `OSZ2_SERVICE_URL` | address of osz2-service, e.g. `http://osz2-service:8080` |
+| `GEOLOC_IPAPI` | `false` turns off the ip-api.com fallback when the proxy sends the country headers |
 
 ## Frontend
 
