@@ -27,6 +27,27 @@ async def start_pubsub_recievers():
         asyncio.create_task(_receiver(channel, handler), name=f"pubsub:{channel}")
 
 
+def _req_id(data: dict) -> str | None:
+    req_id = data.get("req_id")
+    if isinstance(req_id, str) and 8 <= len(req_id) <= 64 and req_id.isalnum():
+        return req_id
+    return None
+
+
+async def _ack(data: dict, result: str) -> None:
+    """AUD-12: when Shiina sent a request id, put the result where it waits for it,
+    so the panel shows what really happened instead of always "success"."""
+    req_id = _req_id(data)
+    if req_id is None:
+        return
+    try:
+        key = f"ex:ack:{req_id}"
+        await app.state.services.redis.rpush(key, result[:200])
+        await app.state.services.redis.expire(key, 60)
+    except Exception as e:
+        log(f"EX | could not send the result back: {e!r}", Ansi.LRED)
+
+
 async def _receiver(channel: str, handler) -> None:
     while True:
         pubsub = app.state.services.redis.pubsub()
@@ -36,15 +57,18 @@ async def _receiver(channel: str, handler) -> None:
             async for message in pubsub.listen():
                 if message["type"] != "message":
                     continue
+                data = None
                 try:
                     data = orjson.loads(message["data"])
                     if not isinstance(data, dict):
                         raise ValueError("payload is not a JSON object")
-                    await handler(data)
+                    result = await handler(data)
+                    await _ack(data, result if isinstance(result, str) else "success")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     log(f"EX | {channel} | bad message skipped: {e!r}", Ansi.LRED)
+                    await _ack(data if isinstance(data, dict) else {}, "error in bancho, see its log")
             log(f"'{channel}' subscription ended - resubscribing in {RETRY_DELAY}s", Ansi.LYELLOW)
         except asyncio.CancelledError:
             log(f"Channel {channel} receiver task cancelled.", Ansi.LYELLOW)
@@ -60,7 +84,7 @@ async def _receiver(channel: str, handler) -> None:
         await asyncio.sleep(RETRY_DELAY)
 
 
-async def handle_clan_change(data: dict) -> None:
+async def handle_clan_change(data: dict) -> str | None:
     """Shiina changed someone's clan (join, leave, kick, create, disband):
     refresh the clan of online players so it's right without logging in again.
     Payload: {"ids": [user ids]} and/or {"clan_id": id} for every member of a clan."""
@@ -88,38 +112,44 @@ async def handle_clan_change(data: dict) -> None:
     log(f"EX | Clan Change | refreshed {len(targets)} online player(s)", Ansi.LBLUE)
 
 
-async def handle_name_change(data: dict) -> None:
+async def handle_name_change(data: dict) -> str | None:
     id, name = int(data["id"]), str(data["name"])
     log(f"EX | Name Change | ID: {id}, Name: {name}", Ansi.LBLUE)
-    log("EX | " + await change_user_name(id, name), Ansi.LBLUE)
+    result = await change_user_name(id, name)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_country_change(data: dict) -> None:
+async def handle_country_change(data: dict) -> str | None:
     id, country = int(data["id"]), str(data["country"])
     log(f"EX | Country Change | ID: {id}, Country: {country}", Ansi.LBLUE)
-    log("EX | " + await change_user_flag(id, country), Ansi.LBLUE)
+    result = await change_user_flag(id, country)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_wipe(data: dict) -> None:
+async def handle_wipe(data: dict) -> str | None:
     id, mode = int(data["id"]), int(data["mode"])
     log(f"EX | Wipe | ID: {id}, Mode: {mode}", Ansi.LBLUE)
-    log("EX | " + await wipe_user(id, mode), Ansi.LBLUE)
+    result = await wipe_user(id, mode)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_rank(data: dict) -> None:
+async def handle_rank(data: dict) -> str | None:
     beatmap_id = int(data["beatmap_id"])
     status = int(data["status"])
     frozen = bool(data["frozen"])
     if status not in PANEL_STATUSES:
         # AUD-27: only the statuses the panel offers; anything else is a bad message
         log(f"EX | Rank | Beatmap ID: {beatmap_id}, refused status {status}", Ansi.LRED)
-        return
+        return "status not allowed"
     log(f"EX | Rank | Beatmap ID: {beatmap_id}, Status: {status}, Frozen: {frozen}", Ansi.LBLUE)
     response = await change_bm_status(beatmap_id, status, frozen)
     log("EX | " + response, Ansi.LBLUE)
     if response != "success":
         # nothing changed, so nothing to announce (AUD-29)
-        return
+        return response
 
     # Notify Discord bot
     from app.usecases.notifications import notify_map_status_change
@@ -137,30 +167,39 @@ async def handle_rank(data: dict) -> None:
         }).decode(),
     )
     await notify_map_status_change([beatmap_id], status, data.get("user_id"))
+    return "success"
 
 
-async def handle_restrict(data: dict) -> None:
+async def handle_restrict(data: dict) -> str | None:
     id, admin_id, reason = int(data["id"]), int(data["userId"]), str(data.get("reason") or "")
     log(f"EX | Restrict | ID: {id}, User ID: {admin_id}, Reason: {reason}", Ansi.LBLUE)
-    log("EX | " + await restrict(id, admin_id, reason), Ansi.LBLUE)
+    result = await restrict(id, admin_id, reason)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_unrestrict(data: dict) -> None:
+async def handle_unrestrict(data: dict) -> str | None:
     id, admin_id, reason = int(data["id"]), int(data["userId"]), str(data.get("reason") or "")
     log(f"EX | Unrestrict | ID: {id}, User ID: {admin_id}", Ansi.LBLUE)
-    log("EX | " + await unrestrict(id, admin_id, reason), Ansi.LBLUE)
+    result = await unrestrict(id, admin_id, reason)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_alert_all(data: dict) -> None:
+async def handle_alert_all(data: dict) -> str | None:
     message = str(data["message"])
     log(f"EX | Alert All | Message: {message}", Ansi.LBLUE)
-    log("EX | " + await alert_all(message), Ansi.LBLUE)
+    result = await alert_all(message)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_givedonator(data: dict) -> None:
+async def handle_givedonator(data: dict) -> str | None:
     id, duration = int(data["id"]), str(data["duration"])
     log(f"EX | Give Donator | ID: {id}, Duration: {duration}", Ansi.LBLUE)
-    log("EX | " + await givedonator(id, duration), Ansi.LBLUE)
+    result = await givedonator(id, duration)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
 def _privs_list(data: dict) -> list:
@@ -170,21 +209,25 @@ def _privs_list(data: dict) -> list:
     return privs
 
 
-async def handle_addpriv(data: dict) -> None:
+async def handle_addpriv(data: dict) -> str | None:
     id, privs = int(data["id"]), _privs_list(data)
     actor_id = int(data["userId"]) if data.get("userId") else None
     log(f"EX | Add Priv | ID: {id}, Privs: {privs}, By: {actor_id}", Ansi.LBLUE)
-    log("EX | " + await addpriv(id, privs, actor_id), Ansi.LBLUE)
+    result = await addpriv(id, privs, actor_id)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_removepriv(data: dict) -> None:
+async def handle_removepriv(data: dict) -> str | None:
     id, privs = int(data["id"]), _privs_list(data)
     actor_id = int(data["userId"]) if data.get("userId") else None
     log(f"EX | Remove Priv | ID: {id}, Privs: {privs}, By: {actor_id}", Ansi.LBLUE)
-    log("EX | " + await removepriv(id, privs, actor_id), Ansi.LBLUE)
+    result = await removepriv(id, privs, actor_id)
+    log("EX | " + result, Ansi.LBLUE)
+    return result
 
 
-async def handle_password_changed(data: dict) -> None:
+async def handle_password_changed(data: dict) -> str | None:
     """Shiina set a new password (reset link from e-mail or from the panel).
     Ends every session of that account in bancho: the game client, IRC and the
     website chat. Whoever was logged in with the old password is out, and the
