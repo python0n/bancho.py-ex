@@ -28,6 +28,31 @@ from app.objects.channel import Channel
 from app.objects.player import Player
 from app.utils import make_safe_name
 
+
+def _default_gateway() -> IPv4Address | None:
+    """The container's default gateway (the host, where nginx runs), from /proc/net/route."""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == "00000000":
+                    return IPv4Address(int(fields[2], 16).to_bytes(4, "little"))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+_TRUSTED_PROXIES: set | None = None
+
+
+def _trusted_proxies() -> set:
+    global _TRUSTED_PROXIES
+    if _TRUSTED_PROXIES is None:
+        gw = _default_gateway()
+        _TRUSTED_PROXIES = {gw} if gw is not None else set()
+        log(f"[IRC] PROXY headers trusted only from: {sorted(map(str, _TRUSTED_PROXIES)) or 'localhost'}", Ansi.LCYAN)
+    return _TRUSTED_PROXIES
+
 NAME = "banchobot"
 FLOOD_MSGS = 10
 FLOOD_WINDOW = 5.0
@@ -292,7 +317,10 @@ class IRCClient:
             return
         self._proxy_seen = True
         peer = self.ip_obj
-        if peer is None or not (peer.is_loopback or peer.is_private):
+        # TSG-18: only nginx may say who the client really is. nginx runs on the host,
+        # so inside the container it shows up as the default gateway; other containers
+        # on the same network are private addresses too and must not be trusted.
+        if peer is None or not (peer.is_loopback or peer in _trusted_proxies()):
             log(f"[IRC] ignored PROXY header from {self.ip}", Ansi.LYELLOW)
             return
         parts = args.split()
