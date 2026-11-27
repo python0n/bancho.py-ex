@@ -15,6 +15,8 @@ from app.logging import log
 from .utils import *  # noqa: F403
 
 RETRY_DELAY = 5
+# map statuses the panel may set: 0 pending, 2 ranked, 3 approved, 4 qualified, 5 loved
+PANEL_STATUSES = {0, 2, 3, 4, 5}
 
 
 async def start_pubsub_recievers():
@@ -108,6 +110,10 @@ async def handle_rank(data: dict) -> None:
     beatmap_id = int(data["beatmap_id"])
     status = int(data["status"])
     frozen = bool(data["frozen"])
+    if status not in PANEL_STATUSES:
+        # AUD-27: only the statuses the panel offers; anything else is a bad message
+        log(f"EX | Rank | Beatmap ID: {beatmap_id}, refused status {status}", Ansi.LRED)
+        return
     log(f"EX | Rank | Beatmap ID: {beatmap_id}, Status: {status}, Frozen: {frozen}", Ansi.LBLUE)
     response = await change_bm_status(beatmap_id, status, frozen)
     log("EX | " + response, Ansi.LBLUE)
