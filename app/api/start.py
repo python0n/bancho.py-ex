@@ -178,6 +178,36 @@ async def handle_removepriv(data: dict) -> None:
     log("EX | " + await removepriv(id, privs, actor_id), Ansi.LBLUE)
 
 
+async def handle_password_changed(data: dict) -> None:
+    """Shiina set a new password (reset link from e-mail or from the panel).
+    Ends every session of that account in bancho: the game client, IRC and the
+    website chat. Whoever was logged in with the old password is out, and the
+    /web/ endpoints stop accepting the old password, because they check it
+    against the online session first. Payload: {"id": user id}."""
+    user_id = int(data["id"])
+    irc = getattr(app.state.services, "irc", None)
+    sessions = [p for p in list(app.state.sessions.players) if p.id == user_id]
+    closed = 0
+    for player in sessions:
+        if irc is not None:
+            clients, _ = irc.detach(player)
+            for client in clients:
+                if client in irc.clients:
+                    irc.clients.remove(client)
+                try:
+                    client.socket.close()
+                except Exception:
+                    pass
+                closed += 1
+        if player.is_online:
+            player.logout()
+    log(
+        f"EX | Password Changed | ID: {user_id}, ended {len(sessions)} session(s), "
+        f"closed {closed} chat connection(s)",
+        Ansi.LBLUE,
+    )
+
+
 RECEIVERS = {
     "rank": handle_rank,
     "restrict": handle_restrict,
@@ -190,4 +220,5 @@ RECEIVERS = {
     "country_change": handle_country_change,
     "name_change": handle_name_change,
     "clan_change": handle_clan_change,
+    "password_changed": handle_password_changed,
 }
