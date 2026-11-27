@@ -1367,7 +1367,18 @@ async def reload(ctx: Context) -> str | None:
     return f"Reloaded {mod.__name__}"
 
 
-@command(Privileges.UNRESTRICTED)
+_CPU_INFO: dict | None = None
+
+
+def _cpu_info() -> dict:
+    """cpuinfo.get_cpu_info() takes about a second and blocks the server, so it runs once."""
+    global _CPU_INFO
+    if _CPU_INFO is None:
+        _CPU_INFO = cpuinfo.get_cpu_info()
+    return _CPU_INFO
+
+
+@command(Privileges.STAFF)  # TSG-34: system details only for staff
 async def server(ctx: Context) -> str | None:
     """Retrieve performance data about the server."""
 
@@ -1378,7 +1389,7 @@ async def server(ctx: Context) -> str | None:
     uptime = int(time.time() - proc.create_time())
 
     # get info about our cpu
-    cpu_info = cpuinfo.get_cpu_info()
+    cpu_info = _cpu_info()
 
     # list of all cpus installed with thread count
     thread_count = cpu_info["count"]
