@@ -34,26 +34,47 @@ async def initialize_housekeeping_tasks() -> None:
 
 
 async def _remove_expired_donation_privileges(interval: int) -> None:
-    """Remove donation privileges from users with expired sessions."""
+    """Remove donation privileges from users with expired sessions.
+
+    AUD-09: one error (a database hiccup, a user that can't be loaded) used to end
+    this task for good, so supporter stopped expiring until the next restart.
+    Now every round and every player is guarded and the loop keeps going."""
     while True:
-        if app.settings.DEBUG:
-            log("Removing expired donation privileges.", Ansi.LMAGENTA)
+        try:
+            await _expire_donors_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"Expiring supporters failed, retrying later: {e!r}", Ansi.LRED)
+        await asyncio.sleep(interval)
 
-        expired_donors = await app.state.services.database.fetch_all(
-            "SELECT id FROM users "
-            "WHERE donor_end <= UNIX_TIMESTAMP() "
-            "AND priv & :donor_priv",
-            {"donor_priv": Privileges.DONATOR.value},
-        )
 
-        for expired_donor in expired_donors:
+async def _expire_donors_once() -> None:
+    if app.settings.DEBUG:
+        log("Removing expired donation privileges.", Ansi.LMAGENTA)
+
+    expired_donors = await app.state.services.database.fetch_all(
+        "SELECT id FROM users "
+        "WHERE donor_end <= UNIX_TIMESTAMP() "
+        "AND priv & :donor_priv",
+        {"donor_priv": Privileges.DONATOR.value},
+    )
+
+    for expired_donor in expired_donors:
+        try:
             player = await app.state.sessions.players.from_cache_or_sql(
                 id=expired_donor["id"],
             )
 
-            assert player is not None
+            if player is None:
+                # can't be loaded as a player: take the bits away in the database directly
+                await app.state.services.database.execute(
+                    "UPDATE users SET priv = priv & ~:donor_priv, donor_end = 0 WHERE id = :id",
+                    {"donor_priv": Privileges.DONATOR.value, "id": expired_donor["id"]},
+                )
+                log(f"User {expired_donor['id']}'s supporter status has expired.", Ansi.LMAGENTA)
+                continue
 
-            # TODO: perhaps make a `revoke_donor` method?
             await player.remove_privs(Privileges.DONATOR)
             player.donor_end = 0
             await app.state.services.database.execute(
@@ -67,8 +88,10 @@ async def _remove_expired_donation_privileges(interval: int) -> None:
                 )
 
             log(f"{player}'s supporter status has expired.", Ansi.LMAGENTA)
-
-        await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"Expiring supporter of user {expired_donor['id']} failed: {e!r}", Ansi.LRED)
 
 
 async def _disconnect_ghosts(interval: int) -> None:

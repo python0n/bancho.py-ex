@@ -1305,6 +1305,9 @@ async def givedonator(ctx: Context) -> str | None:
     else:
         timespan += target.donor_end
 
+    # supporter lasts at most a year from now, also when added on top of a running one
+    timespan = min(timespan, time.time() + 365 * 24 * 60 * 60)
+
     target.donor_end = int(timespan)
     await app.state.services.database.execute(
         "UPDATE users SET donor_end = :end WHERE id = :user_id",

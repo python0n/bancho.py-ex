@@ -6,6 +6,8 @@ from app.objects.beatmap import Beatmap, ensure_osu_file_is_available
 from app.repositories import maps as maps_repo
 from pytimeparse.timeparse import timeparse
 
+MAX_SUPPORTER_SECONDS = 365 * 24 * 60 * 60
+
 str_priv_dict = {
     "normal": Privileges.UNRESTRICTED,
     "verified": Privileges.VERIFIED,
@@ -217,6 +219,9 @@ async def givedonator(id: int, duration: any) -> str:
         timespan += time.time()
     else:
         timespan += target.donor_end
+
+    # supporter lasts at most a year from now, also when added on top of a running one
+    timespan = min(timespan, time.time() + MAX_SUPPORTER_SECONDS)
 
     target.donor_end = int(timespan)
     
