@@ -36,6 +36,12 @@ REPEAT_TTL = KEEP_DAYS * 24 * 3600
 # real osu!auth token; such a placeholder is written as is and never checked
 # for repeats (it is the same for every score)
 PLACEHOLDER_MAX_LEN = 32
+# what the normal stable client sends to a private server
+EXPECTED_TOKEN = "Empty"
+# one alert per player per hour at most
+ALERT_KEY = "tsg:ac_token_alert:{}"
+ALERT_TTL = 3600
+STAFF_PRIVS = (1 << 13) | (1 << 14)  # ADMINISTRATOR | DEVELOPER
 
 # raw tokens contain (encrypted) hardware hashes of players, so off by default
 KEEP_RAW = os.environ.get("AC_TOKEN_KEEP_RAW", "false").strip().lower() in ("1", "true", "yes")
@@ -153,10 +159,96 @@ async def trace_token(player: Any, bmap: Any, osu_version: str, token: str | Non
             "repeated_with": repeated_with,
         }
         _write("ac_token.log", record)
+        if raw != EXPECTED_TOKEN or repeated_with:
+            await _alert_token(player, bmap, raw, placeholder, b64_ok, decoded, repeated_with)
         if KEEP_RAW and raw:
             _write("ac_token_raw.log", {"t": record["t"], "user_id": player.id, "sha256": sha, "token": raw})
     except Exception as exc:
         log(f"Score token trace failed: {exc!r}", Ansi.LRED)
+
+
+def _describe(raw: str, placeholder: bool, b64_ok: bool, decoded: bytes, repeated: str | None) -> str:
+    if repeated:
+        return "a token already used with another score"
+    if not raw:
+        return "an empty token"
+    if placeholder:
+        safe = "".join(c for c in raw if c.isalnum() or c in "+/=_-")[:40]
+        return f'"{safe}" instead of "{EXPECTED_TOKEN}"'
+    if b64_ok:
+        return f"a real-looking token ({len(decoded)} bytes)"
+    return f"an unknown token ({len(raw)} characters)"
+
+
+async def _alert_token(player: Any, bmap: Any, raw: str, placeholder: bool, b64_ok: bool,
+                       decoded: bytes, repeated: str | None) -> None:
+    """Bell notification for admins and a line on the staff Discord channel."""
+    try:
+        redis = app.state.services.redis
+        if not await redis.set(ALERT_KEY.format(player.id), "1", nx=True, ex=ALERT_TTL):
+            return
+        what = _describe(raw, placeholder, b64_ok, decoded, repeated)
+        map_name = getattr(bmap, "full_name", None) or str(getattr(bmap, "id", "?"))
+        log(f"{player} sent {what} with a score on {map_name}", Ansi.LRED)
+        await _notify_staff(player, "ac_token", {"user": player.name, "what": what, "map": map_name},
+                            f"{what} on {map_name}")
+    except Exception as exc:
+        log(f"Score token alert failed: {exc!r}", Ansi.LRED)
+
+
+async def _notify_staff(player: Any, kind: str, data: dict[str, Any], discord_what: str) -> None:
+    """Bell notification for every admin/developer and a line on the staff Discord channel."""
+    from app.usecases.notifications import notify
+
+    rows = await app.state.services.database.fetch_all(
+        "SELECT id FROM users WHERE (priv & :staff) <> 0",
+        {"staff": STAFF_PRIVS},
+    )
+    for row in rows:
+        await notify(row["id"], kind, data, f"/u/{player.id}")
+    await app.state.services.redis.publish(
+        "ex:security",
+        orjson.dumps({"action": kind, "user_id": player.id, "name": player.name, "what": discord_what}).decode(),
+    )
+
+
+LASTFM_ALERT_KEY = "tsg:lastfm_alert:{}:{}"
+
+
+async def alert_lastfm(player: Any, raw_b: str, flags: int | None) -> None:
+    """lastfm.php with anticheat flags ("a" + number) or a broken "a" value: tell the staff.
+
+    One alert per player and flag set per hour; the flags can be false alarms,
+    so this is only a hint to look at the player's replays.
+    """
+    try:
+        if not raw_b.startswith("a"):
+            return
+        if flags is None:
+            what = "a malformed anticheat value"
+            names_key = "malformed"
+        else:
+            names: list[str] = []
+            known = 0
+            try:
+                from app.constants.clientflags import LastFMFlags
+
+                for f in LastFMFlags:
+                    if f.value and flags & f.value:
+                        names.append(f.name or str(f.value))
+                        known |= f.value
+            except Exception:
+                pass
+            names += [f"unknown bit {b}" for b in range(64) if (flags & ~known) >> b & 1]
+            what = ", ".join(names) if names else f"flags {flags}"
+            names_key = str(flags)
+        redis = app.state.services.redis
+        if not await redis.set(LASTFM_ALERT_KEY.format(player.id, names_key), "1", nx=True, ex=ALERT_TTL):
+            return
+        log(f"{player} lastfm.php reported {what}", Ansi.LRED)
+        await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}")
+    except Exception as exc:
+        log(f"lastfm alert failed: {exc!r}", Ansi.LRED)
 
 
 def trace_lastfm(player: Any, query: Any, flags: int | None, response: bytes) -> None:

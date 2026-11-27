@@ -1668,6 +1668,7 @@ async def lastFM(
     response = await _lastfm_handle(player, beatmap_id_or_hidden_flag, flags_value)
     # every call is recorded without the password (us/ha) for the anticheat review
     app.ac_trace.trace_lastfm(player, request.query_params, flags_value, response.body)
+    await app.ac_trace.alert_lastfm(player, beatmap_id_or_hidden_flag, flags_value)
     return response
 
 
