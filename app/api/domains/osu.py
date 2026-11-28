@@ -2802,8 +2802,6 @@ async def osuSubmitModularSelector(
     # the osu!auth token is kept as a description only; a token already used
     # with a different score is logged as suspicious
     await app.ac_trace.trace_token(player, bmap, osu_version, token, score.client_checksum)
-    # old anticheat flags sent with the score (spaces after the osu! version)
-    await app.ac_trace.alert_score_flags(player, bmap, int(score.client_flags))
 
     ## perform checksum validation
 
@@ -3262,6 +3260,10 @@ async def osuSubmitModularSelector(
                 )
                 if score.player.is_online:
                     score.player.logout()
+
+    # old anticheat flags sent with the score (spaces after the osu! version);
+    # after saving, so the report and the notification can link to the score
+    await app.ac_trace.alert_score_flags(player, bmap, int(score.client_flags), score.id or None)
 
     """ Update the user's & beatmap's stats """
 

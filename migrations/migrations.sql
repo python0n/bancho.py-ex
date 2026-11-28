@@ -522,3 +522,24 @@ CREATE TABLE IF NOT EXISTS vanilla_replay_links (
     CONSTRAINT fk_vanilla_replay_score
         FOREIGN KEY (score_id) REFERENCES scores (id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
+
+# v5.26.0
+CREATE TABLE IF NOT EXISTS ac_reports (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    source VARCHAR(16) NOT NULL,
+    flags BIGINT NULL DEFAULT NULL,
+    score_id BIGINT NULL DEFAULT NULL,
+    map_md5 CHAR(32) NULL DEFAULT NULL,
+    detail VARCHAR(512) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reviewed_by INT NULL DEFAULT NULL,
+    reviewed_at DATETIME NULL DEFAULT NULL,
+    note VARCHAR(255) NULL DEFAULT NULL,
+    PRIMARY KEY (id),
+    KEY ac_reports_user_index (user_id, id),
+    KEY ac_reports_open_index (reviewed_at, id)
+) ENGINE=InnoDB;
+INSERT INTO ac_reports (user_id, source, flags, score_id, map_md5, detail, created_at)
+    SELECT userid, 'score', client_flags, id, map_md5, 'score from before the report list', play_time
+    FROM scores WHERE client_flags <> 0;

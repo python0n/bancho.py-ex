@@ -189,6 +189,7 @@ async def _alert_token(player: Any, bmap: Any, raw: str, placeholder: bool, b64_
             return
         what = _describe(raw, placeholder, b64_ok, decoded, repeated)
         map_name = getattr(bmap, "full_name", None) or str(getattr(bmap, "id", "?"))
+        await record_report(player.id, "token", None, None, getattr(bmap, "md5", None), what)
         log(f"{player} sent {what} with a score on {map_name}", Ansi.LRED)
         await _notify_staff(player, "ac_token", {"user": player.name, "what": what, "map": map_name},
                             f"{what} on {map_name}")
@@ -196,7 +197,22 @@ async def _alert_token(player: Any, bmap: Any, raw: str, placeholder: bool, b64_
         log(f"Score token alert failed: {exc!r}", Ansi.LRED)
 
 
-async def _notify_staff(player: Any, kind: str, data: dict[str, Any], discord_what: str) -> None:
+async def record_report(user_id: int, source: str, flags: int | None, score_id: int | None,
+                        map_md5: str | None, detail: str) -> None:
+    """One row in ac_reports, the list the staff review in the admin panel (/ap/anticheat)."""
+    try:
+        await app.state.services.database.execute(
+            "INSERT INTO ac_reports (user_id, source, flags, score_id, map_md5, detail) "
+            "VALUES (:user_id, :source, :flags, :score_id, :map_md5, :detail)",
+            {"user_id": user_id, "source": source, "flags": flags, "score_id": score_id,
+             "map_md5": map_md5, "detail": detail[:500]},
+        )
+    except Exception as exc:
+        log(f"Could not record anticheat report: {exc!r}", Ansi.LRED)
+
+
+async def _notify_staff(player: Any, kind: str, data: dict[str, Any], discord_what: str,
+                        link: str | None = None) -> None:
     """Bell notification for every admin/developer and a line on the staff Discord channel."""
     from app.usecases.notifications import notify
 
@@ -205,7 +221,7 @@ async def _notify_staff(player: Any, kind: str, data: dict[str, Any], discord_wh
         {"staff": STAFF_PRIVS},
     )
     for row in rows:
-        await notify(row["id"], kind, data, f"/u/{player.id}")
+        await notify(row["id"], kind, data, link or f"/u/{player.id}")
     await app.state.services.redis.publish(
         "ex:security",
         orjson.dumps({"action": kind, "user_id": player.id, "name": player.name, "what": discord_what}).decode(),
@@ -236,7 +252,9 @@ async def alert_lastfm(player: Any, raw_b: str, flags: int | None) -> None:
         if not await redis.set(LASTFM_ALERT_KEY.format(player.id, names_key), "1", nx=True, ex=ALERT_TTL):
             return
         log(f"{player} lastfm.php reported {what}", Ansi.LRED)
-        await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}")
+        await record_report(player.id, "lastfm", flags, None, None, what)
+        await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}",
+                            "/ap/anticheat")
     except Exception as exc:
         log(f"lastfm alert failed: {exc!r}", Ansi.LRED)
 
@@ -244,10 +262,11 @@ async def alert_lastfm(player: Any, raw_b: str, flags: int | None) -> None:
 SCORE_FLAGS_ALERT_KEY = "tsg:score_flags_alert:{}:{}"
 
 
-async def alert_score_flags(player: Any, bmap: Any, flags: int) -> None:
-    """Old anticheat flags sent with a score (spaces after the osu! version): tell the staff.
+async def alert_score_flags(player: Any, bmap: Any, flags: int, score_id: int | None) -> None:
+    """Old anticheat flags sent with a score (spaces after the osu! version).
 
-    Same rules as the lastfm.php alert: one per player and flag set per hour, only a hint.
+    Every flagged score goes to ac_reports; the staff get a notification linking to the
+    score at most once per player and flag set per hour. Only a hint, never a restriction.
     """
     try:
         if not flags:
@@ -255,13 +274,16 @@ async def alert_score_flags(player: Any, bmap: Any, flags: int) -> None:
         from app.constants.clientflags import ClientFlags
         from app.constants.clientflags import describe_flags
 
+        described = describe_flags(flags, ClientFlags)
+        await record_report(player.id, "score", flags, score_id, getattr(bmap, "md5", None), described)
         redis = app.state.services.redis
         if not await redis.set(SCORE_FLAGS_ALERT_KEY.format(player.id, flags), "1", nx=True, ex=ALERT_TTL):
             return
         map_name = getattr(bmap, "full_name", None) or str(getattr(bmap, "id", "?"))
-        what = f"{describe_flags(flags, ClientFlags)} with a score on {map_name}"
+        what = f"{described} with a score on {map_name}"
         log(f"{player} sent score flags: {what}", Ansi.LRED)
-        await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}")
+        await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}",
+                            f"/scores/{score_id}" if score_id else "/ap/anticheat")
     except Exception as exc:
         log(f"score flags alert failed: {exc!r}", Ansi.LRED)
 
