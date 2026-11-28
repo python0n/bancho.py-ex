@@ -228,19 +228,9 @@ async def alert_lastfm(player: Any, raw_b: str, flags: int | None) -> None:
             what = "a malformed anticheat value"
             names_key = "malformed"
         else:
-            names: list[str] = []
-            known = 0
-            try:
-                from app.constants.clientflags import LastFMFlags
+            from app.constants.clientflags import describe_flags
 
-                for f in LastFMFlags:
-                    if f.value and flags & f.value:
-                        names.append(f.name or str(f.value))
-                        known |= f.value
-            except Exception:
-                pass
-            names += [f"unknown bit {b}" for b in range(64) if (flags & ~known) >> b & 1]
-            what = ", ".join(names) if names else f"flags {flags}"
+            what = describe_flags(flags)
             names_key = str(flags)
         redis = app.state.services.redis
         if not await redis.set(LASTFM_ALERT_KEY.format(player.id, names_key), "1", nx=True, ex=ALERT_TTL):
@@ -249,6 +239,31 @@ async def alert_lastfm(player: Any, raw_b: str, flags: int | None) -> None:
         await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}")
     except Exception as exc:
         log(f"lastfm alert failed: {exc!r}", Ansi.LRED)
+
+
+SCORE_FLAGS_ALERT_KEY = "tsg:score_flags_alert:{}:{}"
+
+
+async def alert_score_flags(player: Any, bmap: Any, flags: int) -> None:
+    """Old anticheat flags sent with a score (spaces after the osu! version): tell the staff.
+
+    Same rules as the lastfm.php alert: one per player and flag set per hour, only a hint.
+    """
+    try:
+        if not flags:
+            return
+        from app.constants.clientflags import ClientFlags
+        from app.constants.clientflags import describe_flags
+
+        redis = app.state.services.redis
+        if not await redis.set(SCORE_FLAGS_ALERT_KEY.format(player.id, flags), "1", nx=True, ex=ALERT_TTL):
+            return
+        map_name = getattr(bmap, "full_name", None) or str(getattr(bmap, "id", "?"))
+        what = f"{describe_flags(flags, ClientFlags)} with a score on {map_name}"
+        log(f"{player} sent score flags: {what}", Ansi.LRED)
+        await _notify_staff(player, "lastfm_flags", {"user": player.name, "what": what}, f"game client reported {what}")
+    except Exception as exc:
+        log(f"score flags alert failed: {exc!r}", Ansi.LRED)
 
 
 def trace_lastfm(player: Any, query: Any, flags: int | None, response: bytes) -> None:

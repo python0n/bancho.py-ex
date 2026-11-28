@@ -10,7 +10,6 @@ import base64
 import hashlib
 import os
 import time
-import random
 import secrets
 import math
 from collections import defaultdict
@@ -57,7 +56,6 @@ import app.utils
 from app import encryption
 from app._typing import UNSET
 from app.constants import regexes
-from app.constants.clientflags import LastFMFlags
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
 from app.constants.privileges import Privileges
@@ -1648,9 +1646,10 @@ async def osuAddFavourite(
 @router.get("/web/lastfm.php")
 async def lastFM(
     request: Request,
-    action: Literal["scrobble", "np"],
+    # any action and a missing b are accepted, so every call reaches the log
+    action: str = Query(""),
     beatmap_id_or_hidden_flag: str = Query(
-        ...,
+        "",
         description=(
             "This flag is normally a beatmap ID, but is also "
             "used as a hidden anticheat flag within osu!"
@@ -1674,82 +1673,15 @@ async def lastFM(
 
 async def _lastfm_handle(player: Player, beatmap_id_or_hidden_flag: str, flags_value: int | None) -> Response:
     if not beatmap_id_or_hidden_flag.startswith("a"):
-        # not anticheat related, tell the
-        # client not to send any more for now.
+        # not anticheat related. "-3" tells the client to stop sending for the
+        # session, which may also stop its anticheat reports;
         # LASTFM_NO_STOP=true answers with an empty body instead (experiment)
         return Response(b"" if app.ac_trace.LASTFM_NO_STOP else b"-3")
 
-    if flags_value is None:
-        # "a" followed by something that is not a number
-        return Response(b"-3")
-
-    flags = LastFMFlags(flags_value)
-
-    if flags & (LastFMFlags.HQ_ASSEMBLY | LastFMFlags.HQ_FILE):
-        # Player is currently running hq!osu; could possibly
-        # be a separate client, buuuut prooobably not lol.
-
-        await player.restrict(
-            admin=app.state.sessions.bot,
-            reason=f"hq!osu running ({flags})",
-        )
-
-        # refresh their client state
-        if player.is_online:
-            player.logout()
-
-        return Response(b"-3")
-
-    if flags & LastFMFlags.REGISTRY_EDITS:
-        # Player has registry edits left from
-        # hq!osu's multiaccounting tool. This
-        # does not necessarily mean they are
-        # using it now, but they have in the past.
-
-        if random.randrange(32) == 0:
-            # Random chance (1/32) for a ban.
-            await player.restrict(
-                admin=app.state.sessions.bot,
-                reason="hq!osu relife 1/32",
-            )
-
-            # refresh their client state
-            if player.is_online:
-                player.logout()
-
-            return Response(b"-3")
-
-        player.enqueue(
-            app.packets.notification(
-                "\n".join(
-                    [
-                        "Hey!",
-                        "It appears you have hq!osu's multiaccounting tool (relife) enabled.",
-                        "This tool leaves a change in your registry that the osu! client can detect.",
-                        "Please re-install relife and disable the program to avoid any restrictions.",
-                    ],
-                ),
-            ),
-        )
-
-        player.logout()
-
-        return Response(b"-3")
-
-    """ These checks only worked for ~5 hours from release. rumoi's quick!
-    if flags & (
-        LastFMFlags.SDL2_LIBRARY
-        | LastFMFlags.OPENSSL_LIBRARY
-        | LastFMFlags.AQN_MENU_SAMPLE
-    ):
-        # AQN has been detected in the client, either
-        # through the 'libeay32.dll' library being found
-        # onboard, or from the menu sound being played in
-        # the AQN menu while being in an inappropriate menu
-        # for the context of the sound effect.
-        pass
-    """
-
+    # Anticheat flags ("a" + number, or a broken "a" value) are only logged and
+    # reported to the staff (see ac_trace.alert_lastfm); nobody is restricted
+    # automatically, the staff look at the replays and decide. The answer is
+    # empty so the client keeps reporting.
     return Response(b"")
 
 
@@ -2870,6 +2802,8 @@ async def osuSubmitModularSelector(
     # the osu!auth token is kept as a description only; a token already used
     # with a different score is logged as suspicious
     await app.ac_trace.trace_token(player, bmap, osu_version, token, score.client_checksum)
+    # old anticheat flags sent with the score (spaces after the osu! version)
+    await app.ac_trace.alert_score_flags(player, bmap, int(score.client_flags))
 
     ## perform checksum validation
 
